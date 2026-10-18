@@ -423,8 +423,8 @@ const xhsSliceStart = assetDefPos >= 0 && assetDefPos < xhsStart ? assetDefPos :
 const xhsCtx = vm.createContext({ console, Map, Set, String, Number, RegExp, URL });
 vm.runInContext(bgCode.slice(xhsSliceStart, xhsEnd), xhsCtx, { filename: "xhs-rules" });
 const xhs = vm.runInContext(
-  "({ isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList })", xhsCtx, { filename: "xhs-export" });
-const { isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList } = xhs;
+  "({ isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList, identityOf, dedupeImagesByIdentity })", xhsCtx, { filename: "xhs-export" });
+const { isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList, identityOf, dedupeImagesByIdentity } = xhs;
 
 // ---- 域名 / 详情页判定
 check("识别小红书域名", isXhsHostUrl("https://www.xiaohongshu.com/explore") === true);
@@ -637,6 +637,54 @@ renumberImages(recHome);
 check("首页（非详情页）不误编号",
   [...recHome.items.values()].every((x) => !x.mark),
   [...recHome.items.values()].map((x) => x.mark));
+
+console.log("\n[4d] 通用图片去重（借鉴 CocoCut 去 query 签名）+ 身份");
+// identityOf：host + pathname，去掉 query 和 hash
+check("身份 = host + pathname（去 query）",
+  identityOf("https://cdn.example.com/a/b.jpg?sign=abc") === identityOf("https://cdn.example.com/a/b.jpg?sign=xyz"));
+check("身份忽略 hash 片段",
+  identityOf("https://cdn.example.com/a/b.jpg#me") === identityOf("https://cdn.example.com/a/b.jpg"));
+check("不同 pathname 是不同身份",
+  identityOf("https://cdn.example.com/a/1.jpg") !== identityOf("https://cdn.example.com/a/2.jpg"));
+check("不同 host 是不同身份",
+  identityOf("https://cdn.a.com/x.jpg") !== identityOf("https://cdn.b.com/x.jpg"));
+check("host 大小写归一",
+  identityOf("https://CDN.Example.com/x.jpg") === identityOf("https://cdn.example.com/x.jpg"));
+check("坏 URL 身份为空串", identityOf("不是URL") === "");
+
+// dedupeImagesByIdentity：同一 host+pathname 的裸图只留体量最大的
+const GEN_DUP = [
+  { u: "https://cdn.example.com/pic/1.jpg?sign=111", k: "image", s: 480000 },
+  { u: "https://cdn.example.com/pic/1.jpg?sign=222", k: "image", s: 120000 },
+  { u: "https://cdn.example.com/pic/2.jpg?sign=333", k: "image", s: 300000 },
+];
+const genOut = dedupeImagesByIdentity(GEN_DUP);
+check("同一张图（query 不同）合掉：3 条 → 2 条", genOut.length === 2, genOut.map((x) => x.u));
+check("保留体量最大的那条", genOut.some((x) => x.u.includes("sign=111")) && !genOut.some((x) => x.u.includes("sign=222")),
+  genOut.map((x) => [x.u, x.s]));
+
+// 没有 s 时退回像素面积
+const genArea = dedupeImagesByIdentity([
+  { u: "https://cdn.example.com/p/1.jpg?q=1", k: "image", w: 1000, h: 800 },
+  { u: "https://cdn.example.com/p/1.jpg?q=2", k: "image", w: 320, h: 240 },
+]);
+check("通用去重：无字节数时按像素面积留大图", genArea.length === 1 && genArea[0].u.includes("q=1"), genArea.map((x) => [x.u, x.w]));
+
+// 保守线：带 mid/title/page/hint 的（页面上下文条目）不合并
+const genCtx = dedupeImagesByIdentity([
+  { u: "https://cdn.example.com/p/1.jpg?q=1", k: "image", s: 100, mid: "8925" },
+  { u: "https://cdn.example.com/p/1.jpg?q=2", k: "image", s: 200, title: "标题" },
+]);
+check("带页面上下文（mid/title）的同图不合并", genCtx.length === 2, genCtx.map((x) => x.u));
+
+// 没有重复时不扰动
+check("通用去重：无重复时一条不少",
+  dedupeImagesByIdentity([{ u: "https://cdn.example.com/1.jpg", k: "image", s: 1 }, { u: "https://cdn.example.com/2.jpg", k: "image", s: 2 }]).length === 2);
+// 不碰非 image
+check("通用去重：视频条目不受影响",
+  dedupeImagesByIdentity([{ u: "https://cdn.example.com/a.mp4?x=1", k: "video" }, { u: "https://cdn.example.com/a.mp4?x=2", k: "video" }]).length === 2);
+// 空输入安全
+check("通用去重：空列表安全返回", Array.isArray(dedupeImagesByIdentity([])) && dedupeImagesByIdentity([]).length === 0);
 
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");

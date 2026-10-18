@@ -306,7 +306,7 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 | 3 | 视频或图片的水印能否去掉 | 待评估 | 见 9.3 的风险说明，大概率属于「做不到/不建议做」 |
 | 4 | 给代码添加注释 | **已完成** | popup 11%→36%，host 系列 6~11%→16~22%，整体 39%，见 9.2 |
 | 5 | 给功能分组，方便快速定位问题 | **待定** | 用户明确说之后再商量，不动手 |
-| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2/9.4/9.5/9.6 已覆盖大半 |
+| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2/9.4/9.5/9.6/9.7 已覆盖大半 |
 
 > 后续顺序：**3 → 5 待用户发话**。第 6 章随每轮进展继续补。
 
@@ -615,3 +615,69 @@ const ord = i + coverOffset;
 
 **教训**：`chrome.storage.session` 里 `items` 是 `[[url, item], ...]` 数组而不是对象，
 探针脚本直接 `x.k` 会让 `kinds` 全是 `undefined`，看起来像「代码把分类写坏了」。
+
+### 9.7 第十四轮（1.3.3）：借鉴 CocoCut 提升「广覆盖」——三项低风险改动
+
+用户原话：「快去看看有没有能借鉴的，它（CocoCut）几乎能捕捉到大部分网页上的资源，
+而我们的几乎不能正常使用」。随后定调：「MSE buffer 重组作为新计划放在开发文档，实现
+（本轮先落地三项低风险改动）」。
+
+先分析了 CocoCut 源码（`89891383/video-downloader---CocoCut`，MV2 扩展，webpack 单行压缩）：
+
+- **第 1 层 `onResponseStarted` 嗅探**（`background.js`）：它挂在 `onResponseStarted`（带
+  `responseHeaders`），而我们只挂了 `onHeadersReceived`。它用「可配置白名单 + size 阈值」
+  （默认 `flv/hlv/f4v/mp4/mp3/.../m3u8/ts` + `video/*`≥2KB + `audio/*`≥10KB）而非硬编码分类，
+  用 `pure(url)` 去 hash、`repeatReg`（默认 `\?[\S]+`）去 query 做**通用去重**。
+- **第 2 层 MSE 分片重组**（`pagehelper.js` 的 `videoTimeHook_` + `cocoparser.js` 内嵌的
+  fMP4/TS 解析器）：`hookReplace` 拦 `MediaSource.addSourceBuffer` → `appendBuffer` 的 buffer
+  包成 Blob → 按 `moov/traf/moof/mdat/sidx` box 解析重组出完整 mp4。这是它「几乎能抓所有
+  流媒体」的终极原因——**抓的是数据流，不是 URL**。
+- **第 3 层自建解析服务**（`cococut.net/hls.html`）：把 URL 发到自家服务器解析，商业模式，不适用。
+
+本轮落地三项（都在 `extension/background.js`）：
+
+| # | 改动 | 说明 |
+|---|---|---|
+| 1 | 补 `onResponseStarted` 监听 | 用 `requestId` 去重防 hits 翻倍（`recordedRequestIds` set，满 20000 整体清空）。onHeadersReceived 抓「带完整响应头」的，onResponseStarted 兜底抓「content-type 缺失 / 短头 / SW 缓存响应」的 |
+| 2 | 通用图片去重 `identityOf` + `dedupeImagesByIdentity` | 身份 = `host + pathname`（去 query、去 hash），同身份裸图只留体量最大。**只合并裸条目**（无 mid/title/page/hint），带 DOM 上下文的绝不合并。只作用于非小红书详情页（小红书有更权威的 `dedupeXhsNoteImages`） |
+| 3 | 最小体量门槛 `MIN_MEDIA_BYTES` | video≥2KB、audio≥10KB、image≥512B（参照 CocoCut 阈值），挡掉 1×1 像素/空占位。**只作用于 statusCode≠206 的完整响应**（206 是 Range 分段，content-length 只是分段长） |
+
+测试：background 103 → **116**（新增 `[4d]` 13 项）。main-hook 160、range_parallel 14、
+Python 7/7、`node --check` 全过。
+
+### 9.8 新计划（未开始）：MSE buffer 重组，实现「通用流媒体抓取」
+
+**目标**：让扩展能抓「没有可嗅探 URL、数据只走 MSE/blob 的流媒体」，不靠每站单独读
+`__INITIAL_STATE__` 打补丁。
+
+**背景**：B 站、小红书我们已靠「站点级直读 `__INITIAL_STATE__` + DASH/m4s 直连」走通；
+但任何没做站点适配的站点（小众视频站、加密直播切片、iframe 内播放器）仍抓不到。
+CocoCut 的办法是通用的：**不找 URL，直接从内存里截下播放器正在吃的 buffer，重组出完整文件**。
+
+**技术方案（参照 CocoCut 的 `pagehelper.js` + `cocoparser.js`）**：
+
+1. **注入层**（`inject-main.js`，`document_start`）：hook `MediaSource.prototype.addSourceBuffer`，
+   把返回的 `sourceBuffer.appendBuffer` 包一层，每次 append 的 `ArrayBuffer` 记下
+   `{ mimeType, mediaSourceId, bufferId, timestamp }`。
+2. **收集层**：buffer 按 mediaSourceId+bufferId 归组；`sourceBuffer.addEventListener("abort")`
+   当作「这一路流结束」的信号。
+3. **重组层**（新增一个 fMP4 解析模块）：把每段 buffer 解析成 `moov/traf/moof/mdat/sidx`
+   box，按 sequenceNumber 排序、去重（随机 seek 会重复 append 同一段），拼成完整 mp4。
+4. **落地层**：重组完的 Blob 走既有的 `page:save` / msfile 通路写盘（这条链路我们已经有了）。
+
+**难点与风险（写下来，开工前要逐个想清楚）**：
+
+- **加密流**（DRM / AES-128 HLS）：`appendBuffer` 拿到的已是解密后的明文，反而**能绕开**部分
+  加密（比 webRequest 抓 `.ts` 密文强）；但带 license 校验的 DRM（EME）拿不到明文，仍抓不到。
+- **随机 seek**：同一分片被 append 多次，必须按 `sequenceNumber` 去重，否则花屏/体积膨胀。
+- **内存**：直播/长视频的 buffer 总量可能几个 GB，不能全存内存，要边收边落盘（复用 msfile 分块）。
+- **时机**：hook 必须在播放器创建 MediaSource **之前**注入（`document_start` + `MAIN` world），
+  晚了 hook 不到。这一点和「改 inject-main 必须刷新页面」的既有铁律直接相关。
+- **代价/收益**：这是一块 3000+ 行等价逻辑的工程（CocoCut 的 `cocoparser.js` 有 154KB、
+  内嵌完整 MP4 解析器）。**除非要做「通用到任何站点」，否则收益/成本比不如继续按站适配。**
+
+**建议开工顺序**：先做「注入层 + 收集层」（只记录 buffer 元信息、不重组），先验证能稳定
+截到 buffer 且不拖垮播放器；确认后再上「重组层」。**开工前先和用户确认：是否真的要投入这块，
+还是先按站适配够用。**
+
+---

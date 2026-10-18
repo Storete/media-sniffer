@@ -12,6 +12,18 @@ const MAX_PER_TAB = 5000;
 const MAX_SEGMENTS = 400;
 const FLUSH_DELAY = 600;
 
+// 最小体量门槛（借鉴 CocoCut 的可配置白名单阈值）：content-length 明确存在且小于
+// 门槛的媒体请求直接丢弃。很多假资源（1×1 像素、空占位、几字节的 mime 声明）content-length
+// 极小，webRequest 会把它们全抓进来堆在列表里。门槛取最宽松一档，绝不误杀真内容。
+// 注意：只作用于「完整响应」（statusCode 非 206）。206 是 Range 分段响应，content-length
+// 只是分段长度，用它判体量会把真视频误删——分段由 existed 分支的「取最大 size」修正。
+const MIN_MEDIA_BYTES = {
+  video: 2048,     // 2KB
+  audio: 10240,    // 10KB（CocoCut 对 audio/* 也是 10KB）
+  image: 512,      // 半 KB，仅挡掉 1×1 像素/空占位
+  seg: 0, doc: 0, font: 0, other: 0, icon: 0,
+};
+
 // ---------------------------------------------------------------- 分类规则
 
 const EXT_TO_KIND = {
@@ -162,6 +174,10 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
   const mime = headerValue(d.responseHeaders, "content-type");
   const kind = classify(d.url, mime);
   const size = Number(headerValue(d.responseHeaders, "content-length")) || 0;
+
+  // 最小体量门槛（见 MIN_MEDIA_BYTES 注释）：明确小于门槛的完整响应丢弃。
+  // 206 分段响应跳过门槛（content-length 只是分段长度，真体量靠后续 existed 分支补）。
+  if (d.statusCode !== 206 && size > 0 && size < (MIN_MEDIA_BYTES[kind] || 0)) return;
 
   const now = Date.now();
   const existed = rec.items.get(d.url);
@@ -735,7 +751,82 @@ function preferXhsNoteList(items) {
   });
 }
 
+/**
+ * 通用图片「内容身份」：host + pathname（去 query、去 hash）。
+ *
+ * 借鉴 CocoCut 的做法（它用 `repeatReg` 默认 `\?[\S]+` 去掉整条 query string 再比对，
+ * `pure(url)` 去掉 `#...`）。很多图片 CDN 用 query 里的签名/时间戳做缓存失效，同一张图
+ * 每次请求 query 都不同、pathname 却不变，按完整 URL 记会得到 N 条重复。小红书就是典型，
+ * 之前是单独写 xhsImgIdentity 补丁解决的；这里给一个**通用兜底**，别的站点也能受益。
+ *
+ * 取不到稳定段（坏 URL）返回空串，调用方据此放弃去重，绝不误删。
+ */
+function identityOf(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname.toLowerCase() + u.pathname;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 通用图片去重：同一 host+pathname 的多条（query 签名不同）只留体量最大一条。
+ *
+ * 保守线（宁多留、不误删）：
+ *   · 只动 k === "image"，视频/音频/文档一律不碰；
+ *   · 只合并「裸条目」——没有 mid / title / page / hint 的（这些是 webRequest 抓来的
+ *     同一 CDN 资源被反复请求，正是要去重的对象）。带 DOM 上下文（mid/title/ord）的图
+ *     是页面明确报出的内容项，即使 pathname 相同也不能合并（可能是相册里两张同图）；
+ *   · 身份取不到就原样保留；
+ *   · 只有出现「同身份 ≥2 条」才真正合并，否则原样返回，避免无谓扰动。
+ *
+ * 注意：这个兜底只在「非小红书详情页」时用；小红书详情页有更权威的
+ * dedupeXhsNoteImages + preferXhsNoteList，不会走到这里。
+ */
+function dedupeImagesByIdentity(items) {
+  const best = new Map(); // 身份 -> {score, idx}
+  const seen = new Map(); // 身份 -> 出现次数
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.k !== "image") continue;
+    // 只合并裸条目（无页面上下文）
+    if (it.mid || (it.title || "").trim() || it.page || it.hint) continue;
+    const id = identityOf(it.u);
+    if (!id) continue;
+    seen.set(id, (seen.get(id) || 0) + 1);
+    const score = (it.s | 0) || (((it.w | 0) * (it.h | 0)) | 0) || 1;
+    const cur = best.get(id);
+    if (!cur || score > cur.score) best.set(id, { score, idx: i });
+  }
+  // 没有任何「同身份出现多次」的裸图，说明没有 query 签名造成的重复，原样返回
+  let hasDup = false;
+  for (const n of seen.values()) if (n >= 2) { hasDup = true; break; }
+  if (!hasDup) return items;
+  const keepIdx = new Set();
+  for (const v of best.values()) keepIdx.add(v.idx);
+  return items.filter((it, i) => {
+    if (it.k !== "image") return true;
+    if (it.mid || (it.title || "").trim() || it.page || it.hint) return true;
+    if (!identityOf(it.u)) return true;
+    return keepIdx.has(i);
+  });
+}
+
 // ---------------------------------------------------------------- 监听
+
+// onHeadersReceived 已经记录过的 requestId：onResponseStarted 对同一条请求会再触发一次，
+// 若也进 record() 会把 hits 翻倍（用户看到 ×2/×3）。用 requestId 去重，让两个监听器
+// 各司其职：onHeadersReceived 抓「带完整响应头的」，onResponseStarted 兜底抓「响应头缺失
+// 或响应开始时才拿得到」的（CDN 直连 mp4 端点、service worker 命中的缓存响应等）。
+const recordedRequestIds = new Set();
+function markRecorded(requestId) {
+  if (!requestId) return;
+  recordedRequestIds.add(requestId);
+  // 防无限增长：满了整体清空。最坏后果是清空后极少数请求被重复记录一次（hits 多算 1），
+  // 远好过 set 无限膨胀吃内存。
+  if (recordedRequestIds.size > 20000) recordedRequestIds.clear();
+}
 
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
@@ -744,6 +835,21 @@ chrome.webRequest.onHeadersReceived.addListener(
       if (buffered.length > 2000) buffered.shift();
       return;
     }
+    markRecorded(details.requestId);
+    record(details);
+  },
+  { urls: ["http://*/*", "https://*/*"] },
+  ["responseHeaders"]
+);
+
+// 兜底监听：onHeadersReceived 没覆盖到的（content-type 缺失、短头响应、SW 缓存响应等）
+// 在这里补记。requestId 已在 onHeadersReceived 记过就不重复。
+chrome.webRequest.onResponseStarted.addListener(
+  (details) => {
+    if (!loaded) return;
+    if (details.type === "main_frame") return; // 主文档由 onBeforeRequest 管
+    if (recordedRequestIds.has(details.requestId)) return;
+    markRecorded(details.requestId);
     record(details);
   },
   { urls: ["http://*/*", "https://*/*"] },
@@ -972,7 +1078,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 缩略图/雪碧图/别的帖子封面全是噪声（详见 preferXhsNoteList 的注释）。
         const shown = isXhsDetailUrl(tabUrl)
           ? preferXhsNoteList(dedupeXhsNoteImages(visible))
-          : visible;
+          : dedupeImagesByIdentity(visible);
         const counts = {};
         for (const it of shown) counts[it.k] = (counts[it.k] || 0) + 1;
         sendResponse({ ok: true, items: shown, counts, tabUrl, order: KIND_ORDER });
