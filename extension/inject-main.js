@@ -1,0 +1,2510 @@
+/**
+ * 页面内 hook（MAIN world，document_start）
+ *
+ * 捕获层（发现资源）：
+ *   1. URL.createObjectURL       → 主线程创建 Blob 时直接持有本体
+ *   2. <video>/<audio>.src 赋值  → 即时发现 + 抓标题（property setter）
+ *   3. Element.setAttribute      → 覆盖 setAttribute('src', ...) 的写法
+ *   4. 轮询 currentSrc           → 兜底：无论 src 怎么设（含 <source> 子元素），
+ *                                  currentSrc 都是最终解析结果
+ *   5. MediaSource/SourceBuffer  → 流式播放（MSE）时累积分片
+ *   6. fetch/XHR hook            → 记录页面自己发出的流媒体请求（Telegram 的
+ *                                  /progressive/、/k/stream/ 就是这样发的）
+ *
+ * 保存层（为什么必须在页面里做）：
+ *   Telegram Web 的媒体由它自己的 Service Worker 提供：
+ *     - 不带 Range 的 GET          → TypeError: Failed to fetch（SW 直接拒绝）
+ *     - 带 Range 的 GET            → 206，但**每次响应最多 512 KB**，而且
+ *       即使请求 1 MB，SW 也会截断到 512 KB（见 HANDOVER 里的实测记录）
+ *   → 只能分段（Range 链）拉满整条流，再一段段喂给本地下载器写盘。
+ *   本地下载器接不到 Service Worker，所以数据必须由页面搬运。
+ *
+ * 通信：与 content.js 用 window.postMessage
+ *   上报  → {__ms_sniffer:true, cmd:'found'|'progress'|'saved', ...}
+ *   桥接  ← {__ms_sniffer_cmd:true, cmd:'host-message'|'host-disconnected'}
+ *   指令 ↑ {__ms_sniffer_cmd:true, cmd:'host-send', payload}
+ *
+ * PageEgo / DSH debug hooks（自动测试用，生产环境不存在时自动忽略）：
+ *   window.__msDiag(items) / __msLog(level, text)
+ */
+(() => {
+  if (window.__MS_SNIFFER_MAIN__) return;
+
+  // 只处理真正的网页。扩展自己的页面（chrome-extension://，比如 chrome://extensions
+  // 里点「检查视图」时的 popup）、chrome:// 内部页、空白页都不该被 hook：
+  // 那些页面里 fetch/XHR 的行为不同，硬装 hook 会在控制台刷红字
+  // （典型：getResponseHeader 读到 null 后抛错），用户会以为扩展坏了。
+  // 注意：只有「明确不是 http(s)」时才退出；读不到 location 时照常工作，
+  // 免得非标准环境（worker 包装、测试沙箱）被误杀。
+  try {
+    const proto = location && location.protocol;
+    if (typeof proto === "string" && proto && proto !== "http:" && proto !== "https:") return;
+  } catch (e) {
+    /* location 读不到就继续 */
+  }
+
+  // 放在守卫之后：这个标记表示「本页确实装了 hook」，
+  // 别在非网页环境里也留下它，否则排查时会误以为扩展生效了。
+  window.__MS_SNIFFER_MAIN__ = true;
+
+  const KEEP_MS = 5 * 60 * 1000;
+  const MIN_BLOB = 64 * 1024;
+  // MSE 分片是整块留在页面内存里的，所以这里只能按「内存」设限，不能无限。
+  // 有 performance.memory 就按可用堆的 1/4 算，拿不到就给 512MB 兜底。
+  // 注意：这不是下载文件的大小上限——B 站/Telegram 走 Range 直传宿主，
+  // 文件多大都行，宿主那边已经不设上限了。
+  const MAX_MSE_BYTES = (() => {
+    try {
+      const m = performance && performance.memory;
+      if (m && m.jsHeapSizeLimit > 0) {
+        const cap = Math.floor(m.jsHeapSizeLimit / 4);
+        return Math.max(256 * 1024 * 1024, Math.min(cap, 2 * 1024 * 1024 * 1024));
+      }
+    } catch (e) { /* 拿不到就用兜底值 */ }
+    return 512 * 1024 * 1024;
+  })();
+  const MAX_ITEMS = 60;
+  const MAX_MEDIA = 300; // 记录多少条原生媒体请求
+
+  const blobs = new Map();   // blobUrl -> {url, blob, type, size, ts, expires}
+  const titles = new Map();  // blobUrl -> title
+  const mse = new Map();     // id(m\d+) -> {id, mime, chunks, size, ts}
+  const msUrls = new Set();  // MediaSource 的 blob URL（不可 fetch）
+  const seenSrc = new Set(); // 已上报过的 mediasrc
+  const meta = new Map();    // blobUrl -> {w, h, dur} 分辨率/时长
+  const mediaSeen = new Map(); // url -> {kind, ct, size, sample, ts, ref}
+  const imgCtx = new Map();  // 图片 url -> {mid, title, ord, w, h}（DOM 上下文）
+  let seq = 0;
+
+  const post = (data) => {
+    try { window.postMessage({ __ms_sniffer: true, ...data }, "*"); } catch (e) { /* 忽略 */ }
+  };
+  const diag = (text) => {
+    try { if (typeof window.__msDiag === "function") window.__msDiag(text); } catch (e) { /* 忽略 */ }
+  };
+  const log = (text) => {
+    try { if (typeof window.__msLog === "function") window.__msLog("info", text); } catch (e) { /* 忽略 */ }
+  };
+
+  const origCreate = URL.createObjectURL.bind(URL);
+  const origRevoke = URL.revokeObjectURL.bind(URL);
+
+  function extOf(mime) {
+    const m = (mime || "").toLowerCase();
+    if (m.includes("mp4")) return ".mp4";
+    if (m.includes("webm")) return ".webm";
+    if (m.includes("mpeg") || m.includes("mp3")) return ".mp3";
+    if (m.includes("m4a") || m.includes("audio/mp4")) return ".m4a";
+    if (m.includes("aac")) return ".aac";
+    if (m.includes("ogg") || m.includes("opus")) return ".ogg";
+    if (m.includes("quicktime")) return ".mov";
+    return ".bin";
+  }
+
+  function sanitize(name) {
+    return (name || "").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").replace(/\s+/g, " ").trim().slice(0, 90);
+  }
+
+  /**
+   * 文件名用的标题 → 安全文件名。比 sanitize 多三步：
+   *   1. URL 里的 %20 / %E4%B8%AD 之类百分号编码先还原成字符，否则文件名里留一堆 %XX；
+   *   2. 没有扩展名的标题去掉垂尾的点/空格（Windows 不允许文件名以 . 或空格结尾）；
+   *   3. 清理后只剩符号或空 → 返回 ""，交给调用方走兜底名。
+   * B 站用户反馈「B站视频名字不显示」时，最终落盘名是 bilibili.mp4；
+   * 现在标题会一路带到文件名，所以这一层必须可靠。
+   */
+  function safeFileName(t) {
+    let s = String(t == null ? "" : t);
+    try {
+      if (/%[0-9a-f]{2}/i.test(s)) s = decodeURIComponent(s);
+    } catch (e) { /* 坏的百分号编码：保持原样 */ }
+    // 全角括号/斜杠保留原样（Windows 允许），只处理真正非法的
+    s = sanitize(s.replace(/\s+/g, " "));
+    s = s.replace(/^[\s.]+|[\s.]+$/g, "");
+    return s;
+  }
+
+  /**
+   * 文件名用的标题上限。
+   *
+   * Telegram 的媒体都在一条聊天消息里，之前抓到的「标题」其实是整段正文
+   * （实测 84 个字符的帖子全文），存下来就是
+   * 「东京热 n0875 三穴同插不眠不休的24小时 楓乃々花太敬业了，玩的真狠啊两穴…mp4」。
+   * 列表里显示全文没问题，但文件名必须收成一截，所以这里单独再加一层截断。
+   * 90 是 Windows 全路径 260 上限下还留得住的长度，这里取 60 更稳。
+   */
+  function fileNameTitle(t) {
+    const s = String(t || "").replace(/\s+/g, " ").trim();
+    // 「bilibili / 完整 DASH 流」这种前缀是列表里给条目分类用的，不该进文件名，
+    // 否则存出来就是 bilibili_【官方MV】xxx.mp4
+    const pre = s.replace(/^[a-z0-9.-]*bilibili(\.com)?\s*[/|·]\s*/i, "");
+    const base = pre || s;
+    if (base.length <= 60) return base;
+    return base.slice(0, 60).replace(/[\s_\-·,，、]+$/, "") + "…";
+  }
+
+  function trim() {
+    if (blobs.size <= MAX_ITEMS) return;
+    const sorted = [...blobs.values()].sort((a, b) => a.ts - b.ts);
+    for (const old of sorted.slice(0, blobs.size - MAX_ITEMS)) blobs.delete(old.url);
+  }
+
+  function ascii(b, off, len) {
+    return String.fromCharCode(...b.slice(off, off + len));
+  }
+
+  /** 字节头 → 扩展名（Telegram 的 CDN 是加密的，靠头判断更靠谱） */
+  function sniffExt(b) {
+    if (!b || b.length < 12) return null;
+    if (ascii(b, 4, 4) === "ftyp") {
+      const brand = ascii(b, 8, 4).toLowerCase();
+      if (brand === "m4a " || brand.startsWith("m4a") || brand === "mp4a") return ".m4a";
+      return ".mp4";
+    }
+    if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return ".webm";
+    if (ascii(b, 0, 3) === "ID3") return ".mp3";
+    if (ascii(b, 0, 4) === "OggS") return ".ogg";
+    if (ascii(b, 0, 4) === "fLaC") return ".flac";
+    if (b[0] === 0x47 && b[188] === 0x47) return ".ts";
+    return null;
+  }
+
+  // ------------------------------------------------------------ 1. Blob / MediaSource 捕获
+
+  URL.createObjectURL = function (obj) {
+    const url = origCreate(obj);
+    try {
+      if (obj && typeof obj.size === "number" && obj.size >= MIN_BLOB && typeof obj.type === "string") {
+        blobs.set(url, { url, blob: obj, type: obj.type, size: obj.size, ts: Date.now(), expires: 0 });
+        trim();
+        // 只上报音视频 blob。Telegram 的图片预览（头像缩略图、查看器里的照片）
+        // 也是 createObjectURL 出来的 image/jpeg blob，且常超过 MIN_BLOB；
+        // 报给页面媒体列表会变成「页面视频 · image/jpeg」这类假视频条目。
+        // 图片本来就有 webRequest 那条路可抓，这里不必重复上报。
+        if (/^(video|audio)\//i.test(obj.type) || !obj.type) {
+          post({ cmd: "found", source: "blob", key: url, size: obj.size, mime: obj.type, ext: extOf(obj.type) });
+        }
+      } else if (obj && typeof obj.addSourceBuffer === "function") {
+        msUrls.add(url); // 这是 MediaSource 的 URL，不可 fetch，数据走 appendBuffer
+      }
+    } catch (e) { /* 忽略 */ }
+    return url;
+  };
+
+  URL.revokeObjectURL = function (url) {
+    const rec = blobs.get(url);
+    if (rec && !rec.expires) {
+      rec.expires = Date.now() + KEEP_MS;
+      setTimeout(() => {
+        const cur = blobs.get(url);
+        if (cur && cur.expires) blobs.delete(url);
+      }, KEEP_MS + 100);
+      post({ cmd: "progress", key: url, state: "released" });
+    }
+    msUrls.delete(url);
+    return origRevoke(url);
+  };
+
+  // ------------------------------------------------------------ 2. 媒体元素发现（三种触发 + 轮询兜底）
+
+  /** 媒体所在消息的 id / 引用（Telegram 的 data-message-id 在 .Message 上） */
+  function mediaContext(el) {
+    const out = { mid: "", ref: "" };
+    try {
+      let n = el, depth = 0;
+      while (n && n.nodeType === 1 && depth < 22) {
+        const cn = String(n.className || "");
+        if (!out.mid && n.getAttribute) out.mid = n.getAttribute("data-message-id") || "";
+        if (!out.ref) {
+          if (/MediaViewerSlide/.test(cn) || /is-for-video/.test(cn)) out.ref = "viewer";
+          // `^Album\b` 只认得 Telegram 旧版的 `Album` 类名；WebZ 现在发的是
+          // 哈希类名 + `album-item`，所以补上 album-item（实测 8928 的
+          // 两个 video 都挂在 div.AOksc2b1.Q1Cqmt5K.album-item 里）。
+          else if (/^Album\b|album-item/.test(cn)) out.ref = "album";
+        }
+        if (out.mid && out.ref) break;
+        n = n.parentElement;
+        depth++;
+      }
+    } catch (e) { /* 忽略 */ }
+    return out;
+  }
+
+  /**
+   * 这个 <video>/<audio> 在「同一条消息」里的阅读顺序（0 起，从左到右、从上到下）。
+   *
+   * 序号本身由 background 编（图片和视频要在同一个池子里排序），这里只提供
+   * 位置信息。用同一消息容器里的 video/audio 逐个比坐标，而不是拿 indexOf
+   * 出来的序号 —— DOM 里可能混着 <img>、占位 div，index 会把顺序算错。
+   */
+  function ordOfMedia(el) {
+    try {
+      if (!el || !el.parentElement) return -1;
+      // 找消息容器：有 data-message-id 的祖先；没有就退回父节点
+      let box = el.parentElement;
+      let n = el, depth = 0;
+      while (n && n.nodeType === 1 && depth < 22) {
+        if (n.getAttribute && n.getAttribute("data-message-id")) { box = n; break; }
+        n = n.parentElement;
+        depth++;
+      }
+      if (!box || !box.querySelectorAll) return -1;
+      // 只跟同一种媒体比：消息里一条视频 + 一条音频时各自从 ① 起
+      const tag = el.tagName === "AUDIO" ? "audio" : "video";
+      const list = [...box.querySelectorAll(tag)];
+      if (list.length <= 1) return 0;
+      let r = null;
+      try { r = el.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      if (!r) return -1;
+      let before = 0;
+      for (const other of list) {
+        if (other === el) continue;
+        let ro = null;
+        try { ro = other.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+        if (!ro) continue;
+        if (Math.abs(ro.top - r.top) > 8 ? ro.top < r.top : ro.left < r.left) before++;
+      }
+      return before;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  /**
+   * 判断一段文本是不是播放器 UI 里随手就能抓到的垃圾（不能当标题）：
+   * - 全是标点/省略号：「……」「...」「···」
+   * - 纯百分比/数字进度：「0%」「0%0%…」「1:23 / 4:56」
+   * - 常见播放器控件词：play/pause/下载/全屏/静音/0.5x
+   * Telegram 的加载占位符和进度条会把这类文本塞进容器，guessTitle 向上找容器时
+   * 会把它当成标题（实测抓出「0%0%…」和「……」两条）。
+   */
+  function isJunkTitle(t) {
+    const s = String(t || "").replace(/\s+/g, " ").trim();
+    if (!s) return true;
+    // 去掉标点、数字、空白后如果没有至少 2 个「文字」字符，就不是标题
+    const words = s.replace(/[%…\.\-–—:：\/\(\)\[\]「」『』【】<>·、,，。!！?？'"“”‘’\s\d]/g, "");
+    if (words.length < 2) return true;
+    // 纯进度样式：数字 + 百分号 / 时间戳 反复出现
+    if (/^[\d\s%:：\.\-\/]+$/.test(s)) return true;
+    if (/^(play|pause|停止|静音|全屏|下载|分享|复制|loading|buffering)$/i.test(s)) return true;
+    return false;
+  }
+
+  /**
+   * 聊天气泡的正文（Telegram 的 .text-content，别的站按通用类名兜）。
+   *
+   * 为什么必须先认它：向上找容器的旧逻辑到了 `message-content` 这一层，
+   * textContent 已经是大杂烩 —— Telegram 实测抓到的是
+   * 「#jav #深喉 ISRD-008 如何让一个高傲的女人彻底丧失尊严94.4Kdd ch14:58」
+   * （正文 + 阅读数 + 签名 + 时间全粘在一起），被当成文件名存了下来。
+   * 这里只取正文节点，干净得多；再去掉末尾的时间/状态小字。
+   */
+  function bubbleText(el) {
+    try {
+      let n = el, depth = 0;
+      while (n && n !== document.body && depth < 8) {
+        const box = n.querySelector && n.querySelector(
+          ".text-content, .message-text, .tgme_widget_message_text, [class*='message-text']"
+        );
+        if (box) {
+          // cloneNode 后删掉 meta，避免把「94.4K / 14:58 / dd ch」混进标题。
+          // 走 clone：直接改原节点会把页面自己的消息内容删掉。
+          let txt = "";
+          try {
+            const c = box.cloneNode(true);
+            for (const m of c.querySelectorAll(".MessageMeta, .message-time, .message-views, .message-signature, [class*='Meta']")) {
+              try { m.remove(); } catch (e) { /* 忽略 */ }
+            }
+            txt = (c.textContent || "").replace(/\s+/g, " ").trim();
+          } catch (e) {
+            txt = (box.textContent || "").replace(/\s+/g, " ").trim();
+          }
+          if (txt && txt.length > 3 && !isJunkTitle(txt)) return txt.slice(0, 90);
+        }
+        n = n.parentElement;
+        depth++;
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  function guessTitle(el) {
+    try {
+      const t = el.getAttribute("title") || el.getAttribute("aria-label") || el.title;
+      if (t && t.trim() && !isJunkTitle(t)) return sanitize(t);
+      // 优先用气泡正文：它是这段媒体真正的「标题」，比往上抓整层 innerText 干净
+      const bubble = bubbleText(el);
+      if (bubble) return sanitize(bubble);
+      // 向上找几层容器，优先认「文件名样式」的文本（xxx.mp4 / 报告.pdf），
+      // 找不到再退回普通短文本（时长、大小等至少能区分资源）
+      let n = el, depth = 0;
+      while (n && n !== document.body && depth < 5) {
+        n = n.parentElement;
+        depth++;
+        if (!n) break;
+        if (n.querySelectorAll) {
+          const nodes = n.querySelectorAll("span, div, p, a, strong, em");
+          for (const nd of nodes) {
+            const txt = (nd.textContent || "").replace(/\s+/g, " ").trim();
+            if (
+              txt && txt.length >= 4 && txt.length <= 100 &&
+              /\.(mp4|mkv|webm|mov|avi|flv|ts|m4v|mp3|m4a|aac|flac|ogg|opus|wav|pdf|zip|rar|7z|doc|docx|xls|xlsx|ppt|pptx|txt|epub)$/i.test(txt) &&
+              !/^https?:/i.test(txt)
+            ) {
+              return sanitize(txt);
+            }
+          }
+        }
+        const txt = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (txt && txt.length > 3 && txt.length < 80 && !isJunkTitle(txt)) return sanitize(txt);
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  function handleMediaSrc(el, url) {
+    try {
+      if (!url || typeof url !== "string") return;
+      const isBlob = url.startsWith("blob:");
+      const isHttp = /^https?:/i.test(url);
+      if (!isBlob && !isHttp) return;
+      if (isBlob && msUrls.has(url)) return; // MediaSource 流，交给 MSE hook
+      const isAudio = el && el.tagName === "AUDIO";
+      const ctx = el ? mediaContext(el) : { mid: "", ref: "" };
+      // Telegram 自己会往 <video> 里塞 UI 小视频（贴纸、转圈占位等，100×100
+      // 这种），不是用户要保存的内容。页面里量出来比 ICON_MAX 还小、又挂在
+      // 相册/消息结构外的，直接不上报 —— background 里看不到渲染尺寸。
+      let rw = 0, rh = 0;
+      try {
+        const r = el.getBoundingClientRect();
+        rw = Math.round(r.width); rh = Math.round(r.height);
+      } catch (e) { /* 忽略 */ }
+      if (rw && rh && rw <= 96 && rh <= 96) return;
+
+      // 标题：拿到一次就不再扫（guessTitle 要遍历 DOM，轮询时反复调太贵）
+      if (!titles.get(url)) {
+        const title = guessTitle(el);
+        if (title) {
+          titles.set(url, title);
+          post({ cmd: "progress", key: url, title });
+        }
+      }
+
+      // 分辨率/时长元数据（loadedmetadata 之后才有，需要持续更新）
+      let w = 0, h = 0, dur = 0;
+      try {
+        w = el.videoWidth | 0;
+        h = el.videoHeight | 0;
+        dur = el.duration && isFinite(el.duration) ? Math.round(el.duration) : 0;
+      } catch (e) { /* 忽略 */ }
+      const last = meta.get(url);
+      if (w || dur) {
+        if (!last || last.w !== w || last.h !== h || last.dur !== dur) {
+          meta.set(url, { w, h, dur });
+          post({ cmd: "progress", key: url, w, h, dur });
+        }
+      }
+      if (ctx.mid) post({ cmd: "progress", key: url, mid: ctx.mid });
+      if (ctx.ref) post({ cmd: "progress", key: url, ref: ctx.ref });
+      const ord = ordOfMedia(el);
+      if (ord >= 0) post({ cmd: "progress", key: url, ord });
+
+      if (!seenSrc.has(url)) {
+        seenSrc.add(url);
+        const ct = mediaSeen.get(url);
+        const mime = (ct && ct.ct) || (isAudio ? "audio/mpeg" : "video/mp4");
+        post({
+          cmd: "found",
+          source: isBlob ? "mediasrc" : "httpmedia",
+          key: url,
+          size: (ct && ct.size) || 0,
+          mime,
+          ext: isAudio ? ".mp3" : ".mp4",
+          w, h, dur,
+          mid: ctx.mid,
+          ord,
+          ref: ctx.ref,
+        });
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // 2a. src property setter
+  const mdesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "src");
+  if (mdesc && mdesc.set) {
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true,
+      enumerable: true,
+      get() { return mdesc.get.call(this); },
+      set(v) {
+        handleMediaSrc(this, v);
+        return mdesc.set.call(this, v);
+      },
+    });
+  }
+
+  // 2b. setAttribute('src', ...)
+  if (Element && Element.prototype && Element.prototype.setAttribute) {
+    const origSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      try {
+        const tag = this && this.tagName;
+        if ((tag === "VIDEO" || tag === "AUDIO") && String(name).toLowerCase() === "src") {
+          handleMediaSrc(this, value);
+        }
+      } catch (e) { /* 忽略 */ }
+      return origSetAttr.call(this, name, value);
+    };
+  }
+
+  // ------------------------------------------------------------ 小红书：只抓当前帖子
+  //
+  // 用户诉求：打开小红书单个帖子详情页时，只显示「这个帖子自己的图片」，
+  // 不要信息流里其他帖子的封面、也不要头像/logo/二维码等装饰图。
+  //
+  // 难点：干净 profile 打开详情页会被反爬拦（error_code=300031），拿不到详情页的
+  // 精确容器 class。所以判据建立在三路信号上（都不依赖详情页专用选择器）：
+  //   1. URL 路由：/explore/{noteId} 或 /discovery/item/{noteId} 才是详情页
+  //   2. 图片 CDN URL 特征：小红书正文配图有独一无二的大图签名（见 XHS_NOTE_IMG）
+  //   3. DOM 上下文：头像/logo/二维码的 class 和尺寸特征
+  // 判据集中成下面的常量/函数，小红书改版时只改这一处。
+
+  /** 是不是小红书网页版（含子域） */
+  function isXhsHost() {
+    try {
+      return /(^|\.)xiaohongshu\.com$/i.test(location.hostname || "");
+    } catch (e) { return false; }
+  }
+
+  /** 从地址栏提取当前帖子 noteId（只在详情页有；首页 /explore 无 noteId 返回空） */
+  function xhsCurrentNoteId() {
+    try {
+      const m = /^\/(explore|discovery\/item)\/([0-9a-f]{20,})/i.exec(location.pathname || "");
+      return m ? m[2] : "";
+    } catch (e) { return ""; }
+  }
+
+  /**
+   * 小红书正文配图（大图）的 CDN URL 签名。实测（信息流封面 + 详情配图同源）：
+   *   https://sns-webpic-qc.xhscdn.com/<ts>/<hash>/notes_pre_post/1040g3k03...!nc_n_webp_mw_1
+   *   https://sns-webpic-qc.xhscdn.com/<ts>/<hash>/spectrum/1040g0k03...!...
+   *   https://sns-webpic-qc.xhscdn.com/<ts>/<hash>/oss-sg/notes/1040g3l03...!...
+   * 共同点：sns-(webpic|img)-qc.xhscdn.com 域名 + 路径里 `1040g`（1040px 大图档）+
+   * `!` 后缀（图片服务裁切参数）。头像/logo/二维码都不满足这三条。
+   */
+  const XHS_NOTE_IMG = /sns-(webpic|img)(-qc)?\.xhscdn\.com\/[^"'\s]*1040g/i;
+
+  /** 小红书装饰图（头像/logo/二维码）的 class 特征 */
+  const XHS_DECOR_CLASS = /author-avatar|logo|qrcode|qr-code|\bicon\b|profile|avatar/i;
+
+  /** 这张图是不是小红书正文配图（只认 CDN URL 签名，不认 class） */
+  function imgIsXhsNote(src) {
+    try {
+      return XHS_NOTE_IMG.test(src || "");
+    } catch (e) { return false; }
+  }
+
+  /** 这张图是不是小红书的装饰图（头像/logo/二维码）——详情页和首页都该跳过 */
+  function imgIsXhsDecor(el) {
+    try {
+      const hint = String(el.className || "") + " " + String(el.id || "") + " " +
+        String(el.getAttribute && el.getAttribute("alt") || "") + " " +
+        String(el.parentElement && el.parentElement.className || "");
+      if (XHS_DECOR_CLASS.test(hint)) return true;
+      const w = el.naturalWidth || 0, h = el.naturalHeight || 0;
+      if (w && h && w <= 120 && h <= 120) return true; // 极小图 = 头像/徽章
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // ---- 当前帖子的 DOM 容器（2026-10-18 第七轮新增，解决「混进其他帖子的图」）
+  //
+  // 用户的真机反馈：「不仅有当前帖子所属图片，还有其他帖子的。」
+  // 说明只靠 CDN URL 签名不够 —— **其他帖子的正文配图也是同一个 1040g 大图签名**，
+  // URL 层面根本区分不了。唯一可靠的判据是「这个 <img>/<video> 挂在哪棵 DOM 子树下」。
+  //
+  // ⚠️ 约束：干净 profile 打不开详情页（error_code=300031），拿不到小红书的真实容器
+  // class 名。所以这里**不写死选择器**，改成「由内容反推容器」：
+  //   1. 拿出页面上所有命中 XHS_NOTE_IMG 的 <img>（这些是「某处』的正文配图」）
+  //   2. 沿祖先链往上走，找到那个「只包含本组图、不再往上套」的最近公共祖先
+  //   3. 该祖先子树里**所有**的 1040g 图都属于同一个帖子
+  // 详情页 = 「当前帖子」容器是页面上**面积最大 / 图最多**的那一组（帖子正文是主内容），
+  // 侧边栏相关推荐是若干小卡片，各自成组、面积小得多。
+  //
+  // 这条规则只在**详情页**生效；首页/搜索页没有「当前帖子」，照旧全部放行。
+
+  /** 这些 class/id 命中的祖先，说明是「别的帖子」（相关推荐/评论区卡片），直接排除 */
+  const XHS_OTHER_NOTE_CLASS = /note-item|feed-item|recommend|related|sidebar|comment|suggest|search-result/i;
+
+  /** 元素是否落在「别的帖子」子树里（相关推荐/评论区/侧栏） */
+  function xhsInOtherNote(el) {
+    try {
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 30) {
+        const hint = String(n.className || "") + " " + String(n.id || "");
+        if (XHS_OTHER_NOTE_CLASS.test(hint)) return true;
+        n = n.parentElement; d++;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+
+  /**
+   * 判断这张图是否属于「当前帖子」。
+   * 返回 true = 是当前帖子的；false = 别的帖子/装饰。
+   *
+   * 策略：在**详情页**下，取页面上所有 1040g 大图，按「祖父容器」分组，
+   * 图最多（并列时面积最大）的那一组就是当前帖子。本图必须落在该组里。
+   */
+  function imgBelongsToCurrentNote(el) {
+    try {
+      if (!xhsCurrentNoteId()) return true; // 非详情页不做归属判断
+      if (xhsInOtherNote(el)) return false; // 在相关推荐/评论区里，一定是别的帖子
+      // 找出页面上所有正文配图
+      const all = [...document.querySelectorAll("img")].filter((im) => {
+        let s = "";
+        try { s = im.currentSrc || im.src || ""; } catch (e) { s = ""; }
+        return imgIsXhsNote(s) && !imgIsXhsDecor(im) && !xhsInOtherNote(im);
+      });
+      if (!all.length) return true; // 一张正文图都没识别到，别误伤
+      if (all.length === 1) return all[0] === el;
+      // 按「父节点」分组：正文配图通常在同一个画廊容器里，相关推荐封面各自一张
+      const groups = new Map();
+      for (const im of all) {
+        const box = im.parentElement || im;
+        if (!groups.has(box)) groups.set(box, []);
+        groups.get(box).push(im);
+      }
+      let best = null, bestScore = -1;
+      for (const [box, ims] of groups) {
+        // 打分：图数量优先，其次容器面积（帖子正文容器大得多）
+        let area = 0;
+        try {
+          const r = box.getBoundingClientRect && box.getBoundingClientRect();
+          if (r) area = Math.round((r.width || 0) * (r.height || 0));
+        } catch (e) { area = 0; }
+        const score = ims.length * 1e9 + area;
+        if (score > bestScore) { bestScore = score; best = ims; }
+      }
+      return !!(best && best.includes(el));
+    } catch (e) { return true; } // 判不出来时放行，宁可多抓不可漏抓
+  }
+
+  // ---- 小红书视频（2026-10-18 第七轮新增）
+  //
+  // 用户诉求：「实现小红书视频下载的功能，逻辑和图片一样」。
+  // 小红书的视频是 <video> 且 **src 直接是 mp4 的 CDN 地址**（不是 MSE），
+  // 所以只要在 scanMedia 里像处理图片那样做「装饰图/其他帖子」过滤就行。
+  //
+  // 视频 CDN 特征（实测）：sns-video-hw.xhscdn.com / sns-video-qc.xhscdn.com 等，
+  // 路径里通常带 `spectrum` 或直接 .mp4。注意：正文图也可能出现 sns-video 域名的封面帧，
+  // 所以**不靠域名判视频**，靠元素本身是 <video> 就够。
+  const XHS_VIDEO_HINT = /\.(mp4|m4v|mov)(\?|$)|sns-video/i;
+
+  /** 这个 <video> 是不是小红书的装饰/他帖视频 */
+  function videoIsXhsDecor(el) {
+    try {
+      const hint = String(el.className || "") + " " + String(el.id || "") + " " +
+        String(el.parentElement && el.parentElement.className || "");
+      if (XHS_DECOR_CLASS.test(hint)) return true;
+      return xhsInOtherNote(el);
+    } catch (e) { return false; }
+  }
+
+  // 2c. 轮询 currentSrc 兜底
+  function scanMedia() {
+    try {
+      const els = document.querySelectorAll("video, audio");
+      for (const el of els) {
+        let src = "";
+        try { src = el.currentSrc || ""; } catch (e) { /* 忽略 */ }
+        if (!src && typeof el.src === "string") src = el.src;
+        if (!src) continue;
+        // 小红书（2026-10-18 第七轮）：视频逻辑和图片一样 ——
+        // 详情页只要当前帖子的视频，跳过装饰/其他帖子的视频。
+        // 小红书的视频 src 直接是 mp4 CDN 地址（不是 MSE），所以走到这里就是能下的。
+        if (isXhsHost() && el.tagName === "VIDEO") {
+          if (videoIsXhsDecor(el)) continue;
+          if (xhsCurrentNoteId() && !imgBelongsToCurrentNote(el)) continue;
+        }
+        handleMediaSrc(el, src);
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  setInterval(scanMedia, 600);
+  window.__msScan = scanMedia; // 供调试/测试手动触发
+  // 小红书同上：供排查
+  window.__msXhsInOtherNote = xhsInOtherNote;
+  window.__msXhsBelongs = imgBelongsToCurrentNote;
+
+
+  // B 站 __playinfo__ 是 playurl XHR 返回后才挂上 window 的，没有可监听事件，
+  // 所以周期轮询；reportBiliDash 内部按 baseUrl 签名去重，几乎零开销。
+  setInterval(reportBiliDash, 2500);
+
+  // ------------------------------------------------------------ 2d. 图片的 DOM 上下文
+  //
+  // 图片本身是 webRequest 抓到的（background 里已经有 URL / 大小 / mime），
+  // 但它不知道这张图属于哪条消息、叫什么名字、是这条消息里的第几张。
+  // 这里在页面里把 DOM 侧的上下文补上，按 URL 发一条 found，
+  // background 的 recordPageMedia 会用同一个 URL 当 key 合并进去。
+  //
+  // 序号（①②③）放在 background 里编，因为那里才是所有 URL 汇合的地方，
+  // 这里只负责给每张图一个「同一条消息内的 DOM 顺序」（ord，0 起）。
+
+  const MAX_IMG_CTX = 400;
+
+  /** 从左到右、从上到下：先比 top（容差 8px 容忍同一行的基线差），再比 left */
+  function cmpReadingOrder(a, b) {
+    const ta = a.rect ? a.rect.top : 0;
+    const tb = b.rect ? b.rect.top : 0;
+    if (Math.abs(ta - tb) > 8) return ta - tb;
+    return (a.rect ? a.rect.left : 0) - (b.rect ? b.rect.left : 0);
+  }
+
+  /**
+   * 图片的「上下文提示」：给它自己一个准确定位，供 background 判图标。
+   *
+   * 参考了一段 Playwright 抓图脚本的做法——只看 URL 不够，页头/页脚/侧栏里的
+   * 图基本都是站点装饰（logo、徽章、语言切换旗），class/alt 里带 avatar/logo/
+   * icon/sprite 的也几乎都是。这里只采信「明确」的信号，拿不准的一律不返回，
+   * 避免把真图误杀（宁可漏收图标，不可错杀照片）。
+   */
+  function imgHint(el) {
+    const parts = [];
+    try {
+      const push = (v) => {
+        const s = String(v == null ? "" : v).trim();
+        if (s && s.length < 120) parts.push(s);
+      };
+      push(el.className);
+      push(el.id);
+      push(el.getAttribute && el.getAttribute("alt"));
+      const p = el.parentElement;
+      if (p) push(p.className);
+    } catch (e) { /* 忽略 */ }
+    return parts.join(" ");
+  }
+
+  /** 这张图是不是在页头/页脚/侧栏这类「页面外壳」里（Playwright 脚本的 inChrome） */
+  function imgInChrome(el) {
+    try {
+      return !!el.closest("header,nav,footer,aside");
+    } catch (e) { return false; }
+  }
+
+
+  function scanImages() {
+    try {
+      const els = [...document.querySelectorAll("img")];
+      // 一次扫描内先算好位置，避免每张图各调一次 getBoundingClientRect
+      const rows = els.map((el) => {
+        let r = null;
+        try { r = el.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+        return { el, rect: r };
+      });
+      // 按消息分组 → 组内按阅读顺序排 → 写回 ord
+      const byMsg = new Map();
+      for (const row of rows) {
+        const el = row.el;
+        let src = "";
+        try { src = el.currentSrc || el.src || ""; } catch (e) { /* 忽略 */ }
+        // blob: 的图也要：Telegram 把消息里的照片 fetch 回来 createObjectURL
+        // 后才塞给 <img>，webRequest 只看得到那次 fetch（有时连 fetch 都不走
+        // SW 缓存），DOM 上下文只有这里能补。真图（消息内容）跟图标（UI 装饰）
+        // 靠 background 里的归属判定区分。
+        if (!src || !/^(https?:|blob:)/i.test(src)) continue;
+        // 小红书：详情页只抓当前帖子的正文配图，首页/详情页都要跳过装饰图（头像/logo/二维码）。
+        if (isXhsHost()) {
+          if (imgIsXhsDecor(el)) continue;
+          // 详情页（有 noteId）：先按 CDN 大图签名筛掉明显不是正文的，
+          // 再用 DOM 归属判断「这张图属于当前帖子还是相关推荐里的别的帖子」。
+          // 只靠 URL 签名区分不开——别的帖子的正文配图也是同一个 1040g 签名。
+          if (xhsCurrentNoteId()) {
+            if (!imgIsXhsNote(src)) continue;
+            if (!imgBelongsToCurrentNote(el)) continue;
+          }
+        }
+        // 头像 / 贴纸是 Telegram 的 UI 装饰或非「照片内容」，不当作可保存的图片上报。
+        // Avatar 类名（成员头像圆圈）、sticker 类名（消息里的贴纸）都跳过，
+        // 否则会混进图片列表，且 guessTitle 会抓到频道标题之类垃圾（m03690 混在一起）。
+        const cls = String(el.className || "");
+        if (/\bAvatar\b|avatar-media|sticker-/i.test(cls)) continue;
+        // Telegram 自带的 emoji（/a/img-apple-64/）和 UI 素材（/a/assets/ 的 svg/色块/占位图）
+        // 是站点图标/占位，永远不是用户可保存的照片 —— 直接跳过，别交给 background 猜。
+        if (/\/a\/img-apple-64\//i.test(src)
+          || (/\/a\/assets\//i.test(src) && /\.svg$|blank-/i.test(src))) continue;
+        const ctx = mediaContext(el);
+        const key = ctx.mid || "__nomid__";
+        if (!byMsg.has(key)) byMsg.set(key, []);
+        byMsg.get(key).push({ row, src, ctx });
+      }
+      for (const list of byMsg.values()) {
+        list.sort((a, b) => cmpReadingOrder(a.row, b.row));
+        for (let i = 0; i < list.length; i++) {
+          const { row, src, ctx } = list[i];
+          const el = row.el;
+          let w = 0, h = 0;
+          try {
+            w = el.naturalWidth || 0;
+            h = el.naturalHeight || 0;
+          } catch (e) { /* 忽略 */ }
+          if (!w || !h) {
+            // 懒加载还没解码出来时退回 CSS 尺寸，至少能把 40×40 的图标认出来
+            w = Math.round(row.rect ? row.rect.width : 0);
+            h = Math.round(row.rect ? row.rect.height : 0);
+          }
+          const title = guessTitle(el) || "";
+          const hint = imgHint(el);
+          const inChrome = imgInChrome(el);
+          // blob: 图标 mime：createObjectURL 时的 obj.type 大多带 image/jpeg
+          const rec = /^blob:/i.test(src) ? blobs.get(src) : null;
+          const mime = (rec && rec.type) || "image/*";
+          const size = (rec && rec.size) || 0;
+          const prev = imgCtx.get(src);
+          if (!prev || prev.ord !== i || prev.title !== title || prev.w !== w || prev.h !== h
+            || prev.hint !== hint || prev.inChrome !== inChrome) {
+            imgCtx.set(src, { mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+            if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
+            post({ cmd: "found", source: "imgctx", key: src, mime, size, mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+          }
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+  }
+  setInterval(scanImages, 1200);
+  window.__msImgScan = scanImages; // 供调试/测试手动触发
+
+  // ------------------------------------------------------------ 3. 原生媒体请求（fetch / XHR）
+
+  /** 判断一个请求是不是「流媒体」：看 URL 特征，再用 Range 嗅探响应头 */
+  const MEDIA_HINT = /(progressive|stream|video|audio|playback|media|document)/i;
+  const NOT_MEDIA = /(\.js|\.css|\.woff2?|\.ttf|\.png|\.jpg|\.jpeg|\.webp|\.gif|\.svg|\.json|\.html)(\?|$)/i;
+
+  function noteMediaResp(url, ct, size, status) {
+    if (!ct) return;
+    const m = ct.toLowerCase();
+    if (!m.startsWith("video/") && !m.startsWith("audio/")) return;
+    const rec = mediaSeen.get(url) || { kind: m.startsWith("audio/") ? "audio" : "video", ct: m, size: 0, ts: 0, ref: "" };
+    rec.ct = m;
+    if (size) rec.size = size;
+    rec.status = status;
+    rec.ts = Date.now();
+    rec.kind = m.startsWith("audio/") ? "audio" : "video";
+    mediaSeen.set(url, rec);
+    if (mediaSeen.size > MAX_MEDIA) mediaSeen.delete(mediaSeen.keys().next().value);
+  }
+
+  const origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = function (input, init) {
+      const p = origFetch.apply(this, arguments);
+      try {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        if (url && MEDIA_HINT.test(url) && !NOT_MEDIA.test(url)) {
+          p.then((resp) => {
+            try {
+              const ct = (resp.headers.get("content-type") || "").toLowerCase();
+              // Range 嗅探时浏览器会隐藏 Range/Content-Range 头，只能记 content-length
+              const len = Number(resp.headers.get("content-length") || 0);
+              noteMediaResp(resp.url || url, ct, len, resp.status);
+            } catch (e) { /* 忽略 */ }
+          }).catch(() => {});
+        }
+      } catch (e) { /* 忽略 */ }
+      return p;
+    };
+  }
+
+  const XHR = window.XMLHttpRequest;
+  if (XHR && XHR.prototype && typeof XHR.prototype.open === "function") {
+    const origOpen = XHR.prototype.open;
+    const origSend = XHR.prototype.send;
+    XHR.prototype.open = function (method, url) {
+      try { this.__msUrl = String(url); } catch (e) { /* 忽略 */ }
+      return origOpen.apply(this, arguments);
+    };
+    XHR.prototype.send = function () {
+      try {
+        const url = this.__msUrl || "";
+        if (url && MEDIA_HINT.test(url) && !NOT_MEDIA.test(url)) {
+          this.addEventListener("loadend", () => {
+            try {
+              // getResponseHeader 在两种情况下会返回 null：响应头不存在，
+              // 或跨域响应里服务器没在 Access-Control-Expose-Headers 里列出它。
+              // 后者是 XHR 的正常行为，不能当成异常，所以统一 || "" 兜住。
+              const ct = String(this.getResponseHeader("content-type") || "").toLowerCase();
+              const cr = String(this.getResponseHeader("content-range") || "");
+              const tot = /\/(\d+)\s*$/.exec(cr);
+              noteMediaResp(url, ct, tot ? Number(tot[1]) : 0, this.status);
+            } catch (e) { /* 忽略 */ }
+          });
+        }
+      } catch (e) { /* 忽略 */ }
+      return origSend.apply(this, arguments);
+    };
+  }
+
+  // ------------------------------------------------------------ 4. MSE 捕获
+
+  function cleanMime(mime) {
+    return (mime || "video/mp4").split(";")[0].trim();
+  }
+
+  const MS = window.MediaSource;
+  if (MS && MS.prototype && typeof MS.prototype.addSourceBuffer === "function") {
+    const origAdd = MS.prototype.addSourceBuffer;
+    MS.prototype.addSourceBuffer = function (mime) {
+      const sb = origAdd.call(this, mime);
+      try { hookSourceBuffer(sb, mime); } catch (e) { /* 忽略 */ }
+      return sb;
+    };
+  }
+
+  function hookSourceBuffer(sb, mime) {
+    const id = "m" + (++seq);
+    const entry = { id, mime: cleanMime(mime), chunks: [], size: 0, ts: Date.now() };
+    mse.set(id, entry);
+    post({ cmd: "found", source: "mse", key: id, size: 0, mime: entry.mime, ext: extOf(entry.mime), live: true });
+
+    const origAppend = sb.appendBuffer;
+    let lastReport = 0;
+    sb.appendBuffer = function (data) {
+      try {
+        if (data && entry.size < MAX_MSE_BYTES) {
+          let buf;
+          if (data instanceof ArrayBuffer) buf = data.slice(0);
+          else if (ArrayBuffer.isView(data)) buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+          if (buf) {
+            entry.chunks.push(buf);
+            entry.size += buf.byteLength;
+            const now = Date.now();
+            if (now - lastReport > 900) {
+              lastReport = now;
+              post({ cmd: "progress", key: id, size: entry.size, state: "growing" });
+            }
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+      entry.ctx = null;
+      return origAppend.call(this, data);
+    };
+  }
+
+  // ------------------------------------------------------------ 本地下载器桥（经 content.js → background → Native Host）
+
+
+  // ------------------------------------------------------------ 4b. 与本地下载器的端口（见 sniffer-hostport.js）
+
+  const HOSTPORT = (() => {
+    if (window.__msHostPort) return window.__msHostPort;
+    // 兜底：单文件注入（调试 / 老版本）时自己建一个
+    const post = (data) => {
+      try { window.postMessage(Object.assign({ __ms_sniffer_cmd: true }, data), "*"); } catch (e) { /* 忽略 */ }
+    };
+    const p = {
+      listeners: [],
+      send(payload) { post({ cmd: "host-send", payload }); },
+      deliver(msg) { for (const fn of this.listeners.slice()) { try { fn(msg); } catch (e) { /* 忽略 */ } } },
+      disconnected(err) {
+        for (const fn of this.listeners.slice()) { try { fn({ __disconnected: true, error: err }); } catch (e) { /* 忽略 */ } }
+        this.listeners.length = 0;
+      },
+      on(fn) { this.listeners.push(fn); },
+      off(fn) { const i = this.listeners.indexOf(fn); if (i >= 0) this.listeners.splice(i, 1); },
+    };
+    window.__msHostPort = p;
+    return p;
+  })();
+
+  // ------------------------------------------------------------ 5. Range 链下载（核心）
+
+  const CHUNK = 512 * 1024; // 一个 Range 请求最多能拿到多少（多要也会被 SW 截断）
+  // 同时在途的分段数。实测 Telegram 的 SW 对这个很敏感（同一文件 4 段并发）：
+  //   4 并发  → 891ms      ← 只有它敢叫「快」
+  //   8 并发  → 4620ms     ← 5 倍慢，曾经就是这里的默认值
+  //   16 并发 → 8404ms     ← 再翻一倍，纯排队
+  // 原因是 SW 把它们串行回源，并发越多每个请求等越久。放宽到 8 反而让
+  // 8.8MB（18 段）看着像卡死在 17%。降到 4 之后单段快 5 倍，总时长反而更短。
+  const PARALLEL = 4;       // 同时在途的分段数（Telegram 这种 SW 流的最优值，见上）
+  const MAX_CHUNK = 16 * 1024 * 1024;
+
+  // ---- 直连 CDN 的「放大档」：分块 4MB × 6 并发 ----------------------------
+  // 512KB×4 是照着 Telegram 那个串行回源的 SW 调出来的，对 B 站这种直连 CDN
+  // 完全是浪费：每个 Range 请求有 ~700-1400ms 的固定开销，512KB 的段摊不开。
+  // 真机基准（BV1GJ411x7h7，固定 16MB 工作量，单位 MB/s）：
+  //   512K×4 → 1.07（现行）  1M×8 → 2.90   4M×6 → 3.12   8M×8 → 3.41
+  // 取 4M×6 而不是最快的 8M×8：8MB×8 路在途是 64MB 堆，页面上还有播放器在跑，
+  // 容易触发 GC 掉帧；4M×6 = 24MB，3.12MB/s 已经比原来快约 3 倍。
+  // 只在「确认不是 SW 流」时才放大（见 runRangeDownload 里 bigChunk 的判断）。
+  const BIG_CHUNK = 4 * 1024 * 1024;
+  const BIG_PARALLEL = 6;
+
+  /**
+   * 这个地址是不是「直连 CDN」（不是 Telegram 那种 Service Worker 代理流）。
+   * 只有直连 CDN 才敢用大分段 + 高并发；SW 流放大反而慢 5 倍以上。
+   * B 站的 m4s 分散在 *.bilivideo.com / *.bilivideo.cn / *.mountaintoys.cn /
+   * *.szbdyd.com 等多个 CDN 域名上，所以按后缀匹配，不写死某一个。
+   */
+  const DIRECT_CDN = /(^|\.)(bilivideo\.com|bilivideo\.cn|mountaintoys\.cn|szbdyd\.com|bilibili\.com|hdslb\.com)$/i;
+  function isDirectCdnKey(url) {
+    try {
+      const h = new URL(url, location.href).hostname;
+      return DIRECT_CDN.test(h);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * Uint8Array → base64 字符串（写盘通路用，见 writeNext 的说明）。
+   * 不能直接 btoa(String.fromCharCode(...bytes))：4MB 一段时展开参数会爆栈
+   * （V8 的参数个数上限约 6.5 万），必须分块喂。
+   * 分块长度取 3 的倍数，每块单独 btoa 再拼，不会出现跨块 padding。
+   * btoa 在页面主世界里一定有；Node 沙箱（测试）里没有，用 Buffer 兜一层。
+   */
+  const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function b64EncodeChunk(bytes) {
+    if (typeof btoa === "function") {
+      let s = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 0x8000, bytes.length)));
+      }
+      return btoa(s);
+    }
+    if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+    // 最后的兜底：手写编码（很慢，只在既没 btoa 又没 Buffer 的怪环境里用）
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+      const a = bytes[i], b = bytes[i + 1], c = bytes[i + 2];
+      const n = (a << 16) | ((b || 0) << 8) | (c || 0);
+      out += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63]
+        + (b === undefined ? "=" : B64_CHARS[(n >> 6) & 63])
+        + (c === undefined ? "=" : B64_CHARS[n & 63]);
+    }
+    return out;
+  }
+
+  function bytesToBase64(bytes) {
+    const CH = 0x8000 * 3; // 98304 字节，能被 3 整除 → 每块编码后无 "=" 补位
+    if (bytes.length <= CH) return b64EncodeChunk(bytes);
+    let out = "";
+    for (let i = 0; i < bytes.length; i += CH) {
+      out += b64EncodeChunk(bytes.subarray(i, Math.min(i + CH, bytes.length)));
+    }
+    return out;
+  }
+
+  function fmtBytes(n) {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+  }
+
+  /**
+   * 发一个 Range 请求，读完整条响应，返回 ArrayBuffer。
+   *
+   * credentials 要按站点区分，不能一律 include：
+   *   - Telegram 的 /a/progressive/ 走 Service Worker，必须带 cookie（include），
+   *     不带就是 TypeError: Failed to fetch。
+   *   - B 站的 CDN（*.bilivideo.cn / *.mountaintoys.cn 等）反过来，它的
+   *     Access-Control-Allow-Origin 不认带凭据的跨域请求，include 直接
+   *     Failed to fetch，必须 omit。（BV1oMpm6QEQR 就是这么挂的）
+   * 所以先按 include 试，被 CORS/网络层拒掉就降级成 omit 再试一次。
+   * 注意：不是 HTTP 状态码，是 TypeError，拿不到 res.status。
+   *
+   * cache 同理要按站点区分（实测 B 站 CDN 上差异巨大）：
+   *   force-cache → 7409ms／段      ← 慢到 43 段要下好几分钟，看着像卡死
+   *   no-cache    → 1127ms／段
+   *   默认        → 465ms／段
+   *   reload      → 32ms／段        ← 正确选择
+   * Telegram 那种小流用 force-cache 有好处（复用 SW 缓存），但 B 站这种
+   * 直连 CDN 的分段流必须 reload，否则每个 chunk 都白等 7 秒。
+   * 判断依据：不需要凭据的跨域 CDN（即降级到 omit）就说明不是 SW 流，用 reload。
+   */
+  async function fetchRange(url, start, end, signal) {
+    let lastErr = null;
+    // 顺序：omit 优先（B 站 CDN 这种直连 CDN 一次就成，且能用 reload 走缓存旁路），
+    // 失败再升级到 include（Telegram 的 SW 流必须带凭据）。
+    // 反过来先试 include 的话，B 站每次都要等 CORS 预检超时（实测 3+ 秒），
+    // 43 段下来就是几十分钟，看起来就是「卡住不动」。
+    let mode = "omit";
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+      try {
+        // omit 模式下（B 站这类直连 CDN）用 reload 绕开缓存查询，实测快 200 倍以上。
+        // include 模式（Telegram 的 SW 流）实测 no-store 比 force-cache 快一倍：
+        //   未缓存段 force-cache → 6291ms    no-store → 3673ms
+        // force-cache 会让 SW 先查一遍缓存再回源，未命中时段段都要多绕一圈。
+        const cacheMode = mode === "omit" ? "reload" : "no-store";
+        const res = await fetch(url, {
+          cache: cacheMode,
+          credentials: mode,
+          headers: { Range: `bytes=${start}-${end}` },
+          signal,
+        });
+        if (res.status !== 206 && res.status !== 200) {
+          // 4xx 不要了；5xx/429 重试
+          if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+            throw Object.assign(new Error("HTTP " + res.status), { fatal: true });
+          }
+          throw new Error("HTTP " + res.status);
+        }
+        // 必须整包读完：让连接归还连接池，否则 8 路分段会把同源连接占满
+        const buf = await res.arrayBuffer();
+        return {
+          buf,
+          cr: res.headers.get("content-range") || "",
+          full: res.status === 200,
+          len: res.headers.get("content-length") || "",
+        };
+      } catch (e) {
+        if (e.name === "AbortError") throw e;
+        if (e.fatal) throw e;
+        lastErr = e;
+        // 网络层直接拒掉（跨域凭据不匹配时就是 TypeError: Failed to fetch）：
+        // omit 被拒就升级 include（Telegram 的 SW 流需要凭据），反之亦然。
+        mode = mode === "omit" ? "include" : "omit";
+        await sleep(250 * (attempt + 1));
+      }
+    }
+    throw lastErr || new Error("Range 请求失败");
+  }
+
+  /**
+   * 从 fMP4 的 sidx box 算总字节数（B 站 / DASH 流的最后手段）。
+   *
+   * 为什么需要：B 站 CDN 的 206 响应**只有 content-length，没有 content-range**，
+   * 而 content-length 是「这次请求要了多少」，不是文件总长；HEAD 和 `bytes=-1`
+   * 又被 CORS 拒（带不带凭据都是 TypeError）。所以三条常规路全废，
+   * 只能读 init+indexRange 那一段，解析出每条 segment 的 size 累加。
+   *   version 0: earliest_presentation_time(4) + first_offset(4)
+   *   version 1: earliest_presentation_time(8) + first_offset(8)
+   * 布局：[size4][sidx4][ver1][flags3][refID4][timescale4][...时间...][reserved2]
+   *       [ref_count2][每项 12 字节: ref_type+size4, duration4, SAP4]
+   * 返回 total（含 init + index 段自身），解析不出来返回 0。
+   */
+  function parseSidxTotal(sidxBuf, initRange, indexRange) {
+    const buf = new Uint8Array(sidxBuf);
+    if (buf.length < 32) return 0;
+    let off = -1;
+    for (let i = 0; i + 8 <= buf.length; i++) {
+      if (buf[i + 4] === 0x73 && buf[i + 5] === 0x69 &&
+          buf[i + 6] === 0x64 && buf[i + 7] === 0x78) { off = i; break; }
+    }
+    if (off < 0) return 0;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    try {
+      const ver = dv.getUint8(off + 8);
+      let p = off + 20;
+      p += ver === 0 ? 8 : 16;
+      p += 2; // reserved
+      const refCount = dv.getUint16(p); p += 2;
+      if (!refCount || p + refCount * 12 > buf.length) return 0;
+      let payload = 0;
+      for (let i = 0; i < refCount; i++) payload += dv.getUint32(p + i * 12) & 0x7fffffff;
+      // 总长 = 首段媒体字节的偏移 + 所有媒体段之和。
+      // indexRange 给的是闭区间下标（"933-1368"），所以首个媒体段从 1369 开始；
+      // 没有 indexRange（sidx 就在 0 号位）时用 sidx box 自身的结束位置。
+      const lead = indexRange ? indexRange[1] + 1 : off;
+      return lead + payload;
+    } catch (e) { return 0; }
+  }
+
+  /**
+   * 问出媒体总长度。Telegram 的 /progressive/ 流不给 Content-Length，
+   * Content-Range 也是 `bytes 0-524287/*` 这种不带总长的形式，只能从上往下试：
+   *   1) 响应头里的 Content-Range 尾部的总长，或 Content-Length
+   *   2) HEAD 请求（部分站点只在 HEAD 上给）
+   *   3) Range: bytes=-1 —— 有的服务端只在尾字节请求里补总长
+   *   4) B 站这类 DASH 流：读 SegmentBase 的 indexRange 解析 sidx
+   * 全失败就返回 0，交给调用方走普通 GET。
+   * `probe.sidx` / `probe.initRange` / `probe.indexRange` 由调用方（B 站分支）传入。
+   */
+  async function probeTotal(key, signal, probe) {
+    const fromCR = (s) => {
+      const m = /\/(\d+)\s*$/.exec(s || "");
+      return m ? Number(m[1]) : 0;
+    };
+    const fromRange = (r) => {
+      const m = /^(\d+)\s*-\s*(\d+)$/.exec(r || "");
+      return m ? [Number(m[1]), Number(m[2])] : null;
+    };
+    let n = fromCR(probe && probe.cr);
+    if (n) return n;
+    // 注意：content-length 在 Range 响应里只是本段长度，只有 200 全量响应才可信。
+    // 调用方传 probe.full 表示这是整包响应。
+    if (probe && probe.full) {
+      const cl = Number((probe && probe.len) || 0);
+      if (cl > 0) return cl;
+    }
+
+    // HEAD 和尾字节探测同样要兼容「带凭据被拒」的 CDN（见 fetchRange 的注释）。
+    // 顺序很重要：先 omit 后 include。
+    //   实测 B 站 CDN：HEAD omit 28ms 就明确失败，HEAD include 要等 3350ms 才失败。
+    //   Telegram 的 SW 流反过来——omit 也失败，但它那路第一次 include 就能成。
+    //   所以先用最便宜的 omit 探一下，失败立刻换 include，不会浪费时间。
+    const tries = ["omit", "include"];
+    for (const cred of tries) {
+      try {
+        const res = await fetch(key, { method: "HEAD", credentials: cred, signal });
+        n = fromCR(res.headers.get("content-range")) || Number(res.headers.get("content-length") || 0);
+        if (n > 0) return n;
+        break;
+      } catch (e) { if (e && e.name === "AbortError") throw e; }
+    }
+
+    for (const cred of tries) {
+      try {
+        const res = await fetch(key, {
+          // 同 fetchRange 的理由：omit 直连 CDN 用 reload，否则单次要等 7 秒；
+          // include 走 SW 流时用 no-store（force-cache 未命中会慢一倍，实测）
+          cache: cred === "omit" ? "reload" : "no-store",
+          credentials: cred, signal,
+          headers: { Range: "bytes=-1" },
+        });
+        if (res.status === 206) {
+          n = fromCR(res.headers.get("content-range"));
+          // 尾字节请求只读走 1 个字节，但响应体要消费掉，否则连接不归还连接池
+          try { await res.arrayBuffer(); } catch (e) { /* 忽略 */ }
+          if (n > 0) return n;
+        }
+        break;
+      } catch (e) { if (e && e.name === "AbortError") throw e; }
+    }
+
+    // 4) DASH：解析 sidx。B 站分支会直接给现成的 sidx 字节；
+    //    没给就按 indexRange 自己读一段。
+    let sidx = probe && probe.sidx;
+    const indexRange = fromRange(probe && probe.indexRange);
+    if (!sidx && indexRange) {
+      try {
+        const r = await fetch(key, {
+          headers: { Range: `bytes=${indexRange[0]}-${indexRange[1]}` },
+          credentials: "omit", signal,
+        });
+        if (r.status === 206 || r.status === 200) sidx = await r.arrayBuffer();
+      } catch (e) { if (e && e.name === "AbortError") throw e; }
+    }
+    if (sidx) {
+      n = parseSidxTotal(sidx, fromRange(probe && probe.initRange), indexRange);
+      if (n > 0) return n;
+    }
+    return 0;
+  }
+
+  /**
+   * 下载整条流：Range 链 + 并行 + 断点续传次数有上限。
+   * 返回 {ok, total, received, bytes}
+   */
+  async function runRangeDownload(opts) {
+    const { key, name, onProgress, signal, hooks } = opts;
+    const onStage = opts.onStage;
+    const stage = (t, p) => { try { onStage && onStage(t, p); } catch (e) { /* 忽略 */ } };
+    const ctx = hooks || {};
+    // 放大档只在两种情况下启用：
+    //   - hooks.big === true（调用方明确知道是直连 CDN，比如 B 站的 m4s）
+    //   - 或者 URL 是 B 站的 CDN 域名（*.bilivideo.cn / *.mountaintoys.cn / *.bilibili.com）
+    // Telegram 那条 SW 流必须留在 512KB×4，否则会从 891ms/段 退化成 4620ms/段。
+    const big = opts.big === true || (ctx.big !== false && isDirectCdnKey(key));
+    let chunkSize = big ? BIG_CHUNK : CHUNK;
+    const parallel = big ? BIG_PARALLEL : PARALLEL;
+    let cb = chunkSize;
+    let total = 0;
+    let first = null;
+
+    // ---- 1) 第一个分段同时充当探针：拿到 /total 和文件头
+    log(`读取媒体信息 ${key}`);
+    stage(ctx.kind === "audio" ? "正在读取音频信息…" : "正在读取媒体信息…");
+    let probe = null;
+    try {
+      // 注意 fetchRange 的 end 是**包含式**的：要 cb 个字节就得到 cb-1。
+      // 这里原来传的是 cb，多要了 1 个字节，导致首段长度和后续段长对不上。
+      probe = await fetchRange(key, 0, cb - 1, signal);
+    } catch (e) {
+      if (e.name === "AbortError") throw e;
+      // 放大档首段就失败：很可能这个 CDN 不接受大 Range，退回保守档重试一次
+      if (big) {
+        log(`大分段请求失败（${String(e.message || e).slice(0, 60)}），退回 512KB 分段`);
+        chunkSize = CHUNK;
+        cb = CHUNK;
+        try {
+          probe = await fetchRange(key, 0, cb - 1, signal);
+        } catch (e2) {
+          if (e2.name === "AbortError") throw e2;
+          probe = null;
+        }
+      }
+      if (!probe) {
+        // 退回不带 Range 的 fetch（有些站点反而只认普通 GET）
+        log("Range 请求失败，退回普通 fetch：" + (e.message || e));
+        const res = await fetch(key, { credentials: "include", signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const buf = await res.arrayBuffer();
+        return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename: name };
+      }
+    }
+    if (!first) first = probe;
+    if (probe.full) {
+      // 服务器忽略 Range，一次给了完整文件
+      const buf = probe.buf;
+      log(`服务器不支持 Range，已取得完整数据 ${fmtBytes(buf.byteLength)}`);
+      const ext = sniffExt(new Uint8Array(buf.slice(0, 16)));
+      const filename = finishName(name, key, ext);
+      fireProgress(onProgress, buf.byteLength, buf.byteLength, 0);
+      return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename };
+    }
+    const m = /\/(\d+)\s*$/.exec(probe.cr || "");
+    let got = probe.buf.byteLength;
+    if (m) total = Number(m[1]);
+    // 服务器可能给的比要求的多（B 站 CDN 会多吐 1 个字节，实测 524289），
+    // 也可能更小气。两种情况段长都必须按**实收字节数**对齐，否则后续分段的
+    // 起始偏移和 written 对不上，pending 里永远「最早那一段不连续」，直接卡死。
+    if (got > 0 && got !== cb) cb = got;
+
+    // 总长已知的话，按「段长 × 并发」封顶：太小的文件不值得开大分段
+    // （20MB 的 B 站流用 4MB 段正好 5 段，用完 5 路并发；512KB 段要 41 段）
+    if (total && big && total < cb) cb = Math.max(64 * 1024, total);
+
+    // 总长未知时（Telegram 的 progressive 流就是这样，既没有 Content-Range 也没有
+    // Content-Length）不能拿第一段当全长，否则只能存下前 512KB。用 Content-Range
+    // 的 */N 或者 HEAD 问一次，问不出来才按普通 GET 直接读全量。
+    if (!total) {
+      // hooks 里的 initRange/indexRange（B 站 SegmentBase）要一起交给探测，
+      // 否则这种「206 不给 content-range、HEAD 又 CORS 拒」的 CDN 问不出总长。
+      total = await probeTotal(key, signal, Object.assign({}, ctx, probe));
+      if (total && total < got) total = got;
+    }
+
+    if (!total) {
+      // 长度实在问不出来：退回普通 GET 一次性读完（只有小文件会走到这里）
+      log(`总长度未知，改用普通 GET 读全量 ${key}`);
+      const res = await fetch(key, { credentials: "include", signal });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const buf = await res.arrayBuffer();
+      const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || ".mp4";
+      const filename = finishName(name, key, ext);
+      fireProgress(onProgress, buf.byteLength, buf.byteLength, 0);
+      return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename };
+    }
+
+    // ---- 2) 文件名：从字节头判断扩展名；Telegram 的引用（album/viewer）防重名
+    let head = new Uint8Array(probe.buf.slice(0, Math.min(got, 64)));
+    const ext = sniffExt(head) || guessExtFromType(ctx.ct) || ".mp4";
+    const filename = finishName(name, key, ext);
+    log(`开始下载 ${filename}（${fmtBytes(total)}，分段 ${fmtBytes(cb)}，${parallel} 并发）`);
+
+    // ---- 3) 建本地文件
+    const startRes = await hostRequest({ action: "msfile_start", name: filename, total }, signal, 60000);
+    if (!startRes || startRes.ok === false) throw new Error("本地下载器无法创建文件: " + ((startRes && startRes.error) || "无响应"));
+    const jobId = startRes.id;
+
+    // ---- 4) 并行分段拉流，按序写盘（窗口式，内存里最多 parallel 段）
+    const queue = [0];
+    for (let s = got; s < total; s += cb) queue.push(s);
+    let received = 0;
+    let written = 0;
+    let abortReason = null;
+    const pending = new Map(); // start -> {buf, seq}
+    let seqNo = 0;
+    let writeChain = Promise.resolve();
+    let pokeDone = null; // 由下面的 Promise 内部赋值，供 writeNext 链尾回调用
+    let lastTick = Date.now();
+    let lastWritten = 0;
+    let lastSpeed = 0;
+
+    // 先把探测到的那一段塞进队列
+    pending.set(0, { buf: probe.buf, seq: seqNo++ });
+    if (got === total) received = got;
+
+    // 分段数据已在内存里，写盘迟到/丢回也要重试而不是整条失败
+    const hostWrite = async (payload) => {
+      let lastErr = null;
+      for (let i = 0; i < 3; i++) {
+        try {
+          const r = await hostRequest(payload, null, 90000);
+          if (r && r.ok === false) throw new Error(r.error || "宿主拒绝写入");
+          return r;
+        } catch (e) {
+          lastErr = e;
+          await new Promise((res) => setTimeout(res, 400 * (i + 1)));
+        }
+      }
+      throw lastErr || new Error("写入失败");
+    };
+
+    const writeNext = () => {
+      writeChain = writeChain.then(async () => {
+        // 一直写到「接不上下一个」为止就退出；等新的段进 pending 后再被调用。
+        // 条件是 while 里 k === written 找不到就 break，而不是 pending 空才 break，
+        // 因为中间可能有缺口（后面的段先到），此时不能跳过缺口继续写。
+        for (;;) {
+          // 找「正好接在已写末尾」的那一段。
+          // 必须是 k === written，不能是 k >= written：
+          // 用 >= 会在中间有缺口时跳过它往下写，结果是文件大小对、内容错位。
+          // 用 === 则缺口永远等不到写，靠 pump 的补队列兜底。
+          let bestKey = null, bestSeq = Infinity;
+          for (const [k, v] of pending) {
+            if (k === written && v.seq < bestSeq) { bestSeq = v.seq; bestKey = k; }
+          }
+          if (bestKey === null) break;
+          const item = pending.get(bestKey);
+          pending.delete(bestKey);
+          if (!item.buf || !item.buf.byteLength) continue;
+          // 传输编码：base64 而不是 number 数组。
+          // 512KB 一帧，真机实测（probe_chunk.js，BV1GJ411x7h7）：
+          //   普通 number 数组 → JSON 1.87MB → 宿主 331ms
+          //   {__b64:"…"}   → JSON 699KB → 宿主  43ms   ← 快 7.7 倍
+          // 宿主侧 sniffer_host.py 的 do_msfile_chunk 本来就认 __b64，
+          // 发 number 数组在 4~6 路并发下会直接把写盘链堵成瓶颈。
+          const bytes = item.buf instanceof Uint8Array ? item.buf : new Uint8Array(item.buf);
+          const b64 = bytesToBase64(bytes);
+          // 关键：written 必须在 await 之前「占位」推进，不能等写盘回来再改。
+          // 否则 await 期间另一个 writeNext 回调进来时会看到旧 written，
+          // 把同一段（甚至更早的段）再写一遍，落盘顺序就乱了——
+          // 表现正是「文件大小对、但内容错位、播不了」。
+          const upto = bestKey + bytes.byteLength;
+          written = upto;
+          try {
+            await hostWrite({ action: "msfile_chunk", id: jobId, text: `bytes=${bestKey}-`, data: { __b64: b64 } });
+          } catch (e) {
+            // 这一段没写进去：回滚占位并放回队列，交给上层判失败
+            if (written === upto) written = bestKey;
+            pending.set(bestKey, item);
+            throw e;
+          }
+          received = Math.max(received, written);
+          const now = Date.now();
+          if (now - lastTick > 400) {
+            lastSpeed = ((received - lastWritten) * 1000) / (now - lastTick);
+            lastTick = now;
+            lastWritten = received;
+            fireProgress(onProgress, received, total, lastSpeed);
+          }
+        }
+      });
+      // 写盘链落定后可能刚好满足完成条件（最后一段往往就是这样收尾的），
+      // 所以链尾再催一次。不催的话，若最后几个 pump 在写盘完成前就退出了，
+      // 就没有任何地方会再调用 maybeDone，await 永远挂着。
+      writeChain.then(() => { if (typeof pokeDone === "function") pokeDone(); });
+      return writeChain;
+    };
+
+    await new Promise((resolve) => {
+      let finished = false;
+      let active = 0;
+      const finish = (err) => {
+        if (finished) return;
+        finished = true;
+        if (err) abortReason = err;
+        resolve();
+      };
+      // 完成判定的核心：必须满足「队列空 + 没有待写段 + 没有在途请求 + 已写字节等于总长」。
+      // 最后一个条件很关键：pending 为空、active 为 0 时，最后一段可能才刚被 hostWrite
+      // 提交（written 已占位推进但 Promise 未落定），只靠 queue/pending/active 会漏判，
+      // 于是 await 永远不返回 —— 文件其实已经写好了，UI 却停在 99%。
+      const maybeDone = () => {
+        if (finished) return;
+        if (queue.length || pending.size || active > 0) return;
+        if (written < total) return; // 还有缺口没补上，等 pump 补队列
+        writeChain.then(() => finish(null), (e) => finish(e));
+      };
+      pokeDone = maybeDone; // 让 writeNext 的链尾也能催一次
+      const pump = async () => {
+        while (!finished) {
+          const s = queue.shift();
+          if (s === undefined) break; // 队列空，交给外层 maybeDone 判定
+          const e = Math.min(total - 1, s + cb - 1);
+          active++;
+          try {
+            const r = await fetchRange(key, s, e, signal);
+            if (!r.buf.byteLength) throw new Error("空分段 @" + s);
+            // 服务器实际给的字节数可能和要求的不一样（B 站 CDN 实测多吐 1 字节）。
+            // 以「实收字节数」为准：不足的部分补回队列，段长跟着改，
+            // 保证后续每个分段的起始偏移都和 written 严丝合缝。
+            const real = r.buf.byteLength;
+            const want = e - s + 1;
+            if (real < want) {
+              if (real < cb) cb = Math.max(64 * 1024, real);
+              for (let p = s + real; p < total; p += cb) queue.push(p);
+            } else if (real > want) {
+              // 多给了：只认 want 字节，多的丢弃（否则 written 会跳过后面的段）
+              pending.set(s, { buf: r.buf.slice(0, want), seq: seqNo++ });
+              writeNext();
+              active--;
+              maybeDone();
+              continue;
+            }
+            pending.set(s, { buf: r.buf, seq: seqNo++ });
+            writeNext();
+          } catch (err) {
+            finish(err); // AbortError 也走这里
+            return;
+          }
+          active--;
+          maybeDone();
+        }
+        // 队列被别的 pump 抢空了，也要检查一次
+        maybeDone();
+      };
+      if (total <= 0) { finish(new Error("内容长度未知")); return; }
+      for (let i = 0; i < parallel; i++) pump();
+    });
+
+    await writeChain;
+    if (abortReason) {
+      await hostRequest({ action: "msfile_abort", id: jobId });
+      if (abortReason.name === "AbortError") throw abortReason;
+      throw abortReason;
+    }
+
+    fireProgress(onProgress, received, total, lastSpeed);
+    const end = await hostRequest({ action: "msfile_end", id: jobId, total: received }, signal, 60000);
+    // 落盘长度对不上 = 文件是残的（以前会静默改名成「完整文件」）
+    const finalSize = Number(end && end.size) || 0;
+    if (finalSize && finalSize !== received) {
+      throw new Error(`写入不完整：应 ${fmtBytes(received)}，实际 ${fmtBytes(finalSize)}`);
+    }
+    return { ok: true, total, received, filename: (end && end.file) || filename, size: received };
+  }
+
+  function fireProgress(onProgress, got, total, speed) {
+    try { onProgress && onProgress(got, total, speed); } catch (e) { /* 忽略 */ }
+  }
+
+  // ------------------------------------------------------------ 5b. B 站：绕开 MSE，直接抓完整流
+
+  /**
+   * B 站播放器走 MSE（blob: 地址 + appendBuffer 分期喂数据），扩展能拿到的
+   * 只有「已经播放过的那几秒」。用户看到的现象就是：看了 5 秒，存下来的文件
+   * 只有 5 秒——但 MP4 的 moov（含全片时长）在文件开头，所以播放器显示的
+   * 总时长仍是全片。
+   *
+   * 正确做法：B 站页面里本来就挂着 `window.__playinfo__`，里面是 DASH 清单
+   * （独立的视频流 / 音频流，带备用 CDN）。这些 m4s 地址支持 Range，
+   * 用和 Telegram 一样的链式分段抓法整条拉下来即可，与看到了多少无关。
+   */
+  function biliPlayinfo() {
+    try {
+      if (window.__playinfo__ && window.__playinfo__.data && window.__playinfo__.data.dash) {
+        return window.__playinfo__.data;
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 从播放清单里提当前流的 cid（DASH baseUrl 路径里埋着 cid，如 /upgcxcode/99/91/137649199/…） */
+  function biliCidOfData(d) {
+    try {
+      const vs = (d && d.dash && d.dash.video) || [];
+      const top = vs.slice().sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0];
+      const m = /upgcxcode\/\d+\/\d+\/(\d+)\//.exec((top && (top.baseUrl || top.base_url)) || "");
+      return m ? m[1] : null;
+    } catch (e) { return null; }
+  }
+
+  /**
+   * 当前页面「实际在播」的那一集（分P）的 cid。
+   * B 站 SPA 切集时**不会重写 window.__playinfo__，也不会更新 __INITIAL_STATE__.videoData**，
+   * 但会实时更新：① window.player.getManifest().cid ② __INITIAL_STATE__ 顶层 cid 字段。
+   * 这就是第 ④ 点「切到下一集下载到的还是上一集」的根因与解药。
+   * 优先级：manifest（最准）> 顶层 state.cid > videoData.cid（兜底）。
+   */
+  function biliCurrentCid() {
+    try {
+      const m = window.player && typeof window.player.getManifest === "function" && window.player.getManifest();
+      if (m && m.cid != null) return String(m.cid);
+    } catch (e) { /* 忽略 */ }
+    try {
+      const s = window.__INITIAL_STATE__ || {};
+      if (s.cid != null) return String(s.cid);
+    } catch (e) { /* 忽略 */ }
+    try {
+      const vd = (window.__INITIAL_STATE__ || {}).videoData;
+      if (vd && vd.cid != null) return String(vd.cid);
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 当前分P对应的 aid / bvid（拼 playurl 接口用，从 manifest 或顶层 state 拿） */
+  function biliCurrentAidBvid() {
+    let aid = null, bvid = null;
+    try {
+      const m = window.player && typeof window.player.getManifest === "function" && window.player.getManifest();
+      if (m) { aid = m.aid; bvid = m.bvid; }
+    } catch (e) { /* 忽略 */ }
+    try {
+      const s = window.__INITIAL_STATE__ || {};
+      if (aid == null) aid = s.aid;
+      if (bvid == null) bvid = s.bvid;
+    } catch (e) { /* 忽略 */ }
+    return { aid, bvid };
+  }
+
+  /**
+   * 用 aid+cid 请求 B 站 playurl 接口，拿到该分P的完整 DASH 清单。
+   * 返回 { data: { dash: { video[], audio[] } } } 或 null。
+   * fnval=16 要 DASH（音视频分流），fourk=1 允许 4K，qn=64 要最高清晰度。
+   */
+  async function biliFetchPlayurl(aid, cid, bvid, signal) {
+    const q = new URLSearchParams();
+    if (aid) q.set("avid", aid);
+    if (bvid) q.set("bvid", bvid);
+    q.set("cid", cid);
+    q.set("qn", "64");
+    q.set("fnval", "16");
+    q.set("fnver", "0");
+    q.set("fourk", "1");
+    const url = "https://api.bilibili.com/x/player/playurl?" + q.toString();
+    try {
+      const resp = await fetch(url, { credentials: "include", signal });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (j && j.code === 0 && j.data && j.data.dash) return j;
+      return null;
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      return null;
+    }
+  }
+
+  /**
+   * 下载前保证 window.__playinfo__ 指向「当前在播分P」的清单。
+   * 检测 playinfo 里的 cid 是否等于实时 cid，不等就重新请求 playurl 并写回。
+   * 写回后 biliPlayinfo() 读到的就是新分P的流，runBiliDownload 自然下对集。
+   */
+  async function biliEnsureFresh(signal) {
+    if (!isBiliHost()) return;
+    const curCid = biliCurrentCid();
+    if (!curCid) return;
+    const d = biliPlayinfo();
+    const pinfoCid = biliCidOfData(d);
+    if (pinfoCid && String(pinfoCid) === String(curCid)) return; // 已是最新
+    const { aid, bvid } = biliCurrentAidBvid();
+    const j = await biliFetchPlayurl(aid, curCid, bvid, signal);
+    if (j && j.data && j.data.dash) {
+      try {
+        if (!window.__playinfo__) window.__playinfo__ = {};
+        // 只替换 data（playurl 返回的 data 与 __playinfo__.data 同形，含 dash），
+        // 不动 __playinfo__ 上的其他字段
+        window.__playinfo__.data = j.data;
+        log(`已刷新到当前分P（cid=${curCid}）`);
+      } catch (e) { /* 忽略 */ }
+    }
+  }
+
+  /**
+   * B 站视频页的完整视频不靠 <video src> 直链，而是 __playinfo__ 的 DASH 清单。
+   * 页面的 <video> 走 MSE，只有「播放过」才会 appendBuffer → 才有录制条目；
+   * 视频暂停（或刚载入还没播）时 background 里一条 video 都没有，popup 列表
+   * 自然全空（HANDOVER 9.11 的「唯一未解决」就是这个）。
+   *
+   * 所以这里在拿到 __playinfo__ 时就主动上报一条合成条目（哨兵 key），
+   * 与 MSE 是否播过无关。background 会把它建成 page=1 的 video 条目，
+   * popup 点「保存」走 pageSaveItem → runBiliDownload（它自己读 __playinfo__，
+   * 不看 key）。key 用与 popup.js 相同的 BILI_DASH_KEY，避免两边各造一条。
+   */
+  const BILI_DASH_KEY = "__bili_dash__";
+  let biliSig = "";
+  function reportBiliDash() {
+    if (!isBiliHost()) return;
+    const d = biliPlayinfo();
+    if (!d || !d.dash || !d.dash.video || !d.dash.video.length) return;
+    // 用「当前分P cid + 标题」当签名。SPA 切集时 __playinfo__ 里的 baseUrl 不换，
+    // 但 __INITIAL_STATE__.cid / manifest.cid 会实时更新，用它才能发现换集。
+    // （第 ④ 点根因：只签 baseUrl 的话，切集后签名不变，popup 标题停在旧集。）
+    const cid = biliCurrentCid() || biliCidOfData(d) || "";
+    const title = biliTitle();
+    // 分P 号必须进签名：同一 bvid 切集时标题常常一字不改（合集里很常见），
+    // 只签 cid+title 会出现「换了集但 popup 不刷新」。cid 变了一般够用，
+    // 但有些页面切集后 __INITIAL_STATE__ 滞后，这时 p 号是唯一的信号。
+    const part = biliPartTag();
+    const fullSig = cid + "|" + title + "|" + part;
+    if (fullSig === biliSig) return;
+    biliSig = fullSig;
+    // 名字直接拼成「标题-P2」，和 runBiliDownload 里算文件名用的是同一套规则，
+    // 这样列表里看到的和存下来的永远一致。
+    const shown = title || "bilibili";
+    post({
+      cmd: "found", source: "bili", key: BILI_DASH_KEY, size: 0,
+      mime: "video/mp4", title: part ? shown + part : shown,
+    });
+  }
+
+  /**
+   * B 站视频标题。站内改版频繁，选择器按「新旧版 + 兜底」顺序试：
+   *   - 新版视频页：h1.video-title（还在，但 class 可能带 hash 后缀）
+   *   - 旧版/部分页面：#viewbox_report h1、.video-info-title h1
+   *   - 番剧页：.mediainfo_mediaTitle h1
+   *   - 最后兜底 <title>，去掉「_哔哩哔哩」之类的后缀。
+   */
+  function biliTitle() {
+    const pick = (sel) => {
+      try {
+        const n = document.querySelector(sel);
+        const t = n ? (n.textContent || "").trim() : "";
+        return t.length > 1 ? t : "";
+      } catch (e) { return ""; }
+    };
+    const sels = [
+      "h1.video-title",
+      "h1.video-title[title]",
+      ".video-info-title h1",
+      "#viewbox_report h1",
+      ".mediainfo_mediaTitle h1",
+      ".video-title",
+      "h1[class*=video-title]",
+      "h1[class*=videoTitle]",
+    ];
+    for (const s of sels) {
+      const t = pick(s);
+      if (t) return cleanBiliTitle(t);
+    }
+    // 兜底：<title> 形如 "标题_哔哩哔哩_bilibili" / "标题 - 哔哩哔哩"
+    const dt = (document.title || "").trim();
+    if (dt) return cleanBiliTitle(dt);
+    return "bilibili";
+  }
+
+  /** 去掉 B 站标题尾巴与多余空白 */
+  function cleanBiliTitle(t) {
+    return String(t || "")
+      .replace(/[_\-|]\s*哔哩哔哩.*$/i, "")
+      .replace(/\s*[-_|]\s*bilibili.*$/i, "")
+      .replace(/\s*[-_|]\s*番剧\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  /**
+   * 题目里带 ?p=N 的分P号（同 bvid 下的第 N 集）。番剧页是 /bangumi/play/ep123，
+   * 一个 ep 就是一个文件，不需要区分，返回 ""。
+   * 为什么要它：同一合集里每一集的标题常常一模一样（「第 3 话」这种除外，
+   * 但「正片」类合集很常见同名），不带 p 号的话第二次保存会互相覆盖。
+   */
+  function biliPartTag() {
+    try {
+      const q = new URLSearchParams(location.search || "");
+      const p = Number(q.get("p") || 0);
+      return p > 1 ? "-P" + p : "";
+    } catch (e) { return ""; }
+  }
+
+  function biliPickStreams(d) {
+    const dash = d.dash || {};
+    const vids = (dash.video || []).slice();
+    const auds = (dash.audio || []).slice();
+    if (!vids.length) return null;
+    // 同分辨率下优先 avc（兼容性最好）；没有再退回带宽最高的
+    const bestH = Math.max.apply(null, vids.map((v) => v.id || 0));
+    const sameQ = vids.filter((v) => (v.id || 0) === bestH);
+    const avc = sameQ.filter((v) => /^avc/i.test(v.codecs || ""));
+    const video = (avc.length ? avc : sameQ).sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0];
+    const audio = auds.sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))[0] || null;
+    return { video, audio };
+  }
+
+  function biliUrls(stream) {
+    const out = [];
+    const push = (u) => { if (u && out.indexOf(u) < 0) out.push(u); };
+    push(stream.baseUrl || stream.base_url);
+    const bk = stream.backupUrl || stream.backup_url || [];
+    for (const u of bk) push(u);
+    return out;
+  }
+
+  /** 一条流整条抓下来（Range 链），落成单独文件 */
+  async function biliFetchStream(stream, name, onProgress, signal) {
+    const urls = biliUrls(stream);
+    if (!urls.length) throw new Error("播放清单里没有可用的地址");
+    // B 站 CDN 不返回 content-range，HEAD/尾字节又被 CORS 拒，
+    // 总长只能靠 sidx 算 —— 把 SegmentBase 的两个 range 交给 probeTotal。
+    const sb = stream.SegmentBase || {};
+    const seg = {
+      ct: stream.mimeType || "",
+      initRange: sb.Initialization || "",
+      indexRange: sb.indexRange || "",
+      // 放大档：B 站 m4s 是直连 CDN，不走 Telegram 那种串行 SW
+      big: true,
+      kind: /^audio\//i.test(stream.mimeType || "") ? "audio" : "video",
+    };
+    let lastErr = null;
+    for (const u of urls) {
+      try {
+        return await runRangeDownload({ key: u, name, onProgress, signal, hooks: seg });
+      } catch (e) {
+        if (e.name === "AbortError") throw e;
+        lastErr = e;
+        log(`备用地址失败，换下一个：${String(e.message || e).slice(0, 80)}`);
+      }
+    }
+    throw lastErr || new Error("所有地址都失败");
+  }
+
+  /**
+   * B 站整体保存：视频流 + 音频流先各自落盘（Range 链），
+   * 然后让本地宿主用 bin/ffmpeg.exe 无损封装（-c copy）合成单个 mp4。
+   * 合并跑在 detached 进程里：浏览器/页面中途关掉，合并也会完成；
+   * 合并失败不算下载失败——两条源流文件保留，note 里说明原因。
+   */
+  async function runBiliDownload(opts) {
+    const { name, onProgress, onStage, signal } = opts || {};
+    // 第 ④ 点修复：切分P后 __playinfo__ 不刷新，先校正到当前分P再下载
+    await biliEnsureFresh(signal);
+    const d = biliPlayinfo();
+    if (!d) throw new Error("没拿到播放清单（__playinfo__），请刷新页面后重试");
+    const picked = biliPickStreams(d);
+    if (!picked) throw new Error("播放清单里没有视频流");
+    // 文件名基名：优先用 popup 递过来的条目名（就是列表里看到的标题），
+    // 没有就现读页面标题；都拿不到才用 bilibili。
+    // 之前用户看到的是 bilibili.mp4 —— 名字在 popup 里被写死过一次，
+    // 这条链路上任何一处丢标题都会退化成通用名，所以这里再兜一层。
+    const wanted = safeFileName(stripExt(fileNameTitle(name || "")));
+    const partTag = biliPartTag();
+    // 条目名已经带了 -P2 就不重复拼（列表名和文件名用同一套规则）
+    const withPart = (s) => (s && partTag && !new RegExp(partTag + "$").test(s) ? s + partTag : s);
+    const base = withPart(wanted || safeFileName(stripExt(fileNameTitle(biliTitle() || ""))) || "bilibili");
+    const res = [];
+
+    onStage && onStage("正在下载视频流（完整流，与播放进度无关）…", 0);
+    const v = await biliFetchStream(picked.video, `${base}-video`, onProgress, signal);
+    res.push(v);
+    let a = null;
+    if (picked.audio && !(signal && signal.aborted)) {
+      onStage && onStage("正在下载音频流…", 0);
+      a = await biliFetchStream(picked.audio, `${base}-audio`, onProgress, signal);
+      res.push(a);
+    }
+    const received = res.reduce((s, r) => s + (r.received || 0), 0);
+
+    if (a && v.filename && a.filename && !(signal && signal.aborted)) {
+      try {
+        onStage && onStage("合并音视频…", 0);
+        const ack = await hostRequest(
+          { action: "msfile_merge", video: v.filename, audio: a.filename, out: base },
+          signal, 45000);
+        if (!ack || ack.ok === false) throw new Error((ack && ack.error) || "本地下载器无法开始合并");
+        const fin = await hostWaitJob(ack.id, {
+          onProgress: (pct) => onStage && onStage(`合并音视频… ${Math.round(pct)}%`, pct),
+          signal,
+        });
+        return {
+          ok: true, merged: true,
+          files: [(fin && fin.file) || (base + ".mp4")],
+          received,
+          filename: base + ".mp4",
+          note: "已自动合并为单文件（ffmpeg 无损封装，两条源流已清理）",
+        };
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
+        return {
+          ok: true, merged: false,
+          files: res.map((r) => r.filename), received,
+          filename: `${base}（视频+音频，未合并）`,
+          note: "自动合并失败（" + String(e.message || e).slice(0, 100)
+            + "），两个源文件已保留，可用 bin\\ffmpeg.exe 手动合并",
+        };
+      }
+    }
+    return {
+      ok: true, merged: false,
+      files: res.map((r) => r.filename), received,
+      filename: a ? `${base}（视频+音频，未合并）` : (v.filename || `${base}-video.mp4`).split(/[\\/]/).pop(),
+      note: a ? null : "清单里没有音频流，仅保存了视频流",
+    };
+  }
+
+  /** 等一个宿主后台任务（合并/下载）到终态：吃 progress 推送，done/error 落定 */
+  function hostWaitJob(id, opts) {
+    const { onProgress, signal, timeoutMs } = opts || {};
+    return new Promise((resolve, reject) => {
+      const finish = (fn, arg) => { cleanup(); fn(arg); };
+      const timer = setTimeout(
+        () => finish(reject, new Error("合并超时（30 分钟）")),
+        timeoutMs || 30 * 60 * 1000);
+      const onMsg = (msg) => {
+        if (!msg || msg.id !== id) return;
+        if (msg.action === "progress" && msg.status) {
+          const pct = Number(msg.percent) || 0;
+          try { onProgress && onProgress(pct); } catch (e) { /* 忽略 */ }
+        } else if (msg.action === "done") {
+          finish(resolve, msg);
+        } else if (msg.action === "error" || msg.action === "cancelled") {
+          finish(reject, new Error(msg.message || (msg.action === "cancelled" ? "已取消" : "合并失败")));
+        }
+      };
+      const onDisc = (msg) => {
+        if (!msg || !msg.__disconnected) return;
+        finish(reject, new Error("本地下载器已断开: " + (msg.error || "")));
+      };
+      function cleanup() {
+        clearTimeout(timer);
+        HOSTPORT.off(onMsg);
+        HOSTPORT.off(onDisc);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      }
+      function onAbort() {
+        // 合并在 detached 进程里，取消只能请宿主写取消标记（merger 会终止 ffmpeg）
+        try { HOSTPORT.send({ action: "cancel", id }); } catch (e) { /* 尽力而为 */ }
+        finish(reject, new DOMException("aborted", "AbortError"));
+      }
+      HOSTPORT.on(onMsg);
+      HOSTPORT.on(onDisc);
+      if (signal) {
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+  }
+
+  function isBiliHost() {
+    try { return /(^|\.)bilibili\.com$/i.test(location.hostname); } catch (e) { return false; }
+  }
+
+  function guessExtFromType(ct) {
+    const m = (ct || "").toLowerCase();
+    if (m.startsWith("audio/")) return extOf(m) === ".bin" ? ".m4a" : extOf(m);
+    if (m.startsWith("video/")) return extOf(m) === ".bin" ? ".mp4" : extOf(m);
+    return null;
+  }
+
+  function stamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  function stripExt(name) {
+    return (name || "").replace(/\.[a-z0-9]{2,5}$/i, "");
+  }
+
+  /**
+   * 组装最终文件名：标题/默认名 + 媒体标识 + 扩展名。
+   * Telegram 一条消息里可能有多个视频（相簿 / 同一消息多条），必须带上 media key
+   * 的尾部数字，否则同名文件会互相覆盖。
+   */
+  function finishName(name, key, ext) {
+    // 收成文件名长度再 sanitize：标题可能是整段聊天正文（见 fileNameTitle）
+    let base = safeFileName(stripExt(fileNameTitle(name || "")));
+    if (!base) {
+      const doc = /document(\d{6,})/.exec(key || "");
+      base = doc ? "tg-document" + doc[1].slice(-6) : "media-" + stamp();
+    }
+    const tail = /(\d{4,})\D*$/.exec(String(key || ""));
+    if (tail) base += "_" + tail[1].slice(-6);
+    return base + ext;
+  }
+
+  /** 给本地宿主发一条请求并等回复（同一个 id） */
+  function hostRequest(payload, signal, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      // 注意：payload 里带 id 时必须用它（msfile_chunk / msfile_end 要靠它定位
+      // 已打开的那个文件句柄）。早期这里无条件用新 id 覆盖，宿主收到 chunk 后
+      // 在 JOBS 里找不到对应 job，只能静默丢弃 —— 表现正是「文件建好了、大小对、
+      // 但内容全是 0」。
+      const id = payload.id || ("msf-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7));
+      const wait = timeoutMs || 45000;
+      const timer = setTimeout(() => { cleanup(); reject(new Error("本地下载器无响应")); }, wait);
+      const onMsg = (msg) => {
+        if (!msg || msg.id !== id) return;
+        cleanup();
+        resolve(msg);
+      };
+      const onDisc = (msg) => {
+        if (!msg || !msg.__disconnected) return;
+        cleanup();
+        reject(new Error("本地下载器已断开: " + (msg.error || "")));
+      };
+      function cleanup() {
+        clearTimeout(timer);
+        HOSTPORT.off(onMsg);
+        HOSTPORT.off(onDisc);
+      }
+      HOSTPORT.on(onMsg);
+      HOSTPORT.on(onDisc);
+      if (signal) {
+        signal.addEventListener("abort", () => { cleanup(); reject(new DOMException("aborted", "AbortError")); }, { once: true });
+      }
+      HOSTPORT.send({ ...payload, id });
+    });
+  }
+
+  // ------------------------------------------------------------ 下载进度卡（页面内悬浮 UI）
+
+  const UI = { root: null, bar: null, text: null, btn: null, job: null, stage: "", lastFile: "" };
+
+  function uiEnsure() {
+    if (UI.root && document.documentElement.contains(UI.root)) return UI.root;
+    try {
+      const host = document.body || document.documentElement;
+      const root = document.createElement("div");
+      root.id = "__ms_sniffer_ui";
+      root.style.cssText = [
+        "position:fixed", "right:18px", "bottom:18px", "z-index:2147483647",
+        "width:320px", "padding:12px 14px", "border-radius:12px",
+        "background:rgba(22,22,26,.94)", "color:#f5f5f7", "font:13px/1.5 system-ui,'Segoe UI',sans-serif",
+        "box-shadow:0 8px 28px rgba(0,0,0,.38)", "backdrop-filter:blur(6px)",
+      ].join(";");
+      const title = document.createElement("div");
+      title.textContent = "资源嗅探 · 保存";
+      title.style.cssText = "font-weight:600;margin-bottom:6px";
+      // 阶段标签（第 3 点）：单独一行，告诉用户「在下载视频」还是「在下载音频」。
+      // 不能揉进进度文字里——那行每 400ms 就被 uiProgress 整行重写一次。
+      const stage = document.createElement("div");
+      stage.style.cssText = [
+        "display:none", "font-size:11.5px", "font-weight:600", "color:#93c5fd",
+        "margin-bottom:4px", "letter-spacing:.3px",
+      ].join(";");
+      const text = document.createElement("div");
+      text.style.cssText = "font-size:12px;opacity:.86;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      text.textContent = "准备中…";
+      const barWrap = document.createElement("div");
+      barWrap.style.cssText = "height:6px;border-radius:3px;background:rgba(255,255,255,.16);margin:8px 0;overflow:hidden";
+      const bar = document.createElement("i");
+      bar.style.cssText = "display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .25s";
+      barWrap.append(bar);
+      // 按钮行：取消/关闭在左，「打开所在文件夹」在右（下载完才出现）
+      const actions = document.createElement("div");
+      actions.style.cssText = "display:flex;gap:8px;align-items:center;justify-content:space-between;margin-top:2px";
+      const btn = document.createElement("button");
+      btn.textContent = "取消";
+      btn.style.cssText = [
+        "appearance:none", "border:0", "border-radius:8px", "padding:5px 12px",
+        "background:rgba(255,255,255,.14)", "color:#fff", "font:12px system-ui", "cursor:pointer",
+      ].join(";");
+      const revealBtn = document.createElement("button");
+      revealBtn.textContent = "打开所在文件夹";
+      revealBtn.style.cssText = [
+        "appearance:none", "border:0", "border-radius:8px", "padding:5px 12px", "display:none",
+        "background:#2563eb", "color:#fff", "font:12px system-ui", "cursor:pointer",
+      ].join(";");
+      actions.append(btn, revealBtn);
+      root.append(title, stage, text, barWrap, actions);
+      host.appendChild(root);
+      Object.assign(UI, { root, bar, text, btn, stage, revealBtn });
+      return root;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function uiShow(name) {
+    const root = uiEnsure();
+    if (!root) return;
+    UI.text.textContent = "准备中… " + (name || "");
+    UI.text.title = "";
+    UI.bar.style.width = "0%";
+    UI.btn.textContent = "取消";
+    UI.btn.disabled = false;
+    UI.stage.textContent = "";
+    UI.stage.style.display = "none";
+    UI.revealBtn.style.display = "none";
+  }
+
+  function uiProgress(got, total, speed, name) {
+    const root = uiEnsure();
+    if (!root) return;
+    lastUiAt = Date.now();
+    const pct = total ? (got / total) * 100 : 0;
+    UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    const parts = total > 0
+      ? [`${pct.toFixed(1)}%  ${fmtBytes(got)} / ${fmtBytes(total)}`]
+      : [fmtBytes(got)];
+    if (speed) parts.push(fmtBytes(speed) + "/s");
+    // 有阶段名时保留阶段标签行，数字行只放进度，避免两种信息互相覆盖
+    if (UI.stage && UI.stage.style.display !== "none" && UI.stage.textContent) {
+      UI.text.textContent = parts.join("  ·  ");
+    } else {
+      UI.text.textContent = parts.join("  ·  ") + (name ? "  ·  " + name : "");
+    }
+    UI.text.title = name || "";
+  }
+
+  // 心跳：上一次真正拿到新字节的时间。Telegram 的单段要 1-6 秒才回来，
+  // 那期间进度条完全不动，用户会以为卡死（真机反馈「卡到 17%」就是这么来的）。
+  // 超过 1.2 秒没新字节就补一行「等待数据…」，让人知道还在跑。
+  let lastUiAt = 0;
+  let uiHeartbeat = null;
+  function startUiHeartbeat() {
+    stopUiHeartbeat();
+    lastUiAt = Date.now();
+    uiHeartbeat = setInterval(() => {
+      if (!UI.root) return;
+      const idle = Date.now() - lastUiAt;
+      if (idle < 1200) return;
+      const base = UI.text.textContent.replace(/\s*·\s*等待数据…$/, "");
+      UI.text.textContent = base + "  ·  等待数据…";
+    }, 600);
+  }
+  function stopUiHeartbeat() {
+    if (uiHeartbeat) { clearInterval(uiHeartbeat); uiHeartbeat = null; }
+  }
+
+  /**
+   * 阶段提示（下载视频流 / 音频流 / 合并中）。
+   *
+   * 第 3 点要求：下载视频时提示「正在下载视频」，下载音频时提示「正在下载音频」。
+   * 做法是把阶段名放进独立的 stage 标签行（蓝色小字），并让它**优先于**
+   * uiProgress 的纯数字行——否则每 400ms 一次进度回调就会把阶段名冲掉。
+   * 当前阶段同时记在 UI.stage，供 uiProgress 拼前缀。
+   */
+  function uiStage(text, pct) {
+    const root = uiEnsure();
+    if (!root) return;
+    if (typeof pct === "number") UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    if (!text) return;
+    const t = String(text).trim();
+    // 合并阶段不属于「下载视频/音频」，也让标签行如实反映
+    UI.stage.textContent = t;
+    UI.stage.style.display = t ? "block" : "none";
+    UI.text.textContent = t;
+  }
+
+  function uiDone(ok, msg, file) {
+    const root = uiEnsure();
+    if (!root) return;
+    stopUiHeartbeat();
+    UI.stage.style.display = "none";
+    UI.text.textContent = ok ? "完成 · " + msg : "失败 · " + msg;
+    UI.text.title = msg || "";
+    UI.btn.textContent = "关闭";
+    UI.btn.disabled = false;
+    UI.btn.onclick = () => { try { UI.root.remove(); UI.root = null; } catch (e) { /* 忽略 */ } };
+    if (ok) {
+      UI.bar.style.width = "100%";
+      // 第 5 点：下载完给一个「打开所在文件夹」按钮，直接定位到刚落盘的文件
+      if (UI.revealBtn) {
+        UI.revealBtn.style.display = "inline-block";
+        UI.revealBtn.disabled = false;
+        UI.revealBtn.textContent = "打开所在文件夹";
+        UI.revealBtn.onclick = async () => {
+          UI.revealBtn.disabled = true;
+          const old = UI.revealBtn.textContent;
+          UI.revealBtn.textContent = "正在打开…";
+          try {
+            const r = await hostRequest({ action: "reveal", file: file || "" }, null, 15000);
+            if (r && r.ok === false) throw new Error(r.error || "打开失败");
+            // 不自动关卡片：用户可能还要点第二次
+            UI.revealBtn.textContent = "已打开";
+          } catch (e) {
+            UI.revealBtn.textContent = "打开失败";
+            UI.revealBtn.title = String((e && e.message) || e).slice(0, 120);
+          }
+          setTimeout(() => {
+            if (!UI.revealBtn) return;
+            UI.revealBtn.textContent = old;
+            UI.revealBtn.disabled = false;
+          }, 1800);
+        };
+      }
+      // 成功自动消失：原来固定 6s，现在有「打开文件夹」按钮，给足 12s
+      setTimeout(() => { try { if (UI.root) { UI.root.remove(); UI.root = null; } } catch (e) { /* 忽略 */ } }, 12000);
+    }
+  }
+
+  let currentAbort = null;
+
+  /** 开始一次 Range 链下载 */
+  async function startMediaDownload(key, name, ctx, onDone) {
+    if (currentAbort) {
+      onDone && onDone({ ok: false, error: "已有任务在进行中" });
+      return;
+    }
+    const ctrl = new AbortController();
+    currentAbort = ctrl;
+    uiShow(name);
+    UI.btn.onclick = () => { try { ctrl.abort(); } catch (e) { /* 忽略 */ } };
+    UI.btn.textContent = "取消";
+    const t0 = Date.now();
+    startUiHeartbeat();
+    try {
+      const useBili = isBiliHost() && biliPlayinfo() && (ctx && ctx.bili !== "off");
+      const r = useBili
+        ? await runBiliDownload({
+            name,
+            onProgress: (got, total, speed) => uiProgress(got, total, speed, name),
+            onStage: (text, pct) => uiStage(text, pct),
+            signal: ctrl.signal,
+          })
+        : await runRangeDownload({
+            key,
+            name,
+            onProgress: (got, total, speed) => uiProgress(got, total, speed, name),
+            // 普通站点没有音视频分流，阶段统一叫「正在下载」
+            onStage: (text, pct) => uiStage(text, pct),
+            signal: ctrl.signal,
+            hooks: ctx || {},
+          });
+      const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+      const msg = `${r.filename || name}（${fmtBytes(r.received)}，${secs}s，${fmtBytes(r.received / secs)}/s）`;
+      // 「打开所在文件夹」要定位到具体文件：r.filename 是宿主返回的绝对路径
+      // （msfile_end / merge done 都带 file 字段）
+      const lastFile = (r.files && r.files[0]) || r.filename || "";
+      uiDone(true, msg + (r.note ? " · " + r.note : ""), /[\\/]/.test(lastFile) ? lastFile : "");
+      post({
+        cmd: "saved", key, ok: true, filename: r.filename, files: r.files || null,
+        size: r.received,
+        format: useBili
+          ? (r.merged ? "B 站完整流（已合并单文件）" : "B 站完整流（视频+音频分开）")
+          : "Range 链式下载",
+        mode: "page",
+      });
+      onDone && onDone({ ok: true, filename: r.filename, files: r.files || null, size: r.received });
+    } catch (e) {
+      const err = e.name === "AbortError" ? "已取消" : String((e && e.message) || e).slice(0, 120);
+      uiDone(false, err);
+      post({ cmd: "saved", key, ok: false, error: err });
+      onDone && onDone({ ok: false, error: err });
+    } finally {
+      stopUiHeartbeat();
+      currentAbort = null;
+    }
+  }
+
+  // ------------------------------------------------------------ 6. 页面内「保存」浮层（用户手势保留在这里）
+
+  const OV = { root: null, wrap: null, name: null };
+
+  function overlayClose() {
+    try { if (OV.root) OV.root.remove(); } catch (e) { /* 忽略 */ }
+    OV.root = null;
+  }
+
+  function overlayShow(items) {
+    overlayClose();
+    const host = document.body || document.documentElement;
+    const root = document.createElement("div");
+    root.id = "__ms_sniffer_overlay";
+    root.style.cssText = [
+      "position:fixed", "inset:0", "z-index:2147483647", "background:rgba(0,0,0,.42)",
+      "display:flex", "align-items:center", "justify-content:center",
+      "font:14px/1.5 system-ui,'Segoe UI',sans-serif",
+    ].join(";");
+    const card = document.createElement("div");
+    card.style.cssText = [
+      "position:relative", "width:440px", "max-width:92vw", "max-height:76vh",
+      "display:flex", "flex-direction:column",
+      "padding:18px 20px", "box-sizing:border-box",
+      "border-radius:14px", "background:#17171c", "color:#f2f2f5", "box-shadow:0 18px 48px rgba(0,0,0,.5)",
+    ].join(";");
+
+    // ---- 关闭按钮：卡片右上角（用户第 2 点要求）----
+    // 用绝对定位而不是 flex 排进标题行：标题长度不定，绝对定位才能保证
+    // 「永远在右上角」这个位置在任何标题长度下都不动。
+    const closeBtn = document.createElement("button");
+    closeBtn.textContent = "✕";
+    closeBtn.title = "关闭";
+    closeBtn.style.cssText = [
+      "position:absolute", "top:10px", "right:10px",
+      "appearance:none", "border:0", "width:26px", "height:26px", "line-height:1",
+      "border-radius:7px", "cursor:pointer",
+      "background:rgba(255,255,255,.10)", "color:#d0d0d8", "font:14px system-ui",
+    ].join(";");
+    closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(255,255,255,.2)"; });
+    closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "rgba(255,255,255,.10)"; });
+    closeBtn.addEventListener("click", overlayClose);
+    card.append(closeBtn);
+
+    const h = document.createElement("div");
+    h.textContent = items.length > 1 ? `资源嗅探 · ${items.length} 个媒体` : "资源嗅探 · 保存媒体";
+    // 右边留出关闭按钮的位置，标题再长也不会被压到按钮底下
+    h.style.cssText = "font-size:15px;font-weight:600;margin-bottom:10px;padding-right:34px";
+    card.append(h);
+
+    // 串行队列：Range 链下载一次只跑一条，避免把带宽和 SW 打满
+    const queue = [];
+    let busy = false;
+    const runQueue = async () => {
+      if (busy) return;
+      busy = true;
+      while (queue.length) {
+        const job = queue.shift();
+        await new Promise((resolve) => startMediaDownload(job.key, job.name, job.ctx, () => resolve()));
+      }
+      busy = false;
+      overlayClose();
+    };
+
+    // 真正的「保存」动作抽出来：底部右下的保存按钮和每行的点击都走这里
+    const runSave = (it, btn) => {
+      // 关键：点击事件在手势栈里，直接发起保存
+      // B 站：blob/MSE 只是「看到哪儿就录到哪儿」，一律改走完整流
+      if (isBiliHost() && biliPlayinfo()) {
+        overlayClose();
+        startMediaDownload(it.key, it.name, { bili: "on" }, () => {});
+        return;
+      }
+      if (/^blob:/i.test(it.key)) {
+        overlayClose();
+        doSaveBlob(it.key, it.name);
+        return;
+      }
+      if (/^m\d+$/.test(it.key)) {
+        overlayClose();
+        doSaveMse(it.key, it.name);
+        return;
+      }
+      queue.push({ key: it.key, name: it.name, ctx: it.ctx || {} });
+      if (btn) {
+        btn.disabled = true;
+        btn.style.opacity = ".45";
+        btn.textContent = "排队中…";
+      }
+      runQueue();
+    };
+
+    // 条目区单独滚动，标题和底栏固定（不然 max-height 一撑，按钮会被滚出视野）
+    const listBox = document.createElement("div");
+    listBox.style.cssText = "overflow:auto;flex:1;min-height:0";
+
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid rgba(255,255,255,.08)";
+      const label = document.createElement("div");
+      label.style.cssText = "flex:1;min-width:0;cursor:pointer";
+      const nm = document.createElement("div");
+      nm.textContent = it.name || "（未命名媒体）";
+      nm.style.cssText = "font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
+      nm.title = it.key;
+      const sub = document.createElement("div");
+      sub.textContent = it.sub || "";
+      sub.style.cssText = "font-size:11.5px;opacity:.6";
+      label.append(nm, sub);
+      // 只有一条时，点整行就等于点保存；多条时靠底部「全部保存」
+      label.addEventListener("click", () => {
+        if (items.length === 1) runSave(it, null);
+      });
+      row.append(label);
+      listBox.append(row);
+    }
+    card.append(listBox);
+
+    // ---- 底栏：说明文字在左，「保存到本地」在右下角（用户第 2 点要求）----
+    const foot = document.createElement("div");
+    foot.style.cssText = [
+      "display:flex", "align-items:flex-end", "justify-content:space-between",
+      "gap:14px", "margin-top:12px",
+    ].join(";");
+    const footText = document.createElement("div");
+    footText.style.cssText = "flex:1;min-width:0;font-size:11.5px;opacity:.55;line-height:1.45";
+    footText.textContent = isBiliHost()
+      ? "B 站走完整流抓取（视频流 + 音频流分开落盘），与播放进度无关。下载完成后会用 bin/ 目录自带的 ffmpeg 自动合并成单文件。"
+      : "媒体由页面自己分段取回，直接写入本地下载器目录。多个文件会依次保存。";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.textContent = items.length > 1 ? `全部保存（${items.length}）` : "保存到本地";
+    saveBtn.style.cssText = [
+      "appearance:none", "border:0", "border-radius:9px", "padding:9px 18px", "cursor:pointer",
+      "background:#2563eb", "color:#fff", "font:13px system-ui", "font-weight:600", "white-space:nowrap",
+      "flex:0 0 auto", "box-shadow:0 2px 10px rgba(37,99,235,.4)",
+    ].join(";");
+    saveBtn.addEventListener("click", () => {
+      if (items.length === 1) {
+        runSave(items[0], saveBtn);
+        return;
+      }
+      // 多条：全部排进队列（按钮交给 runQueue 统一推进度）
+      saveBtn.disabled = true;
+      saveBtn.style.opacity = ".55";
+      saveBtn.textContent = "保存中…";
+      for (const it of items) queue.push({ key: it.key, name: it.name, ctx: it.ctx || {} });
+      runQueue();
+    });
+    foot.append(footText, saveBtn);
+    card.append(foot);
+    root.append(card);
+    root.addEventListener("click", (e) => { if (e.target === root) overlayClose(); });
+    host.appendChild(root);
+    OV.root = root;
+  }
+
+  function onEsc(e) {
+    if (e.key === "Escape") overlayClose();
+  }
+  document.addEventListener("keydown", onEsc, true);
+
+  function overlayOpen(items) {
+    if (!items || !items.length) return;
+    overlayShow(items);
+  }
+
+  /** popup 传来的媒体清单 → 打开页面浮层（popup 的通知只是兜底） */
+  function beginSaveBatch(list) {
+    const items = (list || [])
+      .filter((x) => x && x.key)
+      .map((x) => ({
+        key: x.key,
+        // 统一在入口收一次：popup、旧版直连保存、全部保存三条路都过这里
+        name: fileNameTitle(x.name || ""),
+        sub: x.sub || "",
+        ctx: { ct: x.ct || "", mid: x.mid || "", ref: x.ref || "" },
+      }));
+    if (!items.length) return;
+    if (items.length === 1) {
+      // 只有一个：仍然用浮层，让用户的手势落在按钮上
+      overlayShow(items);
+    } else {
+      overlayShow(items);
+    }
+  }
+
+  // ------------------------------------------------------------ 7. 指令
+
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    const d = e.data;
+    if (!d) return;
+
+    if (d.__ms_sniffer_host) {
+      // content.js 转来的 Native Host 消息
+      if (d.cmd === "host-message") HOSTPORT.deliver(d.payload);
+      else if (d.cmd === "host-disconnected") HOSTPORT.disconnected(d.error);
+      return;
+    }
+
+    if (!d.__ms_sniffer_cmd) return;
+
+    if (d.cmd === "hello") {
+      for (const rec of blobs.values()) {
+        post({ cmd: "found", source: "blob", key: rec.url, size: rec.size, mime: rec.type, ext: extOf(rec.type) });
+        if (titles.get(rec.url)) post({ cmd: "progress", key: rec.url, title: titles.get(rec.url) });
+      }
+      for (const url of seenSrc) {
+        if (!blobs.has(url)) {
+          const ct = mediaSeen.get(url) || {};
+          post({ cmd: "found", source: "mediasrc", key: url, size: ct.size || 0, mime: ct.ct || "video/mp4", ext: extOf(ct.ct) });
+        }
+      }
+      for (const entry of mse.values()) {
+        post({ cmd: "found", source: "mse", key: entry.id, size: entry.size, mime: entry.mime, ext: extOf(entry.mime), live: true });
+      }
+      // 扩展重载后 background 状态被清，重置签名以便重报 B 站 DASH 条目
+      biliSig = "";
+      reportBiliDash();
+      return;
+    }
+
+    if (d.cmd === "save") {
+      // 兼容旧链路：popup 直接点名保存
+      const k = String(d.key || d.id || "");
+      if (/^https?:/i.test(k)) {
+        // 必须在页面里下：本地下载器过不了 Service Worker
+        const list = [{ key: k, name: d.filename || "", sub: "Range 链式下载", ctx: {} }];
+        beginSaveBatch(list);
+        post({ cmd: "progress", key: k, state: "overlay" });
+      } else if (k.startsWith("blob:")) {
+        doSaveBlob(k, d.filename);
+      } else {
+        doSaveMse(k, d.filename);
+      }
+      return;
+    }
+
+    if (d.cmd === "save-batch") {
+      beginSaveBatch(d.items || []);
+      return;
+    }
+  });
+
+  // ------------------------------------------------------------ 8. Blob / MSE 老路径（保留）
+
+  async function sniffType(blob) {
+    try {
+      const buf = await blob.slice(0, 16).arrayBuffer();
+      const ext = sniffExt(new Uint8Array(buf));
+      if (!ext) return null;
+      return { ext, mime: extOf(ext) === ".mp4" ? "video/mp4" : blob.type || "application/octet-stream" };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function downloadBlob(blob, name, meta) {
+    if (!blob || !blob.size) {
+      return { ok: false, error: "数据为空（可能流已结束或该 blob 无法直接读取）" };
+    }
+    const sniff = await sniffType(blob);
+    let base = stripExt(sanitize(fileNameTitle(name)));
+    if (!base) base = "media-" + stamp();
+    const ext = sniff ? sniff.ext : (extOf(blob.type) !== ".bin" ? extOf(blob.type) : "");
+    const finalName = base + ext;
+
+    const url = origCreate(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = finalName;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => { try { origRevoke(url); } catch (e) { /* 忽略 */ } }, 60000);
+
+    return {
+      ok: true,
+      filename: finalName,
+      size: blob.size,
+      format: sniff ? sniff.mime : (blob.type || "未知"),
+      ext: ext || null,
+      ...meta,
+    };
+  }
+
+  async function doSaveBlob(key, filename) {
+    let rec = blobs.get(key);
+    if (!rec) {
+      // Telegram 这种「Worker 里 createObjectURL」的站点：URL 是页面拿到的，
+      // 但 blob 由 <video> 的私有存储持有。直接重试 fetch 一次成本很低，值得做，
+      // 成功了就顺手记下来，后面再保存就不用再取。
+      try {
+        const res = await fetch(key, { cache: "force-cache", credentials: "include" });
+        if (res.ok) {
+          const blob = await res.blob();
+          if (blob && blob.size) {
+            rec = { url: key, blob, size: blob.size, type: blob.type || "video/mp4" };
+            blobs.set(key, rec);
+          }
+        }
+      } catch (e) { /* 取不到就走下面的错误分支 */ }
+    }
+    if (!rec) {
+      post({ cmd: "saved", key, ok: false, error: "页面已释放该 Blob，重新播放一次再试" });
+      return;
+    }
+    downloadBlob(rec.blob, fileNameTitle(filename || titles.get(key) || "")).then((r) => post({ cmd: "saved", key, ...r }));
+  }
+
+  function doSaveMse(id, filename) {
+    const entry = mse.get(id);
+    if (!entry || !entry.chunks.length) {
+      post({ cmd: "saved", key: id, ok: false, error: "还没捕获到数据，或流已结束" });
+      return;
+    }
+    const blob = new Blob(entry.chunks, { type: entry.mime });
+    downloadBlob(blob, fileNameTitle(filename || ""), { experimental: true }).then((r) => post({ cmd: "saved", key: id, ...r }));
+  }
+
+  post({ cmd: "ready" });
+
+  // 调试入口（只有测试脚本 / 控制台排障会调用）
+  window.__msRangeFetch = fetchRange;
+  window.__msProbeTotal = probeTotal;
+  window.__msRangeDownload = runRangeDownload;
+  window.__msRunBiliDownload = runBiliDownload; // 供真机排查
+  window.__msBiliEnsureFresh = biliEnsureFresh; // 供真机排查（第④点切集修复）
+  window.__msBiliCurrentCid = biliCurrentCid; // 供真机排查
+  window.__msParseSidxTotal = parseSidxTotal;
+  window.__msStartMediaDownload = startMediaDownload;
+  window.__msNativeMedia = () => [...mediaSeen.entries()].map(([u, v]) => ({ url: u, ...v }));
+  window.__msFileNameTitle = fileNameTitle; // 文件名截断规则（测试要直接断言）
+  window.__msSafeFileName = safeFileName;   // 文件名清洗（百分号解码 / 首尾点 / 非法字符）
+  window.__msBiliPartTag = biliPartTag;     // 分P号后缀
+  window.__msIsXhsHost = isXhsHost;         // 小红书排查入口
+  window.__msXhsNoteId = xhsCurrentNoteId;  // 当前帖子 noteId（详情页才有）
+})();

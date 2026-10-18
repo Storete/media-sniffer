@@ -1,0 +1,45 @@
+# ── 二进制 / 大文件 ─────────────────────────────────────────────
+# ffmpeg.exe + ffprobe.exe ≈ 323 MB，远超 GitHub 单文件 100 MB 上限。
+# 需要时把 ffmpeg 放进 bin/，或装到系统 PATH（setup.py status 会告诉你找没找到）。
+bin/*.exe
+bin/*.dll
+bin/*.so
+bin/*.dylib
+bin/
+
+# ── 密钥 / 签名（绝不能进仓库）─────────────────────────────────
+# keys/private_key.pem 是扩展签名私钥，泄露 = 任何人都能伪造这个 ID 的 .crx。
+keys/
+*.pem
+*.crx
+*.zip
+
+# ── 本机生成物（每台机器各不相同）──────────────────────────────
+# setup.py install 时自动生成，仓库里只留 .example 模板。
+native-host/host_manifest.json
+native-host/python_path.txt
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 构建产物 ─────────────────────────────────────────────────
+build/
+
+# ── 调试 / 真机验证脚本（依赖本机 Chrome 路径和端口，不适合公开）──
+cdp_*.js
+bench_*.js
+probe_*.js
+prep_debug_profile.js
+start_chrome_debug.ps1
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log

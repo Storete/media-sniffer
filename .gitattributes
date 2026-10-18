@@ -1,0 +1,23 @@
+# 安装器是 .bat（CRLF），Python/JS 用 LF
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.ps1           text eol=crlf
+*.py            text eol=lf
+*.js            text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.html          text eol=lf
+*.css           text eol=lf
+
+# 二进制
+*.png           binary
+*.jpg           binary
+*.ico           binary
+*.exe           binary
+.gitattributes
+text eol=lf
+.gitignore
+text eol=lf
+LICENSE
+text eol=lf
+*.example text eol=lf

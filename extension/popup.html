@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>资源嗅探</title>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span class="logo">◎</span>
+      <div>
+        <h1>资源嗅探</h1>
+        <div id="site" class="site">—</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="saveAll" class="icon-btn" title="把所有页面内捕获的视频/音频交给页面保存">⇩</button>
+      <button id="reload" class="icon-btn" title="重新载入页面以捕获全部资源">⟳</button>
+      <button id="clear" class="icon-btn" title="清空当前列表">🗑</button>
+    </div>
+  </header>
+
+  <nav id="chips" class="chips"></nav>
+
+  <main id="list" class="list">
+    <div class="empty">正在读取…</div>
+  </main>
+
+  <div id="preview" class="preview hidden">
+    <button id="previewClose" class="icon-btn preview-close" title="关闭预览">✕</button>
+    <div id="previewBody"></div>
+  </div>
+
+  <footer>
+    <div class="row">
+      <span id="hostState" class="host pill">检测本地下载器…</span>
+      <label class="opt" title="并发分片数，越大越快">
+        并发
+        <input id="concurrency" type="number" min="1" max="64" value="16" />
+      </label>
+      <button id="openOut" class="icon-btn outdir-btn" title="打开文件存放处">📁</button>
+      <button id="openLog" class="icon-btn outdir-btn" title="打开排查日志（host.log）">📄</button>
+      <span id="hint" class="hint"></span>
+    </div>
+    <div id="jobs" class="jobs"></div>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

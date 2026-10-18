@@ -1,0 +1,9 @@
+{
+  "name": "com.starmediasniffer.host",
+  "description": "Media Sniffer native host (yt-dlp bridge)",
+  "path": "C:\path\to\media-sniffer\native-host\run_host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://fofimjophfaibckjioaffoglkidppifo/"
+  ]
+}
