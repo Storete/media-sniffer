@@ -212,18 +212,36 @@ footer {
 
 .hint { font-size: 11px; color: var(--text-dim); margin-left: auto; }
 
-/* 底部文字按钮（「打开文件夹」「本次记录」）：比图标按钮醒目，用户反馈图标看不懂 */
+/* 底部文字按钮：不同功能用不同浅色底区分（只染底色，不遮文字） */
 .btn-txt {
   padding: 3px 9px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #fff;
-  color: var(--text-dim);
+  color: var(--text);
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
 }
-.btn-txt:hover { background: var(--brand-soft); color: var(--brand); border-color: #c7d7fe; }
+.btn-txt.tint-blue { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
+.btn-txt.tint-blue:hover { background: #dbeafe; }
+.btn-txt.tint-green { background: #f0fdf4; border-color: #bbf7d0; color: #15803d; }
+.btn-txt.tint-green:hover { background: #dcfce7; }
+/* 历史行内的小操作按钮，同样用颜色区分（琥珀=打开文件夹，红=删除） */
+.h-act {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 10.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+.h-act.amber { background: #fffbeb; border-color: #fde68a; color: #b45309; }
+.h-act.amber:hover { background: #fef3c7; }
+.h-act.red { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
+.h-act.red:hover { background: #fee2e2; }
+.h-act[disabled] { opacity: .45; cursor: default; }
 
 /* 本次下载记录（浏览器会话内，关浏览器即清） */
 .history {
@@ -257,13 +275,15 @@ footer {
   color: var(--text);
   display: flex;
   gap: 6px;
-  align-items: baseline;
+  align-items: center;
   word-break: break-all;
 }
 .history .h-item .t { color: var(--text-dim); flex: none; }
 .history .h-item.ok .n { color: var(--text); }
 .history .h-item.err .n { color: var(--err); }
 .history .h-item .s { color: var(--text-dim); flex: none; }
+.history .h-item .sp { flex: 1; }  /* 弹性占位：把操作按钮推到行尾 */
+.history .h-item .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .jobs { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 84px; overflow-y: auto; }.job { font-size: 11px; color: var(--text-dim); }
 .job .bar {

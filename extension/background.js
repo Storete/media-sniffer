@@ -281,7 +281,7 @@ async function notifySaved(p) {
   try {
     const { history } = await chrome.storage.session.get({ history: [] });
     const list = Array.isArray(history) ? history : [];
-    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80) });
+    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
     while (list.length > 100) list.shift();
     await chrome.storage.session.set({ history: list });
   } catch (e) { /* 忽略 */ }
@@ -1217,12 +1217,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
       case "native:reveal-file": {
-        // popup「打开所在文件夹」：优先定位到最近完成下载的那个文件（reveal file），
-        // 没记录（或记录的文件已不存在/不在下载目录）则退回打开下载目录。
+        // 「所在文件夹」：优先用调用方（popup 历史行）指定的 file；
+        // 没指定就退回最近完成下载的那个文件；再没有就只打开下载目录。
         // 白名单校验在宿主 do_reveal 里做，这里只负责把 file 传过去。
         try {
-          const lr = (await chrome.storage.local.get("lastResult")).lastResult;
-          const file = (lr && lr.ok && lr.file) || "";
+          let file = (msg && msg.file) || "";
+          if (!file) {
+            const lr = (await chrome.storage.local.get("lastResult")).lastResult;
+            file = (lr && lr.ok && lr.file) || "";
+          }
           postNative({ action: "reveal", id: "reveal-" + Date.now(), file });
           sendResponse({ ok: true, file });
         } catch (e) {

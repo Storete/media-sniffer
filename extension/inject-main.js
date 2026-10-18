@@ -364,6 +364,11 @@
         const t = xhsNoteTitle();
         if (t) return t;
       }
+      // 小红书首页/发现页：封面的标题在它所属 note-item 卡片的文字区里
+      if (isXhsHost()) {
+        const t = xhsFeedTitle(el);
+        if (t) return t;
+      }
       const t = el.getAttribute("title") || el.getAttribute("aria-label") || el.title;
       if (t && t.trim() && !isJunkTitle(t)) return sanitize(t);
       // 优先用气泡正文：它是这段媒体真正的「标题」，比往上抓整层 innerText 干净
@@ -675,6 +680,52 @@
       while (n && n.nodeType === 1 && d < 30) {
         const hint = String(n.className || "") + " " + String(n.id || "");
         if (XHS_COMMENT_CLASS.test(hint)) return true;
+        n = n.parentElement; d++;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+  /** 首页信息流封面的标题（图二诉求：给捕获到的封面加标题）。
+   *  首页/发现页的每个卡片是 `<section class="note-item" data-note-id=…>`，
+   *  封面图在卡片上半部分，标题文字在卡片下方的 <a>/span 里。
+   *  从图向上找最近的 note-item / section[data-note-id] 容器，
+   *  再在容器里取一段最像标题的纯文本（跳过作者行/互动数字）。
+   *  只在**非详情页**用（详情页走 xhsNoteTitle()，读 __INITIAL_STATE__）。 */
+  function xhsFeedTitle(el) {
+    try {
+      if (xhsCurrentNoteId()) return "";   // 详情页不用这条
+      let card = null;
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 30) {
+        const cls = String(n.className || "");
+        if (/\bnote-item\b|\bfeed-item\b|note-card|section-item/i.test(cls)
+          || (n.tagName === "SECTION" && n.getAttribute("data-note-id"))) { card = n; break; }
+        n = n.parentElement; d++;
+      }
+      if (!card) return "";
+      // 容器里最长的可见文本段通常就是标题；作者名/点赞数都更短
+      let best = "";
+      for (const t of card.querySelectorAll("a, span, p, div")) {
+        const s = String(t.textContent || "").replace(/\s+/g, " ").trim();
+        if (!s || s.length < 4) continue;             // 太短的不是标题
+        if (s.length > 80) continue;                  // 整卡 textContent 兜底项，跳过
+        if (/^[\d.,万w\s·|赞收藏]*$/i.test(s)) continue; // 纯互动数字
+        if (s === best) continue;
+        if (s.length > best.length) best = s;         // 取最长段
+      }
+      return best ? sanitize(best.slice(0, 90)) : "";
+    } catch (e) { return ""; }
+  }
+
+  /** 这张图是不是「信息流卡片里的封面/内容图」（区别于导航、遮罩里的杂图） */
+  function xhsFeedCardImg(el) {
+    try {
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 30) {
+        const cls = String(n.className || "");
+        if (/\bnote-item\b|\bfeed-item\b|note-card|section-item/i.test(cls)
+          || (n.tagName === "SECTION" && n.getAttribute("data-note-id"))) return true;
         n = n.parentElement; d++;
       }
       return false;
@@ -1044,6 +1095,8 @@
   window.__msXhsVideoSource = xhsVideoSource;
   window.__msXhsVideoReady = xhsVideoReady;
   window.__msXhsNoteTitle = xhsNoteTitle;
+  window.__msXhsFeedTitle = xhsFeedTitle;
+  window.__msXhsFeedCardImg = xhsFeedCardImg;
 
 
   // B 站 __playinfo__ 是 playurl XHR 返回后才挂上 window 的，没有可监听事件，
@@ -1237,6 +1290,12 @@
           if (xhsCurrentNoteId()) {
             if (!imgIsXhsNote(src)) continue;
             if (!imgBelongsToCurrentNote(el)) continue;
+          } else {
+            // 首页/发现页信息流：图二是捕获到的**别的帖子的封面**（我们是有意
+            // 抓它们的——用户在 feed 里看到想要的封面就该能保存）。这里只做
+            // 两件事：① 给每条封面对上它卡片的标题（xhsFeedTitle）；
+            // ② 排除信息流卡片外壳之外的东西（导航/弹窗里的杂图）。
+            if (!xhsFeedCardImg(el)) continue;
           }
         }
         // 头像 / 贴纸是 Telegram 的 UI 装饰或非「照片内容」，不当作可保存的图片上报。
@@ -1923,15 +1982,20 @@
     pending.set(0, { buf: probe.buf, seq: seqNo++ });
     if (got === total) received = got;
 
-    // 分段数据已在内存里，写盘迟到/丢回也要重试而不是整条失败
+    // 分段数据已在内存里，写盘迟到/丢回也要重试而不是整条失败。
+    // signal 必须一路透传：用户点「取消」时，若写盘链还挂在 hostRequest 上
+    // （本地宿主无响应 = 「卡住」的典型场景），abort 能让它立刻抛 AbortError 退出，
+    // 否则 writeChain 会一直等到 90s 超时×3 次重试，「取消」点了跟没点一样。
     const hostWrite = async (payload) => {
       let lastErr = null;
       for (let i = 0; i < 3; i++) {
+        if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
         try {
-          const r = await hostRequest(payload, null, 90000);
+          const r = await hostRequest(payload, signal, 90000);
           if (r && r.ok === false) throw new Error(r.error || "宿主拒绝写入");
           return r;
         } catch (e) {
+          if (e && e.name === "AbortError") throw e;
           lastErr = e;
           await new Promise((res) => setTimeout(res, 400 * (i + 1)));
         }
@@ -2059,7 +2123,7 @@
 
     await writeChain;
     if (abortReason) {
-      await hostRequest({ action: "msfile_abort", id: jobId });
+      await hostRequest({ action: "msfile_abort", id: jobId }, null, 10000);
       if (abortReason.name === "AbortError") throw abortReason;
       throw abortReason;
     }

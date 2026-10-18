@@ -774,22 +774,37 @@ $("#openOut").addEventListener("click", async () => {
 
 // （日志按钮已按用户要求移除；host.log 仍照常写盘，排查时直接开文件即可）
 
-// 「所在文件夹」：定位到最近下载完成的文件（若有），否则退回打开下载目录。
-$("#openFile").addEventListener("click", async () => {
-  const res = await chrome.runtime.sendMessage({ type: "native:reveal-file" });
-  if (res && res.ok) {
-    if (res.file) {
-      $("#hint").textContent = "已定位到最近下载的文件";
-    } else {
-      $("#hint").textContent = "已打开文件存放处";
-    }
-  } else {
-    $("#hint").textContent = "打不开：" + ((res && res.error) || "本地宿主无响应");
-  }
-  setTimeout(() => ($("#hint").textContent = ""), 4000);
-});
+// （「所在文件夹」独立按钮已并入每条历史记录的操作里，footer 不再有重复入口）
 
 // ---- 本次下载记录（storage.session，浏览器关闭自动清空）----
+
+/** 「打开某条记录所在文件夹」：把文件路径交给 native host 的 reveal。
+ *  有 file 就定位到文件，没有就只打开下载目录。 */
+async function revealHistoryFile(it, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "native:reveal-file",
+      file: it.file || "",          // background 端：有 file 用 file，没有退回下载目录
+    });
+    $("#hint").textContent = res && res.ok
+      ? (it.file ? "已定位到文件" : "已打开文件存放处")
+      : "打不开：" + ((res && res.error) || "本地宿主无响应");
+  } catch (e) {
+    $("#hint").textContent = "打不开：" + (e && e.message || e);
+  }
+  if (btn) setTimeout(() => (btn.disabled = false), 1200);
+  setTimeout(() => ($("#hint").textContent = ""), 4000);
+}
+
+/** 删除某条历史记录（只删记录本身，不动磁盘上的文件） */
+async function deleteHistoryItem(time, box) {
+  const { history } = await chrome.storage.session.get({ history: [] });
+  const list = (history || []).filter((x) => x.time !== time);
+  await chrome.storage.session.set({ history: list });
+  renderHistory(list, false);
+  if (!list.length) { historyShown = false; renderHistory(null, true); }
+}
 
 /** 渲染「本次记录」面板；hideNow=true 时只收起不重取 */
 function renderHistory(items, hideNow) {
@@ -806,6 +821,7 @@ function renderHistory(items, hideNow) {
   clr.textContent = "清空";
   clr.addEventListener("click", async () => {
     await chrome.storage.session.set({ history: [] });
+    historyShown = false;
     renderHistory([], false);
   });
   h.append(clr);
@@ -828,6 +844,19 @@ function renderHistory(items, hideNow) {
       s.textContent = fmtSize(it.size);
       row.append(s);
     }
+    row.append(Object.assign(document.createElement("span"), { className: "sp" }));
+    // 打开所在文件夹（琥珀色）——只对成功条目有意义，失败条目禁用
+    const rv = document.createElement("button");
+    rv.className = "h-act amber";
+    rv.textContent = "所在文件夹";
+    if (!it.ok) rv.disabled = true;
+    rv.addEventListener("click", () => revealHistoryFile(it, rv));
+    // 删除（红色）——只删这条记录，不动已下载的文件
+    const del = document.createElement("button");
+    del.className = "h-act red";
+    del.textContent = "删除";
+    del.addEventListener("click", () => deleteHistoryItem(it.time, box));
+    row.append(rv, del);
     box.append(row);
   }
   box.classList.remove("hidden");
@@ -839,12 +868,13 @@ $("#historyBtn").addEventListener("click", async () => {
   historyShown = !historyShown;
   if (!historyShown) { renderHistory(null, true); return; }
   const { history } = await chrome.storage.session.get({ history: [] });
-  renderHistory(history, false);
   if (!(history || []).length) {
     $("#hint").textContent = "本次会话还没有下载记录";
     setTimeout(() => ($("#hint").textContent = ""), 3000);
     historyShown = false;   // 没内容就当没展开，下次再点还能重新取
+    return;
   }
+  renderHistory(history, false);
 });
 
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;

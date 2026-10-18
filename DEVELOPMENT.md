@@ -310,6 +310,20 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 
 > 后续顺序：**3 → 5 待用户发话**。第 6 章随每轮进展继续补。
 
+### 9.0a 第十三轮收尾后用户提的三条（2026-10-18 22:00，明天做）
+
+> 用户原话（m06550）：「1.既然标题不一样就不要加序号了；2.B站的图片获取我想改为仅获取所点开视频的封面；
+> 3.Telegram视频和图片下载全部失效。把这三个问题留档，明天再做，我说继续你就开始一个一个做。」
+
+| # | 问题 | 现象 / 排查起点 | 状态 |
+|---|---|---|---|
+| A1 | 首页信息流封面不加序号 | 真机截图：信息流封面标题各不相同却仍带 ①②③ 编号（`①于小…`、`①好…`）。序号机制在 `background.js` 的 `renumberImages()`：详情页整帖共用一个序号池（`gk = "xhs"`）；首页 feed 现在有了 `xhsFeedTitle()` 标题（本轮新加），但分组逻辑仍按 `k+ref` 给编号。改法：首页 feed（`isXhsDetailUrl(tabUrl)` 为假）时跳过编号（每条 mark 置空），只有详情页保留 ①②③。 | 待办 |
+| A2 | B 站图片只取所点开视频的封面 | 现在 B 站页面会把预览图/推荐图/头像等混进列表。改法：在 `inject-main.js` 的 `scanImages()` 加 `isBiliHost()` 分支——视频页（`/video/BV…` 或 `__playinfo__` 存在）时只保留当前视频封面（`__INITIAL_STATE__.videoData.pic` 或 `<img class="bpx-player-cover">` / `.video-info` 内的图），其余图全部跳过。 | 待办 |
+| A3 | Telegram 视频和图片下载全部失效 | 用户原话「Telegram视频和图片下载全部失效」。Telegram 上轮实测依赖 `include` 凭据 + `no-store`；本轮 `fetchRange` 的 `cacheMode` 改过（omit→default），且 `hostWrite` 加了 signal 透传、`msfile_abort` 加了 10s 超时——需先在真机复现：重载扩展→打开 Telegram→点图片「保存」看在哪一步断（fetchRange？hostRequest？）。排查时注意 `onDisc` 分支的「连接已断开」提示和 host.log。 | 待办 |
+
+**处理顺序：A1 → A2 → A3，用户说「继续」即开始。**
+
+
 ### 9.1 第十轮已完成：小红书「别人帖子的图/视频」彻底剥离
 
 这一轮把归属判定从「按父节点分组 + 猜类名」换成了三条独立信号（详见第 7 章），
