@@ -35,7 +35,7 @@ class FakeMediaSource {
 const origAddSourceBuffer = FakeMediaSource.prototype.addSourceBuffer;
 
 class FakeHTMLElement {
-  constructor(tag) { this.tagName = tag; this._attrs = {}; this._parent = null; this.nodeType = 1; this.className = ""; }
+  constructor(tag) { this.tagName = tag; this._attrs = {}; this._parent = null; this.nodeType = 1; this.className = ""; this.children = []; }
   getAttribute(n) { return this._attrs[n] || null; }
   setAttribute(n, v) { this._attrs[n] = v; }
   get title() { return this._attrs.title || ""; }
@@ -45,6 +45,20 @@ class FakeHTMLElement {
   // 测试里就再也模拟不出 DOM 祖先链，相册/气泡标题两条路径等于测不到。
   get parentElement() { return this._parent; }
   set parentElement(v) { this._parent = v; }
+  // 祖先链询问：imgBelongsToCurrentNote 的容器推算靠它判断「本图在不在这棵子树里」。
+  // 只认 children 显示挂载，跟浏览器一致（不靠 parentElement 反向推）。
+  contains(node) {
+    if (!node) return false;
+    if (node === this) return true;
+    const stack = [...this.children];
+    while (stack.length) {
+      const n = stack.pop();
+      if (n === node) return true;
+      if (n && n.children && n.children.length) stack.push(...n.children);
+    }
+    return false;
+  }
+  appendChild(k) { if (k) { k.parentElement = this; this.children.push(k); } return k; }
   // 阅读顺序靠坐标算，假元素也得有 rect
   getBoundingClientRect() {
     return this._rect || { top: 0, left: 0, width: 0, height: 0 };
@@ -517,23 +531,145 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("扫描只上报当前帖子的图", xhs7.length === 2, xhs7.map((m) => m.key.slice(-24)));
   check("别的帖子封面被排除", !xhs7.some((m) => m.key.includes("1040g3k09zzz")), xhs7.map((m) => m.key.slice(-24)));
 
+  // ------------------------------------------------------------ 小红书：真机形态（第十轮）
+  //
+  // ⚠️ 上面 [5y] 的假 DOM 是「两张正文图挤在同一个画廊容器里」——那是**理想形态**，
+  // 真机不是这样。小红书详情页的轮播是 swiper 结构，**每张正文图各占一个 slide**，
+  // 于是「按 parentElement 分组」每组只有 1 张图，旧逻辑直接退化成「面积大的赢」，
+  // 结果只有一张算当前帖子，其余被误杀 —— 用户反馈的「还有其它帖子的图片」
+  // 就是这套判据在真机上失效的结果。
+  //
+  // 本段用**贴近真机**的结构重测：
+  //   正文容器 .note-content
+  //     └ .swiper  → .swiper-slide ×3，每张正文图各自在里面
+  //   相关推荐容器（也是 1040g 签名！）
+  //     └ .note-item ×2，封面各一张
+  console.log("\n[5w] 小红书真机形态：swiper 一图一容器 + 推荐位同签名");
+  sandboxLocation.href = "https://www.xiaohongshu.com/explore/6a7546a50000000032030d6d";
+  sandboxLocation.hostname = "www.xiaohongshu.com";
+  sandboxLocation.pathname = "/explore/6a7546a50000000032030d6d";
+
+  // 建一棵真实形状的树：每层都用 appendChild 挂，contains 才走得通
+  const mkEl = (cls, rect) => {
+    const e = new FakeHTMLElement("DIV");
+    e.className = cls;
+    if (rect) e._rect = rect;
+    return e;
+  };
+  const noteRoot = mkEl("note-detail", { top: 0, left: 0, width: 900, height: 2000 });
+  const content = mkEl("note-content", { top: 0, left: 0, width: 800, height: 1500 });
+  const swiper = mkEl("swiper", { top: 0, left: 0, width: 800, height: 1200 });
+  noteRoot.appendChild(content).appendChild(swiper);
+
+  // 三张正文图，各自一个 slide（真机结构）
+  const slidImgs = [];
+  for (let i = 1; i <= 3; i++) {
+    const slide = mkEl("swiper-slide", { top: i * 400, left: 0, width: 800, height: 400 });
+    const im = xhsNote(`https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k0body${i}!nc_n_webp_mw_1`, 1040, 1400, "");
+    im._rect = { top: i * 400, left: 0, width: 800, height: 400 };
+    slide.appendChild(im);
+    swiper.appendChild(slide);
+    slidImgs.push(im);
+  }
+
+  // 相关推荐：两个 note-item，封面同样是 1040g，容器还比某个 slide 更大
+  const recRoot = mkEl("note-recommend", { top: 0, left: 950, width: 300, height: 1600 });
+  const recImgs = [];
+  for (let i = 1; i <= 2; i++) {
+    const item = mkEl("note-item", { top: i * 700, left: 950, width: 300, height: 600 });
+    const im = xhsNote(`https://sns-webpic-qc.xhscdn.com/b/notes_pre_post/1040g3k0rec${i}!nc_n_webp_mw_1`, 640, 940, "");
+    im._rect = { top: i * 700, left: 950, width: 300, height: 600 };
+    item.appendChild(im);
+    recRoot.appendChild(item);
+    recImgs.push(im);
+  }
+
+  fakeDocument._imgEls = [...slidImgs, ...recImgs];
+  check("swiper：三张正文图全部归属当前帖子",
+    slidImgs.every((im) => sandbox.window.__msXhsBelongs(im) === true),
+    slidImgs.map((im) => sandbox.window.__msXhsBelongs(im)));
+  check("推荐位封面全部判为别的帖子",
+    recImgs.every((im) => sandbox.window.__msXhsBelongs(im) === false),
+    recImgs.map((im) => sandbox.window.__msXhsBelongs(im)));
+
+  // URL 里带 noteId 时，以 URL 为准（最强证据，不依赖 DOM 形状）
+  const curNote = "6a7546a50000000032030d6d";
+  const otherNote = "7b1234560000000011abcdef";
+  const imCurId = xhsNote(`https://sns-webpic-qc.xhscdn.com/${curNote}/notes_pre_post/1040g3k0id1!nc_n_webp_mw_1`, 1040, 1400, "");
+  const imOtherId = xhsNote(`https://sns-webpic-qc.xhscdn.com/${otherNote}/notes_pre_post/1040g3k0id2!nc_n_webp_mw_1`, 1040, 1400, "");
+  // 故意把「别的帖子」的图挂进正文容器里：URL 的 noteId 不一致要能否决 DOM 位置
+  swiper.appendChild(imCurId);
+  swiper.appendChild(imOtherId);
+  fakeDocument._imgEls = [...slidImgs, ...recImgs, imCurId, imOtherId];
+  check("URL 带当前 noteId → 归属", sandbox.window.__msXhsBelongs(imCurId) === true);
+  check("URL 带别的 noteId → 即使挂在正文容器里也排除", sandbox.window.__msXhsBelongs(imOtherId) === false);
+  check("xhsIdInUrl 能抠出 24 位 hex", sandbox.window.__msXhsIdInUrl(
+    `https://sns-webpic-qc.xhscdn.com/${otherNote}/x/1040g3k0.png`) .includes(otherNote) === true);
+
+  // data-note-id 属性：小红书的 React 组件普遍带
+  const itemOther = mkEl("some-card", { top: 0, left: 0, width: 300, height: 300 });
+  itemOther.setAttribute("data-note-id", otherNote);
+  const imInAttr = xhsNote("https://sns-webpic-qc.xhscdn.com/c/x/1040g3k0attr!nc_n_webp_mw_1", 1040, 1400, "");
+  itemOther.appendChild(imInAttr);
+  fakeDocument._imgEls = [...slidImgs, imInAttr];
+  check("祖先 data-note-id 是别的帖子 → 排除", sandbox.window.__msXhsBelongs(imInAttr) === false);
+  const itemMine = mkEl("some-card", { top: 0, left: 0, width: 300, height: 300 });
+  itemMine.setAttribute("data-note-id", curNote);
+  const imMineAttr = xhsNote("https://sns-webpic-qc.xhscdn.com/d/x/1040g3k0my!nc_n_webp_mw_1", 1040, 1400, "");
+  itemMine.appendChild(imMineAttr);
+  fakeDocument._imgEls = [...slidImgs, imMineAttr];
+  check("祖先 data-note-id 是当前帖子 → 归属", sandbox.window.__msXhsBelongs(imMineAttr) === true);
+
+  // 端到端：扫描后只上报三张正文图
+  messages.length = 0;
+  fakeDocument._imgEls = [...slidImgs, ...recImgs];
+  sandbox.window.__msImgScan();
+  const xhsReal = messages.filter((m) => m.source === "imgctx");
+  check("端到端：swiper 三张全上报", xhsReal.length === 3, xhsReal.map((m) => m.key.slice(-26)));
+  check("端到端：推荐位零泄漏", !xhsReal.some((m) => m.key.includes("1040g3k0rec")), xhsReal.map((m) => m.key.slice(-26)));
+
+  // 判不出来时放行（宁可多抓不可漏抓）：全页只有一张正文图
+  fakeDocument._imgEls = [slidImgs[0]];
+  check("全页只有一张图时放行（不误杀）", sandbox.window.__msXhsBelongs(slidImgs[0]) === true);
+
+  // 切回 Telegram
+  sandboxLocation.href = "https://web.telegram.org/a/";
+  sandboxLocation.hostname = "web.telegram.org";
+  delete sandboxLocation.pathname;
+  fakeDocument._imgEls = [];
+  fakeDocument._mediaEls = [];
+
+
   // ------------------------------------------------------------ 小红书视频（第七轮）
   console.log("\n[5z] 小红书视频：和图片同一套逻辑");
   messages.length = 0;
+  // 前置：重新切回小红书详情页。
+  // [5w] 结尾把 location 切回了 Telegram，而 __msXhsBelongs 第一句是
+  // `const cur = xhsCurrentNoteId(); if (!cur) return true;` —— 非详情页一律放行。
+  // 这里曾忘记切回来，于是归属逻辑根本没执行，被「直接 return true」掩盖成红测。
+  sandboxLocation.href = "https://www.xiaohongshu.com/explore/6a7546a50000000032030d6d";
+  sandboxLocation.hostname = "www.xiaohongshu.com";
+  sandboxLocation.pathname = "/explore/6a7546a50000000032030d6d";
+  // 注意：视频也要挂成「真树」——imgBelongsToCurrentNote 用 contains() 问
+  // 「本元素在不在这棵子树里」，所以视频必须真的在容器 children 里，
+  // 只设 parentElement 不够（第十轮改用祖先链推算后暴露过这个测试桩缺陷）。
   const xVideo = new FakeHTMLMediaElement("VIDEO");
   xVideo.currentSrc = "https://sns-video-hw.xhscdn.com/stream/abc/110/258/01e8f0.mp4";
   xVideo._rect = { top: 0, left: 0, width: 800, height: 600 };
-  xVideo.parentElement = xBodyBox; // 正文容器里
+  swiper.appendChild(xVideo);              // 正文容器里（swiper 已挂在 noteRoot 下）
   const xOtherVideo = new FakeHTMLMediaElement("VIDEO");
   xOtherVideo.currentSrc = "https://sns-video-hw.xhscdn.com/stream/def/other.mp4";
   xOtherVideo._rect = { top: 0, left: 0, width: 200, height: 260 };
-  xOtherVideo.parentElement = xOtherBox; // 推荐卡片里
+  recRoot.appendChild(xOtherVideo);        // 推荐卡片里
+  // 归属判断会扫全页 img，把正文图挂回去，否则它看到的是空列表直接放行
   fakeDocument._mediaEls = [xVideo, xOtherVideo];
-  fakeDocument._imgEls = [];
+  fakeDocument._imgEls = [...slidImgs, ...recImgs];
+  check("正文视频归属当前帖子", sandbox.window.__msXhsBelongs(xVideo) === true);
+  check("推荐位视频不归属当前帖子", sandbox.window.__msXhsBelongs(xOtherVideo) === false);
   sandbox.window.__msScan();
   const xv = foundOf((m) => m.source === "httpmedia" || m.source === "mediasrc");
-  check("当前帖子的视频被上报", xv.some((m) => String(m.key).includes("01e8f0")), xv.map((m) => m.key.slice(-30)));
-  check("其他帖子的视频被排除", !xv.some((m) => String(m.key).includes("other.mp4")), xv.map((m) => m.key.slice(-30)));
+  check("当前帖子的视频被上报", xv.some((m) => String(m.key).includes("01e8f0")), xv.map((m) => String(m.key).slice(-30)));
+  check("其他帖子的视频被排除", !xv.some((m) => String(m.key).includes("other.mp4")), xv.map((m) => String(m.key).slice(-30)));
 
   // 切回 Telegram
   sandboxLocation.href = "https://web.telegram.org/a/";

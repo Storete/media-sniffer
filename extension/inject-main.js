@@ -533,7 +533,12 @@
   //
   // 这条规则只在**详情页**生效；首页/搜索页没有「当前帖子」，照旧全部放行。
 
-  /** 这些 class/id 命中的祖先，说明是「别的帖子」（相关推荐/评论区卡片），直接排除 */
+  /** 这些 class/id 命中的祖先，说明是「别的帖子」（相关推荐/评论区卡片），直接排除。
+   *
+   * ⚠️ 2026-10-18 第十轮修正：这串**是猜的**（拿不到小红书真实 DOM 时写下 的），
+   * 真机上小红书的推荐容器叫 `note-item` / `search-item` 一类，命不中就没用。
+   * 所以它现在只是「快速排除」的辅助线，**主判据已改为下面的祖先链推算**，
+   * 即使这行完全失效，归属判断依然成立。 */
   const XHS_OTHER_NOTE_CLASS = /note-item|feed-item|recommend|related|sidebar|comment|suggest|search-result/i;
 
   /** 元素是否落在「别的帖子」子树里（相关推荐/评论区/侧栏） */
@@ -554,40 +559,104 @@
    * 判断这张图是否属于「当前帖子」。
    * 返回 true = 是当前帖子的；false = 别的帖子/装饰。
    *
-   * 策略：在**详情页**下，取页面上所有 1040g 大图，按「祖父容器」分组，
-   * 图最多（并列时面积最大）的那一组就是当前帖子。本图必须落在该组里。
+   * ⚠️ 2026-10-18 第十轮重写（用户真机反馈：「还有其它帖子的图片」）。
+   *
+   * 旧做法是「按 parentElement 分组 → 图最多的组赢」，在真机上**不成立**：
+   * 小红书详情页的轮播图是 `swiper-slide` 结构，每张正文图有**各自的 slide 容器**，
+   * 于是每组都只有 1 张图，「图最多」退化成「面积最大」，最后只有面积最大的那张
+   * 算当前帖子，其余全被误杀；推荐位容器要是更大，推荐图又会漏进来。
+   *
+   * 新做法（三路信号，任一命中即可判定，不依赖猜出来的 class 名）：
+   *   ① URL 里的 noteId（最强证据）。小红书配图 URL 常带
+   *      `.../{noteId}/...` 或 `..._{noteId}_...`，含**别的** 24 位 hex 段
+   *      ⇒ 是别的帖子；含当前 noteId ⇒ 是当前帖子。
+   *   ② 祖先链上出现 `data-note-id` / `data-noteid` 且值 ≠ 当前 ⇒ 别的帖子
+   *      （小红书的 React 组件普遍带这个属性，比 class 名稳）。
+   *   ③ 兜底：沿祖先链找「包含当前帖子正文图最多」的最近公共祖先，
+   *      该子树里的图都算当前帖子；同时把「正文容器之外」的图排除。
    */
+  /** 从图片 URL 里抠出所有 24 位 hex 段（noteId 就是 24 位 hex）
+   *
+   * ⚠️ 必须锚定到「路径/查询分隔符边界」：早年写法是裸匹配 24 位 hex，
+   * 结果视频 URL `.../stream/abc/110/258/01e8f0.mp4` 里的 `110/258/01e8f0`
+   * 也能凑出 24 位 hex，被误判成「别的帖子」把正文视频过滤掉。
+   * 现在只认 `/<24hex>`（路径段）或 `=<24hex>` / `_<24hex>_`（查询/文件名段）。 */
+  const XHS_NOTE_ID_RE = /(?:^|[\/=&_-])([0-9a-f]{24})(?=$|[\/=&_.!-])/gi;
+
+  function xhsIdInUrl(u) {
+    try {
+      const s = String(u || "");
+      const out = [];
+      const re = new RegExp(XHS_NOTE_ID_RE.source, "gi");
+      let m;
+      while ((m = re.exec(s)) !== null) out.push(m[1].toLowerCase());
+      return out;
+    } catch (e) { return []; }
+  }
+
+  /** 元素祖先链上有没有「标记为别的帖子」的属性 */
+  function xhsAncestorNoteId(el) {
+    try {
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 40) {
+        const id = n.getAttribute && (n.getAttribute("data-note-id") || n.getAttribute("data-noteid")
+          || n.getAttribute("data-note"));
+        if (id && /^[0-9a-f]{24}$/i.test(String(id).trim())) return String(id).trim().toLowerCase();
+        n = n.parentElement; d++;
+      }
+      return "";
+    } catch (e) { return ""; }
+  }
+
   function imgBelongsToCurrentNote(el) {
     try {
-      if (!xhsCurrentNoteId()) return true; // 非详情页不做归属判断
-      if (xhsInOtherNote(el)) return false; // 在相关推荐/评论区里，一定是别的帖子
-      // 找出页面上所有正文配图
-      const all = [...document.querySelectorAll("img")].filter((im) => {
+      const cur = xhsCurrentNoteId();
+      if (!cur) return true; // 非详情页不做归属判断
+      const curId = cur.toLowerCase();
+
+      // ① URL 里的 noteId
+      let src = "";
+      try { src = el.currentSrc || el.src || ""; } catch (e) { src = ""; }
+      const ids = xhsIdInUrl(src);
+      if (ids.includes(curId)) return true;           // 明确是自己的
+      if (ids.length && !ids.includes(curId)) return false; // 明确是别人的
+
+      // ② 祖先链上的 data-note-id
+      const anc = xhsAncestorNoteId(el);
+      if (anc) return anc === curId;
+
+      // 快速排除（猜的 class 名，命中就是别的帖子）
+      if (xhsInOtherNote(el)) return false;
+
+      // ③ 兜底：沿祖先链找「正文图最多」的容器
+      // 收集范围内所有正文图（只认 CDN 签名，含被 ①② 判为当前的）
+      const inScope = (im) => {
         let s = "";
         try { s = im.currentSrc || im.src || ""; } catch (e) { s = ""; }
-        return imgIsXhsNote(s) && !imgIsXhsDecor(im) && !xhsInOtherNote(im);
-      });
-      if (!all.length) return true; // 一张正文图都没识别到，别误伤
-      if (all.length === 1) return all[0] === el;
-      // 按「父节点」分组：正文配图通常在同一个画廊容器里，相关推荐封面各自一张
-      const groups = new Map();
-      for (const im of all) {
-        const box = im.parentElement || im;
-        if (!groups.has(box)) groups.set(box, []);
-        groups.get(box).push(im);
-      }
-      let best = null, bestScore = -1;
-      for (const [box, ims] of groups) {
-        // 打分：图数量优先，其次容器面积（帖子正文容器大得多）
-        let area = 0;
+        if (!imgIsXhsNote(s) || imgIsXhsDecor(im)) return false;
+        const iid = xhsIdInUrl(s);
+        if (iid.length) return iid.includes(curId); // URL 有 id 就按 id 算
+        return !xhsInOtherNote(im);
+      };
+      const noteImgs = [...document.querySelectorAll("img")].filter(inScope);
+      if (noteImgs.length <= 1) return true; // 判不出来，放行
+
+      // 从「挂载这些图的最近公共祖先」往下，逐层找能覆盖本图的最大图集
+      // 判据：某个祖先 A 子树里包含的正文图数量 ≥ 阈值，且本图在 A 子树里。
+      let best = null, bestCount = 0;
+      let n = el.parentElement, d = 0;
+      while (n && d < 40) {
+        let cnt = 0;
         try {
-          const r = box.getBoundingClientRect && box.getBoundingClientRect();
-          if (r) area = Math.round((r.width || 0) * (r.height || 0));
-        } catch (e) { area = 0; }
-        const score = ims.length * 1e9 + area;
-        if (score > bestScore) { bestScore = score; best = ims; }
+          cnt = noteImgs.filter((im) => n.contains(im)).length;
+        } catch (e) { cnt = 0; }
+        if (cnt > bestCount) { bestCount = cnt; best = n; }
+        n = n.parentElement; d++;
       }
-      return !!(best && best.includes(el));
+      if (!best) return true;
+      // 该容器要装下「大部分」正文图才算当前帖子容器，否则说明判不出，放行
+      if (bestCount < Math.ceil(noteImgs.length / 2)) return true;
+      return best.contains(el);
     } catch (e) { return true; } // 判不出来时放行，宁可多抓不可漏抓
   }
 
@@ -637,6 +706,8 @@
   // 小红书同上：供排查
   window.__msXhsInOtherNote = xhsInOtherNote;
   window.__msXhsBelongs = imgBelongsToCurrentNote;
+  window.__msXhsIdInUrl = xhsIdInUrl;
+  window.__msXhsAncestorNoteId = xhsAncestorNoteId;
 
 
   // B 站 __playinfo__ 是 playurl XHR 返回后才挂上 window 的，没有可监听事件，
