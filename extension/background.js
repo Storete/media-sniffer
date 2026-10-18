@@ -237,6 +237,37 @@ function fileNameOf(url) {
   }
 }
 
+/**
+ * 下载完成后弹系统通知（桌面右下角 / 通知中心）。
+ *
+ * 背景：下载跑在「页面主世界」（inject-main.js），完成时只有页面右下角一个浮层卡片。
+ * 用户一切页面（切 tab / 切窗口 / 最小化浏览器），那张卡片就看不到了，感觉「卡住没反应」。
+ * 系统通知是浏览器级别的，不随页面走，切走、最小化、甚至浏览器在后台都能弹出来。
+ *
+ * 这里只认「页面保存」这条链路（page 模式，blob/MSE/Range 链下载都汇到这里的 saved 事件）；
+ * 「原生下载」（native:download，交给本地 downloader.py）走 popup 的进度条，关弹窗也能继续，
+ * 那条链路由 popup 的 addJob/updateJob 负责展示，不在这里重复弹。
+ */
+function notifySaved(p) {
+  try {
+    if (!chrome.notifications || !chrome.notifications.create) return;
+    const ok = p.ok !== false;
+    const name = (p.filename || p.key || "").split(/[\\/]/).pop() || "媒体";
+    const sizeText = p.size ? `（${(p.size / 1048576).toFixed(1)}MB）` : "";
+    const title = ok ? "资源嗅探 · 保存完成" : "资源嗅探 · 保存失败";
+    const message = ok
+      ? `${name}${sizeText} 已保存到本地`
+      : `${name}：${p.error || "未知错误"}`;
+    chrome.notifications.create({
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title,
+      message,
+      priority: ok ? 0 : 2,
+    });
+  } catch (e) { /* 通知失败不影响下载本身 */ }
+}
+
 const badgeTimer = new Map();
 function bumpBadge(tabId, kind, rec) {
   if (kind !== "video" && kind !== "audio") return;
@@ -1110,6 +1141,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } else {
             hostLog("page", `保存完成 ${p.filename || ""} ${p.size ? (p.size / 1048576).toFixed(1) + "MB" : ""}`);
           }
+          notifySaved(p);
           chrome.runtime.sendMessage({ type: "ms:saved", payload: p }).catch(() => {});
         }
         sendResponse({ ok: true });
