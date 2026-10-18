@@ -418,6 +418,10 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 `background.test.js` 94 → 101（新增 `[4c]` 7 项）。真机最终：`total 7, counts {image: 7}`，
 编号 ①~⑦ 连续，7 行全部带「预览」按钮。
 
+**按钮次序**：用户 2026-10-18 要求把「预览 / 保存」对调，「保存」靠右。理由是保存才是主操作，
+右端贴近滚动条更好点；顺带也和非页面分支的「复制 / 打开 / 预览 / 下载」形成同一节奏
+（重操作在右）。改动只是 `renderItem()` 里 `ops.append()` 的先后，按钮逻辑没动。
+
 **真机复测的坑**：`loadUnpacked` 之后**必须再刷新页面**，否则页面里仍是旧的注入脚本
 （这次表现为 `window.__msHostPort.disconnected === true`、`found` 一条都发不出去、state 里只剩 4 条 other）。
 
