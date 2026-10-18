@@ -449,6 +449,11 @@
         h = el.videoHeight | 0;
         dur = el.duration && isFinite(el.duration) ? Math.round(el.duration) : 0;
       } catch (e) { /* 忽略 */ }
+      // 页面侧预先量好的值优先（小红书从 __INITIAL_STATE__ 直接读到，
+      // 因为它的 <video> 常是 blob/MSE，videoWidth 要么是 0 要么不是原始尺寸）。
+      // 见 scanMedia 里 el.__msW 的赋值处。
+      if (el && el.__msW && el.__msH) { w = el.__msW | 0; h = el.__msH | 0; }
+      if (el && el.__msDur) dur = el.__msDur | 0;
       const last = meta.get(url);
       if (w || dur) {
         if (!last || last.w !== w || last.h !== h || last.dur !== dur) {
@@ -458,7 +463,9 @@
       }
       if (ctx.mid) post({ cmd: "progress", key: url, mid: ctx.mid });
       if (ctx.ref) post({ cmd: "progress", key: url, ref: ctx.ref });
-      const ord = ordOfMedia(el);
+      // el.__msOrd：页面侧预先算好的序号（小红书视频帖里视频=0，见 scanMedia）。
+      // 优先它，否则退回 DOM 顺序 ordOfMedia。
+      const ord = (el && typeof el.__msOrd === "number") ? el.__msOrd : ordOfMedia(el);
       if (ord >= 0) post({ cmd: "progress", key: url, ord });
 
       // 小红书特有：__INITIAL_STATE__ 是异步挂到 window 上的，第一轮轮询时
@@ -862,9 +869,20 @@
       const streams = media && media.stream;
       if (!streams) return null;
 
-      let best = null, bestArea = -1;
+      let best = null, bestArea = -1, bestRank = -1;
       // streams 在真机上是对象（Map 序列化成对象），但旧的 mock/别的版本可能是数组，
       // 两种都兜住。每个 value 才是「同一清晰度下的候选列表」。
+      //
+      // ⚠️ 2026-10-18 真机教训（帖子 6ad46958…，type=video、有 2K 版）：
+      // 同一份 stream 里**混着两种东西** ——
+      //   · `.mp4`   —— 完整单文件，Range 请求能直接下完整段；
+      //   · `.m4s`   —— DASH 分片，只是整段的一部分，单独下下来放不出画面。
+      // 老逻辑只比 `width*height`，而真机上 `.m4s` 那组的尺寸恰好更大
+      // （2560×1440 的 m4s vs 1920×1080 的 mp4），于是总挑到分片：
+      // 列表里能看到条目，一保存就是坏的 / 页面 <video> 是 blob: 时干脆认不出来。
+      // 所以先按「是不是完整文件」排，再按面积排 —— **宁可分辨率低一点，也要能播**。
+      const isSeg = (u) => /\.m4s(\?|$)/i.test(u);
+      const rankOf = (u) => (isSeg(u) ? 0 : 1);
       const groups = Array.isArray(streams) ? [streams] : Object.keys(streams).map((k) => streams[k]);
       for (const group of groups) {
         const list = Array.isArray(group) ? group : [group];
@@ -873,7 +891,10 @@
           const u = s.masterUrl || s.url || "";
           if (!/^https?:\/\//i.test(u)) continue;
           const area = (s.width | 0) * (s.height | 0);
-          if (area > bestArea) { bestArea = area; best = s; }
+          const rank = rankOf(u);
+          if (rank > bestRank || (rank === bestRank && area > bestArea)) {
+            bestRank = rank; bestArea = area; best = s;
+          }
         }
       }
       if (!best) return null;
@@ -985,11 +1006,29 @@
           if (videoIsXhsDecor(el)) continue;
           if (xhsCurrentNoteId() && !imgBelongsToCurrentNote(el)) continue;
           // 第十轮：blob: 地址页面侧根本下不了，换成 __INITIAL_STATE__ 里的真实 mp4。
-          // 换不到就退回 blob（至少 UI 里能看到条目），比直接丢掉好。
-          if (/^(blob|data):/i.test(src)) {
-            const real = xhsVideoSource();
-            if (real) { src = real.url; }
-          }
+          //
+          // 第十一轮补（真机帖子 6ad46958…）：原来只在 src 是 blob 时才换，
+          // 而且换失败就原样上报 blob。两个后果都对不上用户看到的画面：
+          //   · `__INITIAL_STATE__` 还没挂上时先报了 `blob:…`，它成为该视频的
+          //     唯一 found（seenSrc 挡着后续），弹出「页面视频（录制中）」，
+          //     点保存存下来是坏的；
+          //   · 同一元素还会被 MSE hook 记成 `m1`/`m2` 两条，列表里同时出现
+          //     「页面视频（录制中）」和「页内 m1」三个视频，用户不知道点哪个。
+          // 现在：小红书视频**只认真实地址**，拿不到就这一轮跳过（下一轮 600ms
+          // 再来），永远不往上报 blob。
+          const real = xhsVideoSource();
+          if (!real || !real.url) continue;
+          src = real.url;
+          // 真实地址拿到后直接给出尺寸/时长：<video> 那时可能还没 loadedmetadata，
+          // handleMediaSrc 会读到 0×0，列表里就是「大小未知」。
+          try {
+            if (real.w && real.h) { el.__msW = real.w; el.__msH = real.h; }
+            if (real.duration) el.__msDur = Math.round(real.duration / 1000);
+          } catch (e) { /* 忽略 */ }
+          // 序号：视频帖里视频是正文第一件东西（imageList 那条只是它的封面）。
+          // 用负数走「页面先把 ord 报给 handleMediaSrc」那条路不现实，这里直接
+          // 记在元素上，handleMediaSrc 末尾统一上报。
+          el.__msOrd = 0;
         }
         handleMediaSrc(el, src);
       }
@@ -1078,19 +1117,26 @@
    */
   function scanXhsNoteImages(noteImgs) {
     const title = xhsNoteTitle() || "";
+    // 视频帖（note.type === "video"）的 imageList 只有一条 —— 就是视频封面，
+    // 不是正文配图。正文是那个 mp4。序号要让视频占 ①、封面排后面，
+    // 所以这里给封面统一 +1 的偏移（视频侧扫到后用 ord 0 占位）。
+    // 不用 type 判断也行，但纯图文帖里 imageList[0] 就是第一张正文图，
+    // 加了偏移会出现「①」空号，所以必须按 type 区分。
+    const coverOffset = xhsNoteType() === "video" ? 1 : 0;
     for (let i = 0; i < noteImgs.length; i++) {
       const im = noteImgs[i];
       const src = im.url;
+      const ord = i + coverOffset;
       const prev = imgCtx.get(src);
       const w = im.w || 0, h = im.h || 0;
       // 只在内容真的变了才上报，避免每 1.2s 重复 post 一条相同载荷
-      if (prev && prev.ord === i && prev.title === title && prev.w === w && prev.h === h
+      if (prev && prev.ord === ord && prev.title === title && prev.w === w && prev.h === h
         && prev.hint === "xhs-note") continue;
-      imgCtx.set(src, { mid: "", title, ord: i, w, h, hint: "xhs-note", inChrome: false });
+      imgCtx.set(src, { mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false });
       if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
       post({
         cmd: "found", source: "imgctx", key: src, mime: "image/*", size: 0,
-        mid: "", title, ord: i, w, h, hint: "xhs-note", inChrome: false,
+        mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false,
       });
     }
   }

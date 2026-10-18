@@ -533,11 +533,25 @@ function renumberImages(rec) {
     // 小红书详情页例外：上面的 DOM 归属过滤已经保证「剩下的都属于当前帖子」，
     // 且它们本来就该整组编号。
     if (!xhsDetail && !it.mid && !(it.title || "").trim()) continue;
+    // 小红书详情页还要再筛一层：这个 tab 里同时混着三种「图/视频」——
+    //   · 正文（hint=xhs-note 的图 + 有标题的真实视频）  ← 要编号的
+    //   · svg-sprite / 站点素材 / 别的帖子的封面缩略图  ← 没 hint 也没标题
+    //   · MSE 录制条目 m1/m2（k 是 video/audio，但 u 是 "m1"）  ← 绝不能编号
+    // 以前只靠 popup 那边隐藏，background 照样把它们编号，于是真图被顶到 ④⑤、
+    // MSE 条目拿到 (26)，用户看到的「①」根本对不上。
+    if (xhsDetail) {
+      if (/^m\d+$/.test(it.u || "")) continue;
+      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      if (!real) continue;
+    }
     // ref 也进分组键：Telegram 相册里「视频 + 图片」横排时，两个 <video> 的
     // ref 可能一个 album 一个 viewer，不拆开会把同一格的序号算重
-    // 小红书详情页：整页一个帖子，不分 ref（正文/轮播里的图共用一个序号池）
+    // 小红书详情页：整页一个帖子，不分 ref、**也不分 kind** —— 视频和图片
+    // 共用一个 ①~Ⓝ 序号池，按 DOM 阅读顺序排（正文视频常排在第一张图之前）。
+    // 曾按 kind 分组，结果视频和图片各自都有 ①，列表里出现两个 ①，
+    // 用户没法判断谁先谁后。
     const gk = xhsDetail
-      ? it.k
+      ? "xhs"
       : it.k + "|" + (it.mid ? "m:" + it.mid : "t:" + (it.title || "")) + "|" + (it.ref || "");
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(it);

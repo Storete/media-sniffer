@@ -666,10 +666,59 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   fakeDocument._imgEls = [...slidImgs, ...recImgs];
   check("正文视频归属当前帖子", sandbox.window.__msXhsBelongs(xVideo) === true);
   check("推荐位视频不归属当前帖子", sandbox.window.__msXhsBelongs(xOtherVideo) === false);
+
+  // 第十一轮：小红书视频改成「只认 __INITIAL_STATE__ 里的真实 mp4，拿不到就跳过」。
+  // 原因见 scanMedia 的注释：blob: 上报出去也是坏的，MSE 的 m1/m2 又会混进列表。
+  // 所以这里必须先给沙箱装上假 state，否则视频会被正常跳过（这条断言会红）。
+  const prevState = sandbox.window.__INITIAL_STATE__;
+  sandbox.window.__INITIAL_STATE__ = {
+    note: {
+      noteDetailMap: {
+        "6a7546a50000000032030d6d": {
+          note: {
+            type: "video",
+            title: "",
+            desc: "视频帖文案",
+            video: {
+              media: {
+                stream: {
+                  // 真实形态：EF4/EF5 各是一组候选。这里混一条 .m4s 分片，
+                  // 尺寸比 mp4 还大 —— 用来验证「完整文件优先」不是「面积优先」。
+                  EF4: [{ masterUrl: "http://sns-video-v6.xhscdn.com/stream/abc/110/258/01e8f0.mp4", width: 720, height: 1280, duration: 8000 }],
+                  EF5: [{ masterUrl: "http://sns-video-v6.xhscdn.com/stream/abc/110/3092/01e8f0_3092.m4s", width: 1440, height: 2560, duration: 8000 }],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+  check("xhsVideoSource 优先完整 mp4 而不是更大的 m4s 分片",
+    (() => {
+      const v = sandbox.window.__msXhsVideoSource();
+      return !!v && /\.mp4(\?|$)/i.test(v.url) && !/\.m4s/i.test(v.url);
+    })(), sandbox.window.__msXhsVideoSource());
+  check("xhsVideoSource 把 http:// 转成 https://",
+    (() => { const v = sandbox.window.__msXhsVideoSource(); return !!v && /^https:\/\//.test(v.url); })());
+
+  // 把 <video> 的 src 设成 blob：，验证「blob 一定被换成真实地址」
+  xVideo.currentSrc = "blob:https://www.xiaohongshu.com/abcd-1234";
   sandbox.window.__msScan();
   const xv = foundOf((m) => m.source === "httpmedia" || m.source === "mediasrc");
-  check("当前帖子的视频被上报", xv.some((m) => String(m.key).includes("01e8f0")), xv.map((m) => String(m.key).slice(-30)));
+  check("blob 视频被换成真实 mp4 后再上报", xv.some((m) => String(m.key).includes("01e8f0.mp4")), xv.map((m) => String(m.key).slice(-30)));
+  check("blob: 地址本身绝不上报", !xv.some((m) => /^blob:/.test(String(m.key))), xv.map((m) => String(m.key).slice(0,20)));
+  check("上报的视频带 ord=0", xv.some((m) => m.ord === 0), xv.map((m) => ({ k: String(m.key).slice(-20), ord: m.ord })));
   check("其他帖子的视频被排除", !xv.some((m) => String(m.key).includes("other.mp4")), xv.map((m) => String(m.key).slice(-30)));
+
+  // 拿不到真实地址时必须一条都不发（宁可少抓，也不让用户存到坏文件）
+  sandbox.window.__INITIAL_STATE__ = { note: { noteDetailMap: {} } };
+  messages.length = 0;
+  xVideo.currentSrc = "blob:https://www.xiaohongshu.com/efgh-5678";
+  sandbox.window.__msScan();
+  const xv2 = foundOf((m) => m.source === "httpmedia" || m.source === "mediasrc");
+  check("没有真实地址时不报 blob 条目", xv2.length === 0, xv2.map((m) => String(m.key).slice(0, 20)));
+  sandbox.window.__INITIAL_STATE__ = prevState;
 
   // 切回 Telegram
   sandboxLocation.href = "https://web.telegram.org/a/";

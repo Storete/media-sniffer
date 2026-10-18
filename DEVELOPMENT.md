@@ -285,11 +285,11 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 | # | 问题 | 状态 | 备注 |
 |---|---|---|---|
 | 1 | 评论区里的图片也会抓取 | **已完成** | 双判据拦下（URL 含 `/comment/` 或 DOM 上溯命中评论容器），见 9.1b |
-| 2 | 小红书视频无法读取、名字对不上 | **已完成** | blob: 里取真实 `masterUrl`；标题回退 `desc` + 晚到标题补发，见 9.1b |
+| 2 | 小红书视频无法读取、名字对不上 | **已完成** | blob: 里取真实 `masterUrl`；标题回退 `desc` + 晚到标题补发，见 9.1b；第十二轮又修掉「选到 m4s 分片」和「blob 抢先上报」，见 9.5 |
 | 3 | 视频或图片的水印能否去掉 | 待评估 | 见 9.3 的风险说明，大概率属于「做不到/不建议做」 |
 | 4 | 给代码添加注释 | **已完成** | popup 11%→36%，host 系列 6~11%→16~22%，整体 39%，见 9.2 |
 | 5 | 给功能分组，方便快速定位问题 | **待定** | 用户明确说之后再商量，不动手 |
-| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2/9.4 已覆盖大半 |
+| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2/9.4/9.5 已覆盖大半 |
 
 > 后续顺序：**3 → 5 待用户发话**。第 6 章随每轮进展继续补。
 
@@ -424,5 +424,152 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 
 **真机复测的坑**：`loadUnpacked` 之后**必须再刷新页面**，否则页面里仍是旧的注入脚本
 （这次表现为 `window.__msHostPort.disconnected === true`、`found` 一条都发不出去、state 里只剩 4 条 other）。
+
+---
+
+### 9.5 第十二轮：小红书视频抓不到、没标题、编号错乱（2026-10-18）
+
+用户原话：「接下来是捕捉不到视频和视频没有标题两件事，刚才的快捷指令也能够下载视频，参考一下。
+另外，图中的下载和保存有什么区别」，配图是视频帖 `6ad46958…`（「「当卡片可以收纳」」），
+popup 里四条：页面视频（录制中）/ `01ead4686b…_m4a`（无标题）/ 页面音频（录制中）/ 图片 2560×1440。
+
+#### 缺陷一：抓到的「视频」其实是 DASH 分片（录不到、放不出）
+
+`xhsVideoSource()` 原来只按**面积最大**挑清晰度组：
+
+```js
+const area = (s.width|0) * (s.height|0);
+if (area > bestArea) { bestArea = area; best = s; }
+```
+
+真机 stream 里同时存在两档：
+
+| 档位 | 地址 | 尺寸 | 是什么 |
+|---|---|---|---|
+| `EF4` | `…_259.mp4` | 1280×720 | **完整文件**（音视频都在） |
+| `EF5` | `…_3090.m4s` / `…_3092.m4s` | 2560×1440 | DASH 分片，只有画面、单下放不出来 |
+
+2560×1440 面积更大，于是永远选中分片 —— 这就是「捕捉不到视频」的真正原因：
+不是抓不到地址，是抓到了**一个下下来也不能播的地址**。
+
+修法：先按「完整文件优先」再按面积。
+
+```js
+const isSeg = (u) => /\.m4s(\?|$)/i.test(u);
+const rankOf = (u) => (isSeg(u) ? 0 : 1);
+// ……循环里
+if (rank > bestRank || (rank === bestRank && area > bestArea)) { bestRank = rank; bestArea = area; best = s; }
+```
+
+注释写明「宁可分辨率低一点，也要能播」。修后真机返回 `…_259.mp4`、1280×720、duration 21234ms。
+
+**验证**：`curl -I -H 'Referer: https://www.xiaohongshu.com/'` → `200` / `video/mp4` / `912619` 字节；
+下载后 `ffprobe` → `h264 1280×720` + `aac`，`duration=21.233333`。完整可播放。
+
+#### 缺陷二：没标题 / `blob:` 条目抢先占位
+
+原来 `scanMedia()` 只在 `src` 是 `blob:` 时尝试换真实地址，**换不到就退回 blob 照样上报**。
+后果链：`__INITIAL_STATE__` 还没挂上时先报了 `blob:…` → 它成为这个视频唯一的 `found`
+（`seenSrc` 挡住后续同元素上报）→ popup 出现「页面视频（录制中）」，存下来是坏的；
+同一个元素还被 MSE hook 记成 `m1`/`m2`。
+
+改成**拿不到真实地址就这一轮跳过**（600ms 后再来，页面加载完就一定有）：
+
+```js
+const real = xhsVideoSource();
+if (!real || !real.url) continue;
+src = real.url;
+if (real.w && real.h) { el.__msW = real.w; el.__msH = real.h; }
+if (real.duration) { el.__msDur = Math.round(real.duration / 1000); }
+el.__msOrd = 0;  // 视频帖里视频是正文第一件东西
+```
+
+`handleMediaSrc():(445-470)` 相应读取 `el.__msW/__msH/__msDur/__msOrd`，覆盖 DOM 上读不到的尺寸、时长和顺序
+（`<video>` 元素本身没有宽高属性，`ordOfMedia()` 也只会给个粗值）。
+
+标题走的是第十轮就做好的 `xhsNoteTitle()`（`note.title || note.desc`），这一轮不再动；
+没标题的观感问题主要来自 `blob:` 条目（标题恒空），它不再上报后就消失了。
+
+#### 缺陷三：B 站合成条目串到小红书页
+
+`popup.js` 原来写成 `if (hideRecorder())` 就补 `BILI_DASH_KEY` 合成条目。而这一轮小红书详情页
+也开始 `hideRecorder()`（把 `isXhsDetailPage()` 加进去），于是小红书页顶部冒出
+「B 站视频（完整 DASH 流）」。拆成两件事：
+
+```js
+const hide = hideRecorder();
+let list = hide ? allItems.filter((it) => !isRecorderItem(it)) : allItems.slice();
+if (isBiliSite()) { /* 补 BILI_DASH_KEY 合成条目 */ }
+```
+
+顺带修两处口径问题：
+
+- `shownItems()` 在小红书详情页再过滤一层 `list = list.filter((it) => it.page || (it.title || "").trim())`
+  —— 去掉播放器拉的 m4a/m3u8 裸链接（用户截图里那条无标题的 `01ead…_m4a`）。
+- `renderChips()` 的计数改成 `src.filter((it) => it.k === k).length`，不再用 background 的 `counts[k]`。
+  `counts` 是在 background 里算的，包含被 popup 隐掉的录制条目，会出现「chip 写 3、点进去 1 条」。
+
+#### 缺陷四：编号错乱（MSE 条目拿走 (26)）
+
+真机 `sw_ord.js` 看到 state 里 `m1` 拿到 `mark:"(26)"`，真图被顶到 ③④⑤。原因是
+`renumberImages()` 只在 background 里跑，popup 的隐藏逻辑它并不知道。
+
+`background.js:542-546` 增加小红书专用跳过规则：
+
+```js
+if (xhsDetail) {
+  if (/^m\d+$/.test(it.u || "")) continue;                    // MSE 分片
+  const real = it.hint === "xhs-note" || (it.title || "").trim();
+  if (!real) continue;                                        // 站点素材 / 别的帖缩略图
+}
+```
+
+并把小红书详情页的分组键 `gk` 从 `it.k` 改成常量 `"xhs"` —— **视频、图片、封面共用一个 ①~Ⓝ 池**。
+视频帖的 `imageList` 只有 1 条（就是视频封面），所以 `scanXhsNoteImages()` 里给封面加偏移：
+
+```js
+const coverOffset = xhsNoteType() === "video" ? 1 : 0;
+const ord = i + coverOffset;
+```
+
+视频 `ord=0` 拿 ①，封面 `ord=1` 拿 ②。
+
+真机最终：
+
+```
+全部 2 / 视频 1 / 音频 0 / 图片 1
+▶ ① 「当卡片可以收纳」   页面捕获 · 1280×720 · 0:21 · video/mp4
+▣ ② 「当卡片可以收纳」   页面捕获 · 2560×1440 · image/webp · 49.9 KB · ×2
+```
+
+#### 关于「下载」和「保存」两个按钮的区别
+
+用户在同一轮问了这个问题。它们不是同一个操作的两种叫法，走**完全不同的链路**：
+
+| | **保存**（蓝底） | **下载** |
+|---|---|---|
+| 哪些条目有 | 带 `page` 标记的页面捕获条目 | 不带 `page` 的裸 webRequest 条目 |
+| 入口 | `savePageItem()` → `page:save-batch` | `startDownload()` → `native:download` |
+| 谁取数据 | **页面自己** fetch 整段，经 Native Messaging 分块写盘 | **native host 起独立进程**（`downloader.py`） |
+| 用户看到 | 页面里弹浮层确认 | popup 里出现进度条，关掉弹窗继续下 |
+| 能不能处理 blob / MSE / 分片 | **能**（数据在页面内存里） | 不能（只对直链有效） |
+| 典型限制 | 走扩展消息通道，Telegram 那类有 512KB 限制的页面正是靠它绕开的 | CDN 校验 referer，所以会带上抓取时的 `it.i` |
+
+一句话：**「保存」= 页面里取数据 + 浮层确认；「下载」= 把 URL 交给本地下载器（快、可后台、只对直链有效）。**
+
+#### 测试
+
+- `main-hook.test.js` → **150**（`[5z]` 补 `__INITIAL_STATE__` 桩：完整 mp4 优先于更大的 m4s、`http`→`https`、
+  blob 被换成真实地址后再上报、blob 本身绝不上报、视频 `ord=0`、别的帖视频被排除、无真实地址时不报 blob）。
+- `background.test.js` → **103**（`[4b]` 的 `recX` 补 `hint:"xhs-note"`；`recXV` 改断言「视频 ① / 封面 ② 共用一个池」；
+  新增 `recNoise`：雪碧图 / 无标题缩略图 / MSE 不参与编号，且只有一张真图时不加序号）。
+  **注意未编号条目的 `mark` 是 `undefined` 而不是 `""`，断言要写 `!x.mark`。**
+- `range_parallel.test.js` 14、`python test/run_all.py` 7/7、`node --check` 三个文件全过。
+
+#### 真机复测提醒
+
+`Extensions.loadUnpacked` 之后**必须再刷新页面**，否则页面里还是旧注入脚本。
+这一轮的表现是 `window.__msHostPort.disconnected === true`、`found` 一条都发不出去。
+**看 state 条数比看代码更早发现问题。**
 
 ---

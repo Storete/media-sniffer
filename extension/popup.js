@@ -91,6 +91,14 @@ function isBiliFeedPage() {
   } catch { return false; }
 }
 
+/** 小红书详情页。只比 hostname —— 信息流页没有「当前帖子」，不该走详情页那套。 */
+function isXhsDetailPage() {
+  try {
+    const h = new URL(tabUrl).hostname;
+    return /(^|\.)xiaohongshu\.com$/i.test(h) && /^\/(explore|discovery\/item)\/[0-9a-f]{20,}/i.test(new URL(tabUrl).pathname);
+  } catch { return false; }
+}
+
 /** 这一条是不是「只录到已播放片段」的 MSE/blob 条目
  *  blob: 是页面自己 createObjectURL 出来的，m\d+ 是扩展给 MSE 流编的假 URL。 */
 function isRecorderItem(it) {
@@ -98,9 +106,13 @@ function isRecorderItem(it) {
   return /^blob:/i.test(u) || /^m\d+$/.test(u);
 }
 
-/** 要不要隐藏录制条目。目前只有 B 站需要（它同时提供可完整下载的 DASH 流） */
+/** 要不要隐藏录制条目。
+ *  B 站：播放器走 MSE，同时提供可完整下载的 DASH 流 → 隐掉录制条目。
+ *  小红书（2026-10-18）：正文视频的 <video src> 同样是 blob:，而真实 mp4 地址
+ *  已由页面侧从 __INITIAL_STATE__ 换成直链上报；录制条目留着只会和它并列成
+ *  两条「页面视频（录制中）」，用户点了存下来是坏的。 */
 function hideRecorder() {
-  return isBiliSite();
+  return isBiliSite() || isXhsDetailPage();
 }
 
 /**
@@ -111,8 +123,21 @@ function hideRecorder() {
  * （存在录制条目）——首页那种没有播放器的页面不该冒出「完整 DASH 流」。
  */
 function shownItems() {
-  const list = hideRecorder() ? allItems.filter((it) => !isRecorderItem(it)) : allItems.slice();
-  if (hideRecorder()) {
+  // 小红书也会 hideRecorder（正文视频是 blob，靠真实 mp4 条目代替），但那边
+  // **没有** __playinfo__，绝不能补 B 站那条合成条目。条件必须分开判：
+  // 曾写成 `if (hideRecorder())` 直接补，结果小红书页列表顶部多出一条
+  // 「B 站视频（完整 DASH 流）」，点了当然什么也下不下来。
+  const hide = hideRecorder();
+  let list = hide ? allItems.filter((it) => !isRecorderItem(it)) : allItems.slice();
+  if (isXhsDetailPage()) {
+    // 小红书详情页还有一类噪声：页面播放器拉的 m4a 音轨 / m3u8 分片被 webRequest
+    // 单独记下来，既没有标题也不是 page 条目，混在「音频」栏里就是一条
+    // 叫 `01ead…_m4a` 的裸链接（用户截图里第 ② 条）。
+    // 正文的图/视频都有 title（页面侧从 __INITIAL_STATE__ 读出的帖子文案），
+    // 所以这里只留「有标题的」和 page 条目，其余都是播放器内部请求。
+    list = list.filter((it) => it.page || (it.title || "").trim());
+  }
+  if (isBiliSite()) {
     // B 站的完整视频不在 <video src> 里，而是 __playinfo__ 的 DASH 流；
     // 隐藏录制条目后必须补一个合成条目，否则列表全空没得点。
     // 点保存 → 页面浮层 → runBiliDownload（它自己读 __playinfo__，不看 key）。
@@ -191,11 +216,11 @@ function renderChips() {
   const totalAll = src.filter((it) => it.k !== "seg").length;
   const defs = [["all", "全部", totalAll]];
   for (const k of ["video", "audio", "image", "doc", "font", "other", "seg"]) {
-    let n = counts[k] || 0;
-    if (hideRecorder()) {
-      // 计数里含被隐掉的录制条目，这里按剩余条目重算，避免「点进去是空的」
-      n = src.filter((it) => it.k === k).length;
-    }
+    // ⚠️ 计数一律按 shownItems 重算，不要用 background 给的 counts。
+    // counts 是 background 用**全量**算的，含 popup 这边会隐掉的录制条目
+    // （B 站 / 小红书详情页），直接显示会出现「chip 写 3、点进去 1 条」。
+    // 这一条同时修了小红书「视频 1 音频 2 全部 4」对不上的问题。
+    const n = src.filter((it) => it.k === k).length;
     // 图标默认不占位置：数量都为 0 才跳过，有就显示（用户要求「分出来」，不是「藏起来」）
     if (!n && k !== "video" && k !== "audio") continue;
     defs.push([k, KIND_LABEL[k], n]);

@@ -551,9 +551,12 @@ console.log("\n[4b] 小红书详情页：整帖一组，按 DOM 顺序编号（�
 const XHS_DETAIL = "https://www.xiaohongshu.com/explore/6a7546a50000000032030d6d";
 const recX = mkRec([
   // DOM 顺序故意打乱：c(ord2) a(ord0) b(ord1)
-  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k01aaa!x", k: "image", ord: 2, t: 3 },
-  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k02bbb!x", k: "image", ord: 0, t: 1 },
-  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k03ccc!x", k: "image", ord: 1, t: 2 },
+  // 第十一轮起，小红书详情页只有「直读条目（hint=xhs-note）」或「有标题的」
+  // 才参与编号 —— 站点雪碧图/别的帖子封面缩略图/ MSE 的 m1 都不算。
+  // 所以这里必须带上 hint，否则它们会被当成噪声跳过（这正是线上的行为）。
+  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k01aaa!x", k: "image", ord: 2, t: 3, hint: "xhs-note" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k02bbb!x", k: "image", ord: 0, t: 1, hint: "xhs-note" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k03ccc!x", k: "image", ord: 1, t: 2, hint: "xhs-note" },
 ], XHS_DETAIL);
 renumberImages(recX);
 const xMarks = [...recX.items.values()].map((x) => [x.u.slice(-12), x.ord, x.mark]);
@@ -594,16 +597,36 @@ check("有没有直读条目时原样返回（不能把列表整个清空）",
   preferXhsNoteList(withDirect.filter((x) => x.hint !== "xhs-note")).length);
 check("空数组原样返回", preferXhsNoteList([]).length === 0);
 
-// 同一页里的视频单独一组、也编号
+// 视频帖：视频和封面共用一个序号池（不再各编各的 ①）
+// 真机帖子 6ad46958…：imageList 只有 1 条（视频封面），正文是那个 mp4。
+// 页面侧给视频 ord=0、封面 ord=1，所以视频拿 ①、封面拿 ②。
 const recXV = mkRec([
-  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gimg1!x", k: "image", ord: 0, t: 1 },
-  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gimg2!x", k: "image", ord: 1, t: 2 },
-  { u: "https://sns-video-hw.xhscdn.com/stream/abc.mp4", k: "video", ord: 0, t: 3 },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gimg1!x", k: "image", ord: 1, t: 1, hint: "xhs-note" },
+  { u: "https://sns-video-hw.xhscdn.com/stream/abc.mp4", k: "video", ord: 0, t: 3, title: "帖标题" },
 ], XHS_DETAIL);
 renumberImages(recXV);
-check("小红书视频也参与编号",
-  recXV.items.get("https://sns-video-hw.xhscdn.com/stream/abc.mp4").mark === "",
-  [...recXV.items.values()].map((x) => [x.k, x.mark]));
+check("视频帖里视频拿 ①、封面拿 ②（共用一个序号池）",
+  recXV.items.get("https://sns-video-hw.xhscdn.com/stream/abc.mp4").mark === "①"
+  && recXV.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gimg1!x").mark === "②",
+  [...recXV.items.values()].map((x) => [x.k, x.ord, x.mark]));
+
+// 噪声不占号位：站点雪碧图 / 无标题缩略图 / MSE 的 m1 都不能拿到编号，
+// 否则真图会被顶到 ④⑤（真机帖子 6ad46958… 就是这样，MSE 条目拿到了 (26)）
+const recNoise = mkRec([
+  { u: "https://sns-webpic-qc.xhscdn.com/a/svg-sprite.6.57.6.svg#me", k: "image" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gnoi!nc_n_webp_mw_1", k: "image" },
+  { u: "m1", k: "video", title: "" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040greal!x", k: "image", ord: 0, hint: "xhs-note" },
+], XHS_DETAIL);
+renumberImages(recNoise);
+check("小红书噪声条目（雪碧图/无标题缩略图/MSE）不参与编号",
+  !recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/svg-sprite.6.57.6.svg#me").mark
+  && !recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gnoi!nc_n_webp_mw_1").mark
+  && !recNoise.items.get("m1").mark,
+  [...recNoise.items.values()].map((x) => [String(x.u).slice(-20), x.mark]));
+check("只有一张真图时不加序号（免得满屏 ①）",
+  !recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/1040greal!x").mark,
+  recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/1040greal!x").mark);
 
 // 非详情页（首页/信息流）保持老规则：没 mid 没 title 的仍然不编号
 const recHome = mkRec([
