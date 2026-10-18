@@ -332,11 +332,6 @@ function renderItem(it) {
   const ops = el("div", "ops");
 
   if (isPage) {
-    const save = el("button", "btn primary", "保存");
-    save.title = "在页面里弹出保存面板（数据由页面自己取，能避开 Telegram 的 512KB 限制）";
-    save.addEventListener("click", () => savePageItem(it, save));
-    ops.append(save);
-
     // 预览：只对「有直接 http(s) 地址的图片/视频」给。
     // 页面捕获条目里，图片和视频绝大多数是实打实的 CDN 直链（小红书的
     // sns-webpic / Telegram 的 /progressive/…），popup 直接 <img src>/<video src>
@@ -344,11 +339,20 @@ function renderItem(it) {
     //
     // 为什么不给 blob:/MSE：那两类地址只在本页主世界有效，扩展页加载不了；
     // 点了必然报错，比没有按钮更让人困惑。
+    //
+    // 按钮次序：预览在左、保存在右。用户 2026-10-18 要求对调——「保存」是
+    // 主操作，放在最右贴近滚动条一侧更顺手，也和下面非页面分支的
+    // 「复制 / 打开 / 预览 / 下载」保持「重操作在右」的一致节奏。
     if (["image", "video", "audio"].includes(it.k) && /^https?:/i.test(it.u || "")) {
       const pv = el("button", "btn", "预览");
       pv.addEventListener("click", () => showPreview(it));
       ops.append(pv);
     }
+
+    const save = el("button", "btn primary", "保存");
+    save.title = "在页面里弹出保存面板（数据由页面自己取，能避开 Telegram 的 512KB 限制）";
+    save.addEventListener("click", () => savePageItem(it, save));
+    ops.append(save);
 
     // 注意：不要在这里给页面媒体加「本地下载器（yt-dlp）」入口。
     // Telegram 的 /progressive/document… 是相对地址，yt-dlp 会把
