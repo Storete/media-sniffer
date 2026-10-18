@@ -238,51 +238,44 @@ function fileNameOf(url) {
 }
 
 /**
- * 下载完成后提醒（两层）：
+ * 下载完成提醒：只在插件图标上打角标，不弹桌面通知。
  *
- * 1. 插件图标角标 ✓（主）：下载完成后给该标签页的扩展图标打一个绿色 ✓，
- *    鼠标悬停显示完成的文件名。切 tab / 切窗口 / 最小化都看得见——用户
- *    反馈「切走后再切回来感觉卡住、不知道完没完成」，角标就是常驻的答案。
- *    下一次嗅探到新媒体时自动清掉（bumpBadge 会重写角标）。
- * 2. 系统通知（兜底）：chrome.notifications 弹桌面 toast。浏览器完全在
- *    后台、连图标都看不见时也有提示。Windows 通知权限被关时静默失败，不影响 1。
+ * 角标是**全局**的（不传 tabId = 所有标签页都显示），且**常驻**——用户不点开
+ * 插件（popup）就一直在，直到浏览器关闭。用户点开 popup 时由 popup 发
+ * "badge:clear" 清掉（表示「已经看过结果了」）。
+ *
+ * 完成的文件路径（或失败信息）存进 storage，供 popup 里「打开所在文件夹」用。
  */
-const doneBadgeTimer = new Map();
 function markDoneBadge(tabId, text, color) {
-  if (!tabId || tabId < 0) return;
-  clearTimeout(doneBadgeTimer.get(tabId));
   try {
-    chrome.action.setBadgeBackgroundColor({ tabId, color });
-    chrome.action.setBadgeText({ tabId, text });
-  } catch (e) { return; } // 标签页可能已关闭
-  // 3 分钟后自动消失，避免一直挂着误导用户
-  doneBadgeTimer.set(tabId, setTimeout(() => {
-    try { chrome.action.setBadgeText({ tabId, text: "" }); } catch (e) { /* 忽略 */ }
-  }, 180000));
+    // 全局角标：不传 tabId，切到任何页面都看得见
+    chrome.action.setBadgeBackgroundColor({ color });
+    chrome.action.setBadgeText({ text });
+  } catch (e) { return; } // 忽略
+  // 不设自动消失：常驻到用户点开插件或关闭浏览器
 }
 
 function notifySaved(p) {
   const ok = p.ok !== false;
   const name = (p.filename || p.key || "").split(/[\\/]/).pop() || "媒体";
   const sizeText = p.size ? `（${(p.size / 1048576).toFixed(1)}MB）` : "";
-  // 1. 图标角标：成功 ✓（绿），失败 ✗（红）。悬停标题写明文件名。
+  // 1. 图标角标：成功 ✓（绿），失败 ✗（红），全局 + 常驻。
   try {
     markDoneBadge(p.__tabId, ok ? "✓" : "✗", ok ? "#16a34a" : "#dc2626");
-    try {
-      chrome.action.setTitle({ tabId: p.__tabId, title: ok ? `保存完成：${name}${sizeText}` : `保存失败：${name} —— ${p.error || ""}` });
-    } catch (e) { /* 忽略 */ }
   } catch (e) { /* 忽略 */ }
-  // 2. 系统通知兜底
+  // 2. 记下最近一次完成/失败的结果，供 popup 的「打开所在文件夹」和标题展示用
   try {
-    if (!chrome.notifications || !chrome.notifications.create) return;
-    chrome.notifications.create({
-      type: "basic",
-      iconUrl: "icons/icon128.png",
-      title: ok ? "资源嗅探 · 保存完成" : "资源嗅探 · 保存失败",
-      message: ok ? `${name}${sizeText} 已保存到本地` : `${name}：${p.error || "未知错误"}`,
-      priority: ok ? 0 : 2,
+    chrome.storage.local.set({
+      lastResult: {
+        ok,
+        name,
+        size: p.size || 0,
+        file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "",
+        error: ok ? "" : (p.error || ""),
+        time: Date.now(),
+      },
     });
-  } catch (e) { /* 通知失败不影响下载本身 */ }
+  } catch (e) { /* 忽略 */ }
 }
 
 const badgeTimer = new Map();
@@ -293,12 +286,8 @@ function bumpBadge(tabId, kind, rec) {
     let n = 0;
     for (const it of rec.items.values()) if (it.k === "video" || it.k === "audio") n++;
     const text = n ? (n > 99 ? "99+" : String(n)) : "";
-    // 新媒体到来 = 用户新一轮嗅探：清掉上一轮的「完成 ✓/✗」角标与标题
-    clearTimeout(doneBadgeTimer.get(tabId));
-    doneBadgeTimer.delete(tabId);
     chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
     chrome.action.setBadgeText({ tabId, text });
-    try { chrome.action.setTitle({ tabId, title: "资源嗅探" }); } catch (e) { /* 忽略 */ }
   }, 300));
 }
 
@@ -1218,6 +1207,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         break;
       }
+      case "native:reveal-file": {
+        // popup「打开所在文件夹」：优先定位到最近完成下载的那个文件（reveal file），
+        // 没记录（或记录的文件已不存在/不在下载目录）则退回打开下载目录。
+        // 白名单校验在宿主 do_reveal 里做，这里只负责把 file 传过去。
+        try {
+          const lr = (await chrome.storage.local.get("lastResult")).lastResult;
+          const file = (lr && lr.ok && lr.file) || "";
+          postNative({ action: "reveal", id: "reveal-" + Date.now(), file });
+          sendResponse({ ok: true, file });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e.message || e) });
+        }
+        break;
+      }
       case "native:open-log": {
         try {
           postNative({ action: "open-log", id: "openlog-" + Date.now() });
@@ -1266,6 +1269,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "settings:set": {
         await chrome.storage.local.set(msg.patch || {});
+        sendResponse({ ok: true });
+        break;
+      }
+      case "badge:clear": {
+        // popup 打开时调用：用户已经看到结果，清掉常驻的完成 ✓/✗ 角标。
+        // 全局角标要清就清全局（不传 tabId 的 setBadgeText 会清全部）。
+        try {
+          chrome.action.setBadgeText({ text: "" });
+          chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
+        } catch (e) { /* 忽略 */ }
         sendResponse({ ok: true });
         break;
       }

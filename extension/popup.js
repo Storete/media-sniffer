@@ -782,6 +782,21 @@ $("#openLog").addEventListener("click", async () => {
   setTimeout(() => ($("#hint").textContent = ""), 4000);
 });
 
+// 「打开所在文件夹」：优先定位到最近下载完成的文件（若有），否则退回打开下载目录。
+$("#openFile").addEventListener("click", async () => {
+  const res = await chrome.runtime.sendMessage({ type: "native:reveal-file" });
+  if (res && res.ok) {
+    if (res.file) {
+      $("#hint").textContent = "已定位到最近下载的文件";
+    } else {
+      $("#hint").textContent = "已打开文件存放处";
+    }
+  } else {
+    $("#hint").textContent = "打不开：" + ((res && res.error) || "本地宿主无响应");
+  }
+  setTimeout(() => ($("#hint").textContent = ""), 4000);
+});
+
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;
   await chrome.runtime.sendMessage({ type: "sniff:clear", tabId });
   allItems = [];
@@ -851,4 +866,6 @@ chrome.runtime.onMessage.addListener((msg) => {
   }).catch(() => {});
   await load();
   pingHost();
+  // 打开 popup = 用户看到了结果：清掉常驻的完成 ✓/✗ 角标
+  chrome.runtime.sendMessage({ type: "badge:clear" }).catch(() => {});
 })();
