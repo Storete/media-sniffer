@@ -238,31 +238,48 @@ function fileNameOf(url) {
 }
 
 /**
- * 下载完成后弹系统通知（桌面右下角 / 通知中心）。
+ * 下载完成后提醒（两层）：
  *
- * 背景：下载跑在「页面主世界」（inject-main.js），完成时只有页面右下角一个浮层卡片。
- * 用户一切页面（切 tab / 切窗口 / 最小化浏览器），那张卡片就看不到了，感觉「卡住没反应」。
- * 系统通知是浏览器级别的，不随页面走，切走、最小化、甚至浏览器在后台都能弹出来。
- *
- * 这里只认「页面保存」这条链路（page 模式，blob/MSE/Range 链下载都汇到这里的 saved 事件）；
- * 「原生下载」（native:download，交给本地 downloader.py）走 popup 的进度条，关弹窗也能继续，
- * 那条链路由 popup 的 addJob/updateJob 负责展示，不在这里重复弹。
+ * 1. 插件图标角标 ✓（主）：下载完成后给该标签页的扩展图标打一个绿色 ✓，
+ *    鼠标悬停显示完成的文件名。切 tab / 切窗口 / 最小化都看得见——用户
+ *    反馈「切走后再切回来感觉卡住、不知道完没完成」，角标就是常驻的答案。
+ *    下一次嗅探到新媒体时自动清掉（bumpBadge 会重写角标）。
+ * 2. 系统通知（兜底）：chrome.notifications 弹桌面 toast。浏览器完全在
+ *    后台、连图标都看不见时也有提示。Windows 通知权限被关时静默失败，不影响 1。
  */
+const doneBadgeTimer = new Map();
+function markDoneBadge(tabId, text, color) {
+  if (!tabId || tabId < 0) return;
+  clearTimeout(doneBadgeTimer.get(tabId));
+  try {
+    chrome.action.setBadgeBackgroundColor({ tabId, color });
+    chrome.action.setBadgeText({ tabId, text });
+  } catch (e) { return; } // 标签页可能已关闭
+  // 3 分钟后自动消失，避免一直挂着误导用户
+  doneBadgeTimer.set(tabId, setTimeout(() => {
+    try { chrome.action.setBadgeText({ tabId, text: "" }); } catch (e) { /* 忽略 */ }
+  }, 180000));
+}
+
 function notifySaved(p) {
+  const ok = p.ok !== false;
+  const name = (p.filename || p.key || "").split(/[\\/]/).pop() || "媒体";
+  const sizeText = p.size ? `（${(p.size / 1048576).toFixed(1)}MB）` : "";
+  // 1. 图标角标：成功 ✓（绿），失败 ✗（红）。悬停标题写明文件名。
+  try {
+    markDoneBadge(p.__tabId, ok ? "✓" : "✗", ok ? "#16a34a" : "#dc2626");
+    try {
+      chrome.action.setTitle({ tabId: p.__tabId, title: ok ? `保存完成：${name}${sizeText}` : `保存失败：${name} —— ${p.error || ""}` });
+    } catch (e) { /* 忽略 */ }
+  } catch (e) { /* 忽略 */ }
+  // 2. 系统通知兜底
   try {
     if (!chrome.notifications || !chrome.notifications.create) return;
-    const ok = p.ok !== false;
-    const name = (p.filename || p.key || "").split(/[\\/]/).pop() || "媒体";
-    const sizeText = p.size ? `（${(p.size / 1048576).toFixed(1)}MB）` : "";
-    const title = ok ? "资源嗅探 · 保存完成" : "资源嗅探 · 保存失败";
-    const message = ok
-      ? `${name}${sizeText} 已保存到本地`
-      : `${name}：${p.error || "未知错误"}`;
     chrome.notifications.create({
       type: "basic",
       iconUrl: "icons/icon128.png",
-      title,
-      message,
+      title: ok ? "资源嗅探 · 保存完成" : "资源嗅探 · 保存失败",
+      message: ok ? `${name}${sizeText} 已保存到本地` : `${name}：${p.error || "未知错误"}`,
       priority: ok ? 0 : 2,
     });
   } catch (e) { /* 通知失败不影响下载本身 */ }
@@ -276,8 +293,12 @@ function bumpBadge(tabId, kind, rec) {
     let n = 0;
     for (const it of rec.items.values()) if (it.k === "video" || it.k === "audio") n++;
     const text = n ? (n > 99 ? "99+" : String(n)) : "";
+    // 新媒体到来 = 用户新一轮嗅探：清掉上一轮的「完成 ✓/✗」角标与标题
+    clearTimeout(doneBadgeTimer.get(tabId));
+    doneBadgeTimer.delete(tabId);
     chrome.action.setBadgeBackgroundColor({ tabId, color: "#2563eb" });
     chrome.action.setBadgeText({ tabId, text });
+    try { chrome.action.setTitle({ tabId, title: "资源嗅探" }); } catch (e) { /* 忽略 */ }
   }, 300));
 }
 
@@ -1141,7 +1162,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           } else {
             hostLog("page", `保存完成 ${p.filename || ""} ${p.size ? (p.size / 1048576).toFixed(1) + "MB" : ""}`);
           }
-          notifySaved(p);
+          // 下载完成提醒：插件图标角标 ✓ + 系统通知（notifySaved 注释里写了两层分工）
+          notifySaved({ ...p, __tabId: tid });
           chrome.runtime.sendMessage({ type: "ms:saved", payload: p }).catch(() => {});
         }
         sendResponse({ ok: true });
