@@ -265,6 +265,35 @@ function recordPageMedia(tabId, pageUrl, p) {
   const kind = mime.startsWith("audio/") ? "audio"
     : mime.startsWith("image/") ? "image" : "video";
 
+  // m1 / m2 这类 MSE 录制条目、以及小红书 <video> 的 blob: 地址，都只是
+  // 「页内播放器正在吃分片」的副产品。页面一旦报出同一条视频的真实 mp4 地址
+  // （hint=xhs-note + k=video），它们就该让位 —— 否则列表里同时出现
+  // 「① 真实视频」和「m1 页面视频（录制中）」，用户不知道该点哪个。
+  //
+  // ⚠️ 必须在 `const existed = ...` **之前**：录制/blob 条目往往比真实地址
+  // 晚到（播放器挂载后 MSE hook 才建 m1），放进 existed 分支里就永远轮不到。
+  if (kind === "video" && p.hint === "xhs-note") {
+    rec.xhsVid = isHttp ? mapKey : "";
+    let dropped = 0;
+    for (const [itKey, it] of [...rec.items]) {
+      if (it.k !== "video") continue;
+      const u = it.u || "";
+      if (/^m\d+$/.test(u) || /^blob:/i.test(u)) { rec.items.delete(itKey); dropped++; }
+    }
+    if (dropped) flushSoon(tabId);
+  }
+
+  // 小红书详情页里，播放器吃分片这件事本身没有保存价值：真实 mp4 地址由
+  // inject-main 的 reportXhsVideo 从 __INITIAL_STATE__ 直接给出，与 <video>
+  // 是否挂载、播放到哪都无关。所以同 tab 一旦有了真实地址，MSE 录制条目
+  // （m1/m2）和它的 blob: 地址就**不再准入**，连建都不建。
+  //
+  // 只做「事后清理」不够：页面每 0.6s 扫一次 <video>，会把 m1/m2 一遍遍
+  // 重新播报回来，列表里就永远挂着一个「页面视频（录制中）」。
+  if (!p.hint && rec.xhsVid && kind !== "image" && (p.source === "mse" || /^blob:|^m\d+$/.test(String(key)))) {
+    return;
+  }
+
   const existed = rec.items.get(mapKey);
   if (existed) {
     if (p.size) existed.s = p.size;

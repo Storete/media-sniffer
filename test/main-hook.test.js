@@ -156,7 +156,7 @@ const sandbox = {
   window: win,
   URL: FakeURL,
   Blob, ArrayBuffer, Uint8Array, Date, Math, JSON, console,
-  setTimeout, clearTimeout, setInterval: () => 0,
+  setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},
   document: fakeDocument,
   MediaSource: FakeMediaSource,
   HTMLMediaElement: FakeHTMLMediaElement,
@@ -998,7 +998,7 @@ async function testProbeTotal() {
       postMessage() {},
       location: { href: "https://web.telegram.org/a/", protocol: "https:" },
       navigator: { userAgent: "test" },
-      setTimeout, clearTimeout, setInterval: () => 0, console,
+      setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console,
       URL, Blob, AbortController, TextDecoder, TextEncoder,
       MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
       document: { documentElement: { appendChild() {} }, body: { appendChild() {} }, createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }), querySelectorAll: () => [], addEventListener() {} },
@@ -1103,6 +1103,124 @@ async function testProbeTotal() {
   check("整包 200 的 content-length 可当总长", n === 524288, n);
 
   await testRangeDownloadOrdering();
+  await testFetchTimeout();
+}
+
+/**
+ * fetch() 本身没有超时 —— 这是用户真机截图「一直卡在正在读取媒体信息…」的根因。
+ * 这里用「永远不 resolve 的 fetch」验证三道保护：
+ *   1) fetchWithTimeout 自己掐表，到点抛带 timeout 标记的错误
+ *   2) 外层 AbortController 中止时抛 AbortError（真取消，不是超时）
+ *   3) fetchRange 在 CDN 挂住时会重试几次然后失败返回，而不是永远 pending
+ */
+async function testFetchTimeout() {
+  console.log("\n[10] fetch 超时保护（防「一直卡在读取媒体信息」）");
+  const fs = require("fs");
+  const vm = require("vm");
+  const code = fs.readFileSync(path.join(__dirname, "..", "extension", "inject-main.js"), "utf8");
+  const portCode = fs.readFileSync(path.join(__dirname, "..", "extension", "sniffer-hostport.js"), "utf8");
+
+  // 永远不 resolve 的 fetch：模拟 CDN 挂住连接（TCP 建好了但不回响应）
+  let fetchCalls = 0;
+  const hangFetch = (url, opts) => {
+    fetchCalls++;
+    // 尊重传进来的 signal：被 abort 时按浏览器行为抛 AbortError
+    return new Promise((resolve, reject) => {
+      const sig = opts && opts.signal;
+      const onAbort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+      if (sig) {
+        if (sig.aborted) return onAbort();
+        sig.addEventListener("abort", onAbort, { once: true });
+      }
+      // 故意永不 resolve
+    });
+  };
+
+  const mkWin = (fetchImpl) => {
+    const win = {
+      fetch: fetchImpl,
+      setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console: { log() {}, warn() {}, error() {} },
+      URL, Blob, AbortController, TextDecoder, TextEncoder,
+      MediaSource: class {}, HTMLMediaElement: class {}, Element: class {},
+      addEventListener() {}, removeEventListener() {}, postMessage() {},
+      DOMException,
+      location: { href: "https://www.xiaohongshu.com/explore/6ab221bd000000003602a63e", protocol: "https:", hostname: "www.xiaohongshu.com", search: "" },
+      document: { documentElement: { appendChild() {} }, body: { appendChild() {} }, createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }), querySelectorAll: () => [], addEventListener() {} },
+    };
+    win.window = win;
+    const ctx = vm.createContext(win);
+    vm.runInContext(portCode, ctx, { filename: "sniffer-hostport.js" });
+    vm.runInContext(code, ctx, { filename: "inject-main.js" });
+    return ctx;
+  };
+
+  const ctx = mkWin(hangFetch);
+
+  // --- 1) fetchWithTimeout 自己掐表
+  const t0 = Date.now();
+  let err1 = null;
+  try {
+    await vm.runInContext(`window.__msFetchWithTimeout("https://x.test/a.mp4", {}, 120)`, ctx);
+  } catch (e) { err1 = e; }
+  const el1 = Date.now() - t0;
+  check("fetchWithTimeout 到点抛错（不会永远挂着）", !!err1, err1 && err1.message);
+  check("抛的错带 timeout 标记（调用方可以当可重试处理）", !!(err1 && err1.timeout === true), err1 && { timeout: err1.timeout });
+  check("确实在超时附近就返回了（< 1s，说明没有等到天荒地老）", el1 < 1000, el1 + "ms");
+
+  // --- 2) 外层 signal 中止 → AbortError（真取消，不能被误当成超时）
+  let err2 = null;
+  const outer = new AbortController();
+  setTimeout(() => outer.abort(), 60);
+  try {
+    // AbortController 要从外层传进去（vm 沙箱的全局里没有）
+    await vm.runInContext(
+      `(() => {
+         const ac = new window.AbortController();
+         window.setTimeout(() => ac.abort(), 60);
+         return window.__msFetchWithTimeout("https://x.test/b.mp4", { signal: ac.signal }, 5000);
+       })()`,
+      ctx);
+  } catch (e) { err2 = e; }
+  check("外层中止时抛 AbortError（不是 timeout）", !!(err2 && err2.name === "AbortError"),
+    err2 && { name: err2.name, msg: String(err2.message).slice(0, 120) });
+
+  // --- 3) fetchRange 面对挂住的 CDN：重试几次后失败返回，不无限 pending
+  // 模块级超时是 40s，直接跑要等几分钟；这里把全局 setTimeout 换成
+  // 「立即触发」的版本，等价于超时瞬间到达，几秒内就能验证完。
+  fetchCalls = 0;
+  const fastWin = {
+    fetch: hangFetch,
+    setTimeout: (fn) => { const h = setTimeout(fn, 5); return h; },
+    clearTimeout,
+    setInterval: () => 0, clearInterval() {},
+    console: { log() {}, warn() {}, error() {} },
+    URL, Blob, AbortController, TextDecoder, TextEncoder, Promise,
+    MediaSource: class {}, HTMLMediaElement: class {}, Element: class {},
+    addEventListener() {}, removeEventListener() {}, postMessage() {},
+    DOMException,
+    location: { href: "https://www.xiaohongshu.com/explore/6ab221bd000000003602a63e", protocol: "https:", hostname: "www.xiaohongshu.com", search: "" },
+    document: { documentElement: { appendChild() {} }, body: { appendChild() {} }, createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }), querySelectorAll: () => [], addEventListener() {} },
+  };
+  fastWin.window = fastWin;
+  const ctx2 = vm.createContext(fastWin);
+  vm.runInContext(portCode, ctx2, { filename: "sniffer-hostport.js" });
+  vm.runInContext(code, ctx2, { filename: "inject-main.js" });
+
+  let err3 = null;
+  const t1 = Date.now();
+  try {
+    await vm.runInContext(`window.__msRangeFetch("https://x.test/c.mp4", 0, 1023, null)`, ctx2);
+  } catch (e) { err3 = e; }
+  const el3 = Date.now() - t1;
+  check("fetchRange 遇到挂住的 CDN 最终会失败返回（不无限等待）", !!err3, err3 && err3.message);
+  check("fetchRange 在 omit/include 之间来回重试了几次", fetchCalls >= 2, fetchCalls);
+  check("整轮重试很快就结束了（不会挂几分钟）", el3 < 10000, el3 + "ms");
+
+  // --- 4) 常量定义正确
+  const tmo = await vm.runInContext(`window.__msFetchTimeouts()`, ctx);
+  check("首段超时 20s", tmo && tmo.probe === 20000, tmo);
+  check("分段超时 40s", tmo && tmo.chunk === 40000, tmo);
+  check("8s 后补提示文案", tmo && tmo.hint === 8000, tmo);
 }
 
 /**
@@ -1126,7 +1244,7 @@ function testFileNameChain() {
       addEventListener() {}, removeEventListener() {}, postMessage() {},
       location: { href, search, protocol: "https:", hostname: "www.bilibili.com" },
       navigator: { userAgent: "test" },
-      setTimeout, clearTimeout, setInterval: () => 0, console: { log() {}, warn() {}, error() {} },
+      setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console: { log() {}, warn() {}, error() {} },
       URL, URLSearchParams, Blob, AbortController, TextDecoder, TextEncoder,
       MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
       document: {
@@ -1317,7 +1435,7 @@ async function testRangeDownloadOrdering() {
     addEventListener() {}, removeEventListener() {}, postMessage() {},
     location: { href: "https://www.bilibili.com/video/BV1oMpm6QEQR/", protocol: "https:", hostname: "www.bilibili.com" },
     navigator: { userAgent: "test" },
-    setTimeout, clearTimeout, setInterval: () => 0, console,
+    setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console,
     URL, Blob, AbortController, TextDecoder, TextEncoder,
     MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
     document: { documentElement: { appendChild() {} }, body: { appendChild() {} }, createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }), querySelectorAll: () => [], addEventListener() {} },
@@ -1447,7 +1565,7 @@ async function testBiliMergeFlow() {
     addEventListener() {}, removeEventListener() {}, postMessage() {},
     location: { href: "https://www.bilibili.com/video/BV1test/", protocol: "https:", hostname: "www.bilibili.com" },
     navigator: { userAgent: "test" },
-    setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console,
+    setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, clearInterval() {}, console,
     URL, Blob, AbortController, TextDecoder, TextEncoder,
     MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
     document: { documentElement: { appendChild() {} }, body: { appendChild() {} },
@@ -1500,7 +1618,7 @@ function testProtocolGuard() {
       addEventListener() {}, removeEventListener() {}, postMessage() {},
       location: protocol === undefined ? undefined : { href: "x", protocol },
       navigator: { userAgent: "test" },
-      setTimeout, clearTimeout, setInterval: () => 0, console,
+      setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console,
       URL, Blob, AbortController, TextDecoder, TextEncoder,
       MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
       document: { documentElement: { appendChild() {} }, body: { appendChild() {} }, createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }), querySelectorAll: () => [], addEventListener() {} },

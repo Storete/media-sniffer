@@ -15,7 +15,16 @@
 
   const hostPort = {
     listeners: [],
+    // 端口断开后再 send 等于往黑洞里扔：没人会回，调用方只能等到超时。
+    // 这里直接抛，让 hostRequest / msfile 立刻失败并把「扩展已更新，请刷新页面」
+    // 这句提示送到浮层上（刷新页面就会用上新扩展，问题一次性解决）。
+    disconnectedFlag: false,
     send(payload) {
+      if (this.disconnectedFlag) {
+        const e = new Error("与本地下载器的连接已断开（扩展可能刚更新过，请刷新本页）");
+        e.disconnected = true;
+        throw e;
+      }
       post({ cmd: "host-send", payload });
     },
     // 收到宿主消息（由 content.js 转发）
@@ -24,7 +33,15 @@
         try { fn(msg); } catch (e) { /* 忽略 */ }
       }
     },
+    // 连接断开时必须同时把「正在等回执」的调用方打醒。
+    //
+    // 曾经的坑（真机：点保存后浮层永远停在「正在读取媒体信息…」）：
+    // 端口一断就 this.listeners.length = 0，把等待者全清空，但**从不让它们 reject**。
+    // hostRequest 的 45s 超时根本没机会生效（它的监听器已经被清掉了），
+    // Promise 永久 pending。扩展被重载（loadUnpacked / 更新）后旧页面都会这样。
     disconnected(err) {
+      this.disconnectedFlag = true;
+      // 先置位，后续 send 直接抛错，不再静默丢进黑洞
       for (const fn of this.listeners.slice()) {
         try { fn({ __disconnected: true, error: err }); } catch (e) { /* 忽略 */ }
       }

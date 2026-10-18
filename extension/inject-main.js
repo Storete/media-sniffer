@@ -1042,6 +1042,7 @@
   window.__msXhsIdInUrl = xhsIdInUrl;
   window.__msXhsAncestorNoteId = xhsAncestorNoteId;
   window.__msXhsVideoSource = xhsVideoSource;
+  window.__msXhsVideoReady = xhsVideoReady;
   window.__msXhsNoteTitle = xhsNoteTitle;
 
 
@@ -1115,6 +1116,52 @@
    *   · 这里**不做图标判定**，交给 background 的 looksLikeIcon（头像/二维码
    *     的 URL 特征那边也有兜底）。
    */
+  // 小红书正文视频的「统一上报」。
+  //
+  // ⚠️ 2026-10-18 真机教训（用户：「捕捉不到视频了」）：
+  // 小红书的 <video> 只有在**点开笔记、播放器挂载之后**才在 DOM 里出现。
+  // 从信息流直接点开（新标签页打开 / 首屏还没渲染播放器）时，scanMedia()
+  // 那次 600ms 轮询根本没找到元素；等播放器出现时，handleMediaSrc() 还有
+  // 两道闸 —— `if (!src) continue;`（currentSrc 还是空的）和 seenSrc 去重 ——
+  // 于是这个视频**整场静默**，列表里只剩一个 MSE 的 m1。
+  // 现在视频地址与标题都来自 `__INITIAL_STATE__`，和 DOM 无关，所以按
+  // noteId 直接报，与 <video> 是否出现无关。scanMedia 那条路保留（补充
+  // 宽高/时长），两条路用同一个 URL 当 key，在 background 里自然合并。
+  const xhsVidReported = new Map(); // noteId|url -> title 已报过的标题
+
+  function reportXhsVideo(real) {
+    const noteId = xhsCurrentNoteId() || "";
+    if (!noteId || !real || !real.url) return;
+    const url = real.url;
+    const title = xhsNoteTitle() || "";
+    const prev = xhsVidReported.get(noteId + "|" + url);
+    if (prev === title) return; // 同一标题不重复发
+    xhsVidReported.set(noteId + "|" + url, title);
+    if (xhsVidReported.size > 20) xhsVidReported.delete(xhsVidReported.keys().next().value);
+    const payload = {
+      cmd: "found", source: "httpmedia", key: url, size: 0,
+      mime: "video/mp4", ext: ".mp4",
+      w: real.w | 0, h: real.h | 0, dur: real.duration ? Math.round(real.duration / 1000) : 0,
+      title, mid: "", ord: 0, ref: "", hint: "xhs-note",
+    };
+    post(payload);
+    // 宽高/时长/序号也走 progress，popup 打开时即使 found 发生在很久以前
+    //（background 里已有该条目），这些字段也能补上。
+    post({ cmd: "progress", key: url, w: payload.w, h: payload.h, dur: payload.dur, ord: 0, title, hint: "xhs-note" });
+    // 同时把「视频没有 <video> 元素」这件事也当作已见，避免之后 handleMediaSrc
+    // 再发一条不带 hint 的重复 found。
+    try {
+      seenSrc.add(url);
+      meta.set(url, { w: payload.w, h: payload.h, dur: payload.dur });
+      titles.set(url, title);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function xhsNoteVideoInfo() {
+    // 只有视频帖才有；xhsVideoSource 内部已按 note.type === "video" 判定
+    return xhsVideoSource();
+  }
+
   function scanXhsNoteImages(noteImgs) {
     const title = xhsNoteTitle() || "";
     // 视频帖（note.type === "video"）的 imageList 只有一条 —— 就是视频封面，
@@ -1151,6 +1198,10 @@
         const noteImgs = xhsNoteImages();
         if (noteImgs && noteImgs.length) {
           scanXhsNoteImages(noteImgs);
+          // 视频帖的封面之外还有那个 mp4 本体：它不依赖 <video> 元素（见
+          // reportXhsVideo 开头的说明），在这里一并补报，否则「点开笔记但
+          // 播放器没挂载」时整个视频都抓不到。
+          reportXhsVideo(xhsNoteVideoInfo());
           return; // 已由直读通路报完，不再跑 DOM 扫描
         }
       }
@@ -1403,6 +1454,19 @@
   const BIG_CHUNK = 4 * 1024 * 1024;
   const BIG_PARALLEL = 6;
 
+  // ---- 单次 fetch 的超时上限 ------------------------------------------------
+  // fetch() 本身**没有超时**：CDN 把 TCP 连接挂住不回响应时，Promise 永远 pending，
+  // 页面上就停在「正在读取媒体信息… · 等待数据…」，等一天也不会动（真机截图即此）。
+  // 所以每一次请求都必须自己掐表。
+  //   首段（探针）给 20s —— 它同时承担「问总长度」，有些 CDN 首字节就是慢；
+  //   后续分段给 40s —— 4MB 段在 100KB/s 的弱网下要 40s，再短会误杀大分段。
+  // 超时按可重试的网络错误处理（换凭据模式再试），不当作致命错误。
+  const FETCH_TIMEOUT_PROBE = 20 * 1000;
+  const FETCH_TIMEOUT_CHUNK = 40 * 1000;
+  // 「读取媒体信息」阶段超过这么久还没拿到任何字节，就在阶段行补一句提示，
+  // 让用户知道可以点取消，而不是以为扩展死了。
+  const PROBE_HINT_AFTER = 8 * 1000;
+
   /**
    * 这个地址是不是「直连 CDN」（不是 Telegram 那种 Service Worker 代理流）。
    * 只有直连 CDN 才敢用大分段 + 高并发；SW 流放大反而慢 5 倍以上。
@@ -1491,6 +1555,31 @@
    * 直连 CDN 的分段流必须 reload，否则每个 chunk 都白等 7 秒。
    * 判断依据：不需要凭据的跨域 CDN（即降级到 omit）就说明不是 SW 流，用 reload。
    */
+  /**
+   * 带超时的 fetch。fetch() 自己不会超时——CDN 挂住连接时 Promise 永远 pending。
+   *
+   * 外层 signal 中止时抛 AbortError（真取消）；自己掐表打断时抛带 `timeout` 标记的
+   * 普通 Error，调用方可以当成「可重试的网络错误」。
+   */
+  async function fetchWithTimeout(url, opts, ms) {
+    const outer = opts && opts.signal;
+    const ctrl = new AbortController();
+    let fired = false;
+    const onOuterAbort = () => { try { ctrl.abort(); } catch (e) { /* 忽略 */ } };
+    if (outer) outer.addEventListener("abort", onOuterAbort, { once: true });
+    const timer = setTimeout(() => { fired = true; try { ctrl.abort(); } catch (e) { /* 忽略 */ } }, ms);
+    try {
+      return await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+    } catch (e) {
+      if (outer && outer.aborted) throw new DOMException("aborted", "AbortError");
+      if (fired) throw Object.assign(new Error(`请求超时（${Math.round(ms / 1000)}s 无响应）`), { timeout: true });
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (outer) outer.removeEventListener("abort", onOuterAbort);
+    }
+  }
+
   async function fetchRange(url, start, end, signal) {
     let lastErr = null;
     // 顺序：omit 优先（B 站 CDN 这种直连 CDN 一次就成，且能用 reload 走缓存旁路），
@@ -1500,17 +1589,35 @@
     let mode = "omit";
     for (let attempt = 0; attempt < 4; attempt++) {
       if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+      // 每次请求自带上限。fetch 本身**没有任何超时**：CDN 把连接挂住不回响应时，
+      // 这个 Promise 永远 pending，页面浮层就停在「正在读取媒体信息… / 等待数据…」
+      // 一整天（用户真机截图就是这个状态）。首段给得宽松一点，后续分段更短。
+      const timeout = attempt === 0 ? FETCH_TIMEOUT_PROBE : FETCH_TIMEOUT_CHUNK;
+      const timer = { id: 0, fired: false };
+      const ctrl = new AbortController();
+      const onOuterAbort = () => { try { ctrl.abort(); } catch (e) { /* 忽略 */ } };
+      if (signal) signal.addEventListener("abort", onOuterAbort, { once: true });
+      timer.id = setTimeout(() => { timer.fired = true; try { ctrl.abort(); } catch (e) { /* 忽略 */ } }, timeout);
       try {
         // omit 模式下（B 站这类直连 CDN）用 reload 绕开缓存查询，实测快 200 倍以上。
         // include 模式（Telegram 的 SW 流）实测 no-store 比 force-cache 快一倍：
         //   未缓存段 force-cache → 6291ms    no-store → 3673ms
         // force-cache 会让 SW 先查一遍缓存再回源，未命中时段段都要多绕一圈。
-        const cacheMode = mode === "omit" ? "reload" : "no-store";
+        //
+        // ⚠️ 2026-10-18 真机（小红书 CDN）：
+        //   · default 缓存模式 → 5ms（浏览器直接给内存缓存，最快，也不报错）
+        //   · no-store / reload → 250~380ms（真的回源）
+        //   · credentials:"include" → `TypeError: Failed to fetch`（小红书 CDN 的
+        //     ACAO 不回 credentials，带凭据的请求被 CORS 直接拒掉）
+        // 所以：omit + default 是小红书这类 CDN 的最优组合；Telegram 的 SW 流
+        // 必须 include，那边仍然用 no-store（实测比 force-cache 快一倍）。
+        // 回源需求靠 Range 头本身满足（每段 Range 不同，缓存不会命中错段）。
+        const cacheMode = mode === "omit" ? "default" : "no-store";
         const res = await fetch(url, {
           cache: cacheMode,
           credentials: mode,
           headers: { Range: `bytes=${start}-${end}` },
-          signal,
+          signal: ctrl.signal,
         });
         if (res.status !== 206 && res.status !== 200) {
           // 4xx 不要了；5xx/429 重试
@@ -1528,13 +1635,26 @@
           len: res.headers.get("content-length") || "",
         };
       } catch (e) {
-        if (e.name === "AbortError") throw e;
-        if (e.fatal) throw e;
-        lastErr = e;
+        // 外层 signal 中止 → 真的取消，直接往外抛
+        if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+        if (e.name === "AbortError" && !timer.fired) throw e;
+        // 自己超时打断的，当成一次可重试的网络错误（fetch 会抛 AbortError）
+        if (timer.fired) {
+          lastErr = new Error(`请求超时（${Math.round(timeout / 1000)}s 无响应）`);
+        } else {
+          if (e.fatal) throw e;
+          lastErr = e;
+        }
         // 网络层直接拒掉（跨域凭据不匹配时就是 TypeError: Failed to fetch）：
         // omit 被拒就升级 include（Telegram 的 SW 流需要凭据），反之亦然。
-        mode = mode === "omit" ? "include" : "omit";
-        await sleep(250 * (attempt + 1));
+        const wasOmit = mode === "omit";
+        mode = wasOmit ? "include" : "omit";
+        // 换个凭据模式重试一次，别把时间全耗在同一条路上
+        if (timer.fired && !wasOmit) await sleep(150);
+        else await sleep(250 * (attempt + 1));
+      } finally {
+        clearTimeout(timer.id);
+        if (signal) signal.removeEventListener("abort", onOuterAbort);
       }
     }
     throw lastErr || new Error("Range 请求失败");
@@ -1616,22 +1736,25 @@
     const tries = ["omit", "include"];
     for (const cred of tries) {
       try {
-        const res = await fetch(key, { method: "HEAD", credentials: cred, signal });
+        // HEAD 也要掐表：CORS 预检挂住时同样会永远 pending
+        const res = await fetchWithTimeout(key, { method: "HEAD", credentials: cred, signal }, FETCH_TIMEOUT_PROBE / 2);
         n = fromCR(res.headers.get("content-range")) || Number(res.headers.get("content-length") || 0);
         if (n > 0) return n;
         break;
-      } catch (e) { if (e && e.name === "AbortError") throw e; }
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
+      }
     }
 
     for (const cred of tries) {
       try {
-        const res = await fetch(key, {
+        const res = await fetchWithTimeout(key, {
           // 同 fetchRange 的理由：omit 直连 CDN 用 reload，否则单次要等 7 秒；
           // include 走 SW 流时用 no-store（force-cache 未命中会慢一倍，实测）
           cache: cred === "omit" ? "reload" : "no-store",
           credentials: cred, signal,
           headers: { Range: "bytes=-1" },
-        });
+        }, FETCH_TIMEOUT_PROBE / 2);
         if (res.status === 206) {
           n = fromCR(res.headers.get("content-range"));
           // 尾字节请求只读走 1 个字节，但响应体要消费掉，否则连接不归还连接池
@@ -1639,7 +1762,9 @@
           if (n > 0) return n;
         }
         break;
-      } catch (e) { if (e && e.name === "AbortError") throw e; }
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
+      }
     }
 
     // 4) DASH：解析 sidx。B 站分支会直接给现成的 sidx 字节；
@@ -1648,10 +1773,10 @@
     const indexRange = fromRange(probe && probe.indexRange);
     if (!sidx && indexRange) {
       try {
-        const r = await fetch(key, {
+        const r = await fetchWithTimeout(key, {
           headers: { Range: `bytes=${indexRange[0]}-${indexRange[1]}` },
           credentials: "omit", signal,
-        });
+        }, FETCH_TIMEOUT_PROBE / 2);
         if (r.status === 206 || r.status === 200) sidx = await r.arrayBuffer();
       } catch (e) { if (e && e.name === "AbortError") throw e; }
     }
@@ -1684,7 +1809,15 @@
 
     // ---- 1) 第一个分段同时充当探针：拿到 /total 和文件头
     log(`读取媒体信息 ${key}`);
-    stage(ctx.kind === "audio" ? "正在读取音频信息…" : "正在读取媒体信息…");
+    const probeLabel = ctx.kind === "audio" ? "正在读取音频信息…" : "正在读取媒体信息…";
+    stage(probeLabel);
+    // 首段可能要等 CORS 预检 + 首字节；超过 PROBE_HINT_AFTER 还没回来就补一句
+    // 「仍在连接…」，配合下面的超时，用户至少知道它没死、也能点取消。
+    const probeHintAt = Date.now();
+    const probeHintTimer = setInterval(() => {
+      const s = Math.round((Date.now() - probeHintAt) / 1000);
+      if (s >= PROBE_HINT_AFTER / 1000) stage(`${probeLabel}（已等 ${s}s，仍在连接，可点取消）`);
+    }, 1000);
     let probe = null;
     try {
       // 注意 fetchRange 的 end 是**包含式**的：要 cb 个字节就得到 cb-1。
@@ -1705,13 +1838,17 @@
         }
       }
       if (!probe) {
-        // 退回不带 Range 的 fetch（有些站点反而只认普通 GET）
+        // 退回不带 Range 的 fetch（有些站点反而只认普通 GET）。
+        // 这条同样要掐表，否则「服务器忽略了 Range」和「服务器根本没回」长得一样。
         log("Range 请求失败，退回普通 fetch：" + (e.message || e));
-        const res = await fetch(key, { credentials: "include", signal });
+        const res = await fetchWithTimeout(key, { credentials: "include", signal }, FETCH_TIMEOUT_CHUNK);
         if (!res.ok) throw new Error("HTTP " + res.status);
         const buf = await res.arrayBuffer();
         return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename: name };
       }
+    } finally {
+      clearInterval(probeHintTimer);
+      stage(probeLabel);
     }
     if (!first) first = probe;
     if (probe.full) {
@@ -1748,7 +1885,7 @@
     if (!total) {
       // 长度实在问不出来：退回普通 GET 一次性读完（只有小文件会走到这里）
       log(`总长度未知，改用普通 GET 读全量 ${key}`);
-      const res = await fetch(key, { credentials: "include", signal });
+      const res = await fetchWithTimeout(key, { credentials: "include", signal }, FETCH_TIMEOUT_CHUNK);
       if (!res.ok) throw new Error("HTTP " + res.status);
       const buf = await res.arrayBuffer();
       const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || ".mp4";
@@ -2382,7 +2519,12 @@
       const onDisc = (msg) => {
         if (!msg || !msg.__disconnected) return;
         cleanup();
-        reject(new Error("本地下载器已断开: " + (msg.error || "")));
+        const why = String((msg && msg.error) || "");
+        // 扩展被重载（loadUnpacked / 商店更新）后，旧页面里的内容脚本整体失效，
+        // 宿主端口随之断开。这时唯一正确的动作是刷新页面，直接把话说明白。
+        reject(new Error(/context invalidated|已断开/i.test(why) || !why
+          ? "与本地下载器的连接已断开（扩展可能刚更新过，请刷新本页后重试）"
+          : "本地下载器已断开: " + why));
       };
       function cleanup() {
         clearTimeout(timer);
@@ -2394,7 +2536,15 @@
       if (signal) {
         signal.addEventListener("abort", () => { cleanup(); reject(new DOMException("aborted", "AbortError")); }, { once: true });
       }
-      HOSTPORT.send({ ...payload, id });
+      // send 在「扩展刚被更新 / 端口已断」时会抛错（见 sniffer-hostport.js）。
+      // 不接住的话异常会从 Promise 构造器里抛出，外层只能看到「无响应」字样，
+      // 用户也就不知道正确的动作是刷新页面。
+      try {
+        HOSTPORT.send({ ...payload, id });
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
     });
   }
 
@@ -2925,7 +3075,7 @@
       // 但 blob 由 <video> 的私有存储持有。直接重试 fetch 一次成本很低，值得做，
       // 成功了就顺手记下来，后面再保存就不用再取。
       try {
-        const res = await fetch(key, { cache: "force-cache", credentials: "include" });
+        const res = await fetchWithTimeout(key, { cache: "force-cache", credentials: "include" }, FETCH_TIMEOUT_CHUNK);
         if (res.ok) {
           const blob = await res.blob();
           if (blob && blob.size) {
@@ -2956,6 +3106,8 @@
 
   // 调试入口（只有测试脚本 / 控制台排障会调用）
   window.__msRangeFetch = fetchRange;
+  window.__msFetchWithTimeout = fetchWithTimeout; // 超时保护（测试要直接断言）
+  window.__msFetchTimeouts = () => ({ probe: FETCH_TIMEOUT_PROBE, chunk: FETCH_TIMEOUT_CHUNK, hint: PROBE_HINT_AFTER });
   window.__msProbeTotal = probeTotal;
   window.__msRangeDownload = runRangeDownload;
   window.__msRunBiliDownload = runBiliDownload; // 供真机排查
