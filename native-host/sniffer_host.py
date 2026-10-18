@@ -5,11 +5,17 @@ Media Sniffer 的 Native Messaging 宿主
 
 协议：4 字节小端长度 + UTF-8 JSON，走 stdin/stdout。
   - stdin/stdout 只用于协议通信，任何调试输出必须走 stderr
+  - 写入必须加 WRITE_LOCK：poll_job 在后台线程里也会发消息，
+    两个线程同时写 stdout 会把帧长度和正文交错，浏览器直接断开
 
-职责：
-  - 回答 ping（汇报 yt-dlp / ffmpeg 是否就绪）
-  - 收到 download 时以 detached 方式拉起 downloader.py，然后轮询状态文件回传进度
-  - 收到 cancel 时写取消标记文件
+职责（两大类，别混）：
+  1. 「点按钮下载」—— downloader.py 以 detached 进程跑，宿主只拉起 + 轮询
+     状态文件回传进度（C 盘/网络下载、yt-dlp、ffmpeg 合并都走这条）
+  2. 「页面直传」—— msfile_* 系列，页面自己把分块递过来，宿主负责顺序落盘。
+     Telegram 这类只认页面 Range 请求的站走这条，数据流方向完全相反
+
+消息形状：每个响应都带 id（请求里那个）和 action（请求的动作名），
+扩展侧靠 id 把响应配回请求；带 inProgress 的表示「后面还有消息，别拆桥」。
 """
 import base64
 import json
@@ -60,6 +66,12 @@ def log(*a):
 
 
 def send(obj):
+    """发一条帧。BrokenPipe 说明浏览器那边已经关了宿主（正常退出路径），
+    直接 os._exit(0) 而不是抛异常 —— 抛的话会在 poll_job 线程里变成
+    一堆噪音，且主循环还活着。
+
+    必须先 write 长度再 write 正文，且两者在同一把锁里：分成两次加锁
+    会出现「A 写完长度、B 插进一段正文」的错位。"""
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     with WRITE_LOCK:
         try:
@@ -71,6 +83,11 @@ def send(obj):
 
 
 def read_message():
+    """读一条帧。返回 None 表示连接该结束了（EOF / 长度非法 / JSON 坏）。
+
+    注意 read(n) 不保证一次读满，但 stdin 是管道且 length-prefixed，
+    正常情况一次到底；< n 视为 EOF 处理（浏览器重启宿主比猜测帧边界安全）。
+    """
     raw = sys.stdin.buffer.read(4)
     if len(raw) < 4:
         return None
@@ -109,6 +126,12 @@ def _download_dir():
 
 
 def _safe_name(name):
+    """把页面给的文件名洗成「只剩一个安全文件名」。
+
+    先 basename 掉路径（同时把反斜杠统一成斜杠，否则 Windows 上的
+    "a\\b.mp4" 在 os.path.basename 里算一个整体），再换掉 Windows 非法字符。
+    空名兜底成 media-时间戳，避免存成一个叫 "" 的文件。最长 150 字符。
+    """
     name = os.path.basename(str(name or "").replace("\\", "/")).strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     name = name.strip(". ")
@@ -118,6 +141,11 @@ def _safe_name(name):
 
 
 def _unique_path(dirname, name):
+    """同名文件不覆盖，从 "xxx (2).mp4" 起往后找空位。
+
+    刻意不用「先删旧的再写」：下载目录是用户的，同名文件可能是他
+    自己攒的东西，覆盖是不可逆的。
+    """
     base, ext = os.path.splitext(name)
     path = os.path.join(dirname, name)
     i = 2
@@ -128,6 +156,12 @@ def _unique_path(dirname, name):
 
 
 def do_msfile_start(msg):
+    """页面直传的第 1 步：建文件、登记任务。
+
+    立刻 open(path, "wb") 而不是收到第一块再建 —— 文件在磁盘上出现本身
+    就是「正在写」的可视信号；中止时 do_msfile_abort 会删掉它。
+    id 允许页面自己带（同一批下载复用），不带就生成一个。
+    """
     name = _safe_name(msg.get("name"))
     total = int(msg.get("total") or 0)
     d = _download_dir()
@@ -144,6 +178,14 @@ def do_msfile_start(msg):
 
 
 def do_msfile_chunk(msg):
+    """页面直传的第 2 步：写一块。**这是整条链路最热的路径**，
+    一次 Telegram 771MB 视频要过 ~1500 次（512KB 一块）。
+
+    三个非显然的点：
+      · 按 start 偏移 seek 写而不是顺序追加 —— 见下面的大段注释（幂等重试）
+      · 数据既可能是 base64 字典也可能是字节数组，两种都收
+      · 回执带 inProgress，否则扩展会把页面桥当一次性请求拆掉
+    """
     job_id = msg.get("id")
     # 起始偏移。页面用 text="bytes=<start>-" 的形式带过来（沿用 B 站那种 Range 风格）。
     # 有偏移就按偏移 seek 写，而不是顺序追加 —— 这样重试同一段是幂等的：
@@ -198,6 +240,11 @@ def do_msfile_chunk(msg):
 
 
 def do_msfile_end(msg):
+    """页面直传的第 3 步：关文件、回最终大小。
+
+    用 os.path.getsize 而不是累加的 written —— written 只是「推进到的最高
+    水位」，理论上应该相等，但以磁盘实际为准；文件系统出错时能立刻发现。
+    """
     job_id = msg.get("id")
     with FILE_LOCK:
         job = FILE_JOBS.pop(job_id, None)
@@ -217,6 +264,11 @@ def do_msfile_end(msg):
 
 
 def do_msfile_abort(msg):
+    """中止直传：关掉句柄**并删掉半成品**。
+
+    与 downloader 不同：那边的半成品是 .part 文件（可续传），这边的半成品
+    是直接以正式文件名打开的，留着就是一坨播不了的垃圾，必须清掉。
+    """
     job_id = msg.get("id")
     with FILE_LOCK:
         job = FILE_JOBS.pop(job_id, None)
@@ -314,6 +366,11 @@ def reap_stale_files():
 
 
 def find_tool(names):
+    """找可执行文件，按优先级：项目 bin/ → PATH → 几个常见包管理器目录。
+
+    为什么项目 bin/ 排第一：ffmpeg/ffprobe 随项目分发，不依赖系统 PATH，
+    也不需要用户装。C 盘上的 winget 目录排最后，避免误用别的版本。
+    """
     import shutil
     # 优先项目自带的 bin/（ffmpeg/ffprobe 随项目分发，不依赖系统 PATH）
     project_bin = os.path.join(os.path.dirname(HERE), "bin")
@@ -495,6 +552,13 @@ def _spawn_worker(job_file):
 
 
 def do_download(msg):
+    """拉起下载任务。宿主只负责写 job 文件 + 起进程 + 开轮询线程，
+    真正的下载在 downloader.py 那个独立进程里跑 —— 弹窗关了、宿主死了、
+    浏览器退了，下载都照下不误。
+
+    副作用顺序很重要：先清取消标记（同 id 重试时残留的 .cancel 会让新任务
+    一启动就自杀），再写初始状态（扩展在 worker 起来前不能读到空文件）。
+    """
     job = {
         "id": msg["id"],
         "url": msg["url"],
@@ -534,6 +598,10 @@ def do_download(msg):
 
 
 def do_cancel(msg):
+    """取消 = 在 jobs/ 下写一个 <id>.cancel 空文件。downloader 的读写循环每
+    轮都 stat 一下它，看到就 terminate 子进程。跨进程用文件当信号，比 socket
+    简单，也不怕 worker 还没起来（标记会一直在那儿等着）。
+    """
     os.makedirs(JOBS_DIR, exist_ok=True)
     with open(os.path.join(JOBS_DIR, msg["id"] + ".cancel"), "w") as f:
         f.write("1")
@@ -541,6 +609,11 @@ def do_cancel(msg):
 
 
 def do_list(msg):
+    """列出最近的下载任务（供排障用）。
+
+    跳过 .job.json（那是发给 worker 的输入，不是状态），只读 .json 状态文件；
+    按 updated 倒序，最多 50 条 —— 用户攒了几个月也不至于返回几千条。
+    """
     os.makedirs(JOBS_DIR, exist_ok=True)
     jobs = []
     for name in os.listdir(JOBS_DIR):
@@ -578,6 +651,12 @@ HANDLERS = {
 
 
 def main():
+    """主循环：读一条、派发一条，**永远不退出**（除非 stdin 关了）。
+
+    handler 里任何异常都就地兜住转成 error 回执 —— 一个坏请求不该把宿主
+    整个打死，否则用户得重启浏览器才能再下载。reap_stale_files 是守护
+    线程，负责清理页面崩溃留下的半成品。
+    """
     log("start", sys.executable)
     threading.Thread(target=reap_stale_files, daemon=True).start()
     while True:

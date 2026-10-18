@@ -1,4 +1,32 @@
-/* 资源嗅探 - popup */
+/* 资源嗅探 - popup
+ *
+ * popup 是扩展的唯一 UI。它本身**不抓任何东西**，只做两件事：
+ *   1. 向 background 要当前标签页的条目清单（sniff:get），渲染成列表
+ *   2. 用户点按钮时，把请求转给 background（本地下载器）或页面（页面浮层保存）
+ *
+ * 三条数据通路，选哪条决定了条目长什么样：
+ *   · webRequest 抓到的直链    → 有 u/s/m，k 是视频/图片/字体等，按大小排序
+ *   · 页面主世界注入脚本上报的 → 带 page=1，有 mid（消息号）/title/ref，
+ *                                Telegram 这类「只能页面自己取」的站走这条
+ *   · B 站合成条目             → u 是哨兵 __bili_dash__，真实流在页面里现取
+ *
+ * 条目字段速查（background.js 的 recordPageMedia 产出的）：
+ *   u      URL，也是唯一 key（B 站合成条目用哨兵）
+ *   k      kind：video/audio/image/icon/doc/font/other/seg
+ *   s      字节数        m   mime
+ *   w h    像素尺寸      dur 时长（秒）
+ *   t      首次抓到的时间戳（同 kind 内按此兜底排序）
+ *   f      服务器给的文件名（Content-Disposition），可能是空的
+ *   page   1 = 页面上下文捕获的（列表里显示「保存」而非「下载」）
+ *   mid    页面里的消息 id（Telegram 一条消息可有多图）
+ *   ref    页面给的上下文标记：album=相册 / viewer=媒体查看器
+ *   ord    页面里的出现序号（决定 ①②③ 的先后）
+ *   idx    编好号后的序号（background 按 mid + ref 分组重排的最终结果）
+ *   mark   ①②③ 这种圈码前缀，只有分组内多于一条时才编
+ *   title  页面里的标题（Telegram 消息正文 / 小红书帖子文字）
+ *   live   1 = 还在录制（MSE 流）
+ *   hits   同一 URL 被命中过几次
+ */
 
 const KIND_LABEL = {
   video: "视频", audio: "音频", image: "图片", icon: "图标",
@@ -8,15 +36,16 @@ const KIND_ICON = {
   video: "▶", audio: "♪", image: "▣", icon: "◆", doc: "▤", font: "A", other: "◇", seg: "#",
 };
 
-let tabId = null;
-let tabUrl = "";
-let allItems = [];
-let filter = "all";
-let counts = {};
-let hostOk = null;
+let tabId = null;      // 当前活动标签页 id，所有消息都带着它（background 的 state 按 tabId 分）
+let tabUrl = "";       // 当前标签页地址，用来判断站点（B 站、小红书…）
+let allItems = [];     // 从 background 拿到的全量条目（未经任何过滤）
+let filter = "all";    // 当前选中的分类 chip
+let counts = {};       // background 给的各 kind 计数（B 站上会被 shownItems 重算覆盖）
+let hostOk = null;     // 本地下载器状态：null=还没结果 / true=可用 / false=不可用
 
 const $ = (sel) => document.querySelector(sel);
 
+/** 「1.5 MB」这种人读的尺寸。0/空返回空串，让调用方用 filter(Boolean) 拼「·」 */
 function fmtSize(n) {
   if (!n) return "";
   const u = ["B", "KB", "MB", "GB"];
@@ -25,6 +54,7 @@ function fmtSize(n) {
   return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
 }
 
+/** 取 host。blob:/data: 这类地址 new URL 也能成功（host 为空），坏 URL 返回空串 */
 function hostOf(url) {
   try { return new URL(url).host; } catch { return ""; }
 }
@@ -61,16 +91,25 @@ function isBiliFeedPage() {
   } catch { return false; }
 }
 
-/** 这一条是不是「只录到已播放片段」的 MSE/blob 条目 */
+/** 这一条是不是「只录到已播放片段」的 MSE/blob 条目
+ *  blob: 是页面自己 createObjectURL 出来的，m\d+ 是扩展给 MSE 流编的假 URL。 */
 function isRecorderItem(it) {
   const u = it.u || "";
   return /^blob:/i.test(u) || /^m\d+$/.test(u);
 }
 
+/** 要不要隐藏录制条目。目前只有 B 站需要（它同时提供可完整下载的 DASH 流） */
 function hideRecorder() {
   return isBiliSite();
 }
 
+/**
+ * 过滤后的条目清单 —— 列表、chip 计数、「全部保存」三处都从这里取，保证口径一致。
+ *
+ * 非 B 站：原样返回（复制一份，避免调用方改到 allItems）。
+ * B 站：剔掉 MSE/blob 录制条目，再补一条合成条目。合成条目的条件是有播放器
+ * （存在录制条目）——首页那种没有播放器的页面不该冒出「完整 DASH 流」。
+ */
 function shownItems() {
   const list = hideRecorder() ? allItems.filter((it) => !isRecorderItem(it)) : allItems.slice();
   if (hideRecorder()) {
@@ -90,6 +129,7 @@ function shownItems() {
 }
 const BILI_DASH_KEY = "__bili_dash__";
 
+/** 造元素的小工具，省掉三行 createElement/setAttribute */
 function el(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -99,6 +139,16 @@ function el(tag, cls, text) {
 
 // ---------------------------------------------------------------- 数据
 
+/**
+ * 读当前标签页的条目并渲染。
+ *
+ * tabId 必须由 popup 自己查（chrome.tabs.query）再带给 background：
+ * background 的 state 是 Map<tabId, record>，没有「当前标签页」的概念。
+ *
+ * 两处 tabUrl 可能不一致：popup 拿到的是 query 的 tab.url，background 记的是
+ * 最后一次 main_frame 请求的地址。SPA（小红书从信息流点进帖子）不会触发
+ * main_frame，所以 background 会把它的 tabUrl 一并发回来纠正 popup。
+ */
 async function load() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) return;
@@ -124,6 +174,15 @@ async function load() {
 
 // ---------------------------------------------------------------- 渲染
 
+/**
+ * 顶部分类 chip。
+ *
+ * 两处刻意的处理：
+ *   · 视频/音频两个 chip 数量为 0 也照显示 —— 它们是主功能，藏起来会让人以为
+ *     扩展只会抓图片；其它分类（doc/font/other/seg）为 0 才跳过。
+ *   · B 站上 counts 是 background 用全量算的，含被隐掉的录制条目，直接显示会
+ *     「chip 写 2、点进去空」，所以这里按 shownItems 重算。
+ */
 function renderChips() {
   const nav = $("#chips");
   nav.replaceChildren();
@@ -152,6 +211,14 @@ function renderChips() {
   }
 }
 
+/**
+ * 按当前 filter 过滤 + 排序。
+ *
+ * 排序三级：
+ *   1. kind 优先级（视频→音频→文档→图片→字体→其他→分片），视频排最前
+ *   2. 同一 mid 且都编了号的，按 idx 升序 —— 否则按大小排会把 ①②③ 打乱
+ *   3. 大小降序，再按抓到时间降序兜底
+ */
 function visibleItems() {
   let list = shownItems();
   if (filter === "all") list = list.filter((it) => it.k !== "seg");
@@ -170,6 +237,10 @@ function visibleItems() {
   });
 }
 
+/**
+ * 渲染列表。空列表时给三种不同的提示 —— 「什么都没有」这句废话解决不了问题，
+ * 用户需要知道「为什么空」以及「下一步该做什么」。
+ */
 function renderList() {
   const box = $("#list");
   const items = visibleItems();
@@ -198,6 +269,15 @@ function renderList() {
   }
 }
 
+/**
+ * 渲染一行。
+ *
+ * 两条完全不同的分支，取决于 it.page：
+ *   · 页面捕获的（page=1）→ 只能「保存」，数据由页面自己取。这里**不要**加
+ *     yt-dlp 入口：Telegram 的 /progressive/document… 是相对地址，yt-dlp 会
+ *     把它当网页爬然后报 302。
+ *   · webRequest 抓到的直链 → 复制 / 打开 / 预览 / 下载（走本地下载器）。
+ */
 function renderItem(it) {
   const row = el("div", "item");
   const isPage = !!it.page;
@@ -286,6 +366,7 @@ function renderItem(it) {
   return row;
 }
 
+/** 秒 → 「1:23」或「1:02:03」。0/空返回空串 */
 function fmtDur(sec) {
   sec = Math.round(Number(sec) || 0);
   if (!sec) return "";
@@ -295,6 +376,10 @@ function fmtDur(sec) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/**
+ * 页面捕获条目没有标题时的兜底名。
+ * 有 w/h 就用尺寸 + 时长当名字（`video_1920x1080_30s`），比空着强。
+ */
 function pageTitle(it) {
   if (it.title) return it.title;
   const m = (it.m || "").toLowerCase();
@@ -342,12 +427,30 @@ function shortTitle(t) {
   return body + ext;
 }
 
+/**
+ * 交给页面浮层的文件名（不是列表显示名）。
+ *
+ * blob:/MSE 条目——页面没有服务器给的文件名，只能用尺寸+时长拼；
+ * 其余——用 title 收一下。B 站合成条目在 pageSaveItem 里单独处理，
+ * 它必须传**未截断**的原始标题。
+ *
+ * 返回空串时由页面侧 fileNameTitle/safeFileName 兜底。
+ */
 function pageSaveName(it) {
   if (it.title) return shortTitle(it.title);
   if (it.w && it.h) return `video_${it.w}x${it.h}` + (it.dur ? `_${Math.round(it.dur)}s` : "");
   return "";
 }
 
+/**
+ * 「保存」按钮：把这一条丢给页面，让页面弹浮层。
+ *
+ * 为什么不让 popup 自己下：Telegram 的媒体只认页面上下文的带 Range 请求，
+ * 外部进程（yt-dlp / 本地宿主）拿不到 Cookie，也拼不出相对路径。
+ *
+ * 按钮文案走「…」→「去页面点」→ 2.5 秒后复位，因为真正的下载在页面里，
+ * popup 这边结束得很快，不复位会让人以为按钮坏了。
+ */
 async function savePageItem(it, btn) {
   btn.disabled = true;
   btn.textContent = "…";
@@ -441,6 +544,12 @@ async function saveAllPageItems(btn) {
 
 // ---------------------------------------------------------------- 下载
 
+/**
+ * 「下载」按钮：交给本地下载器（native host → downloader.py）。
+ *
+ * referer 用 it.i（抓取时的发起页）而不是当前 tabUrl：图片/CDN 常校验来源，
+ * 用当前页地址会 403。it.i 空时退回 tabUrl。
+ */
 async function startDownload(it, btn) {
   btn.disabled = true;
   btn.textContent = "…";
@@ -463,8 +572,11 @@ async function startDownload(it, btn) {
   setTimeout(() => { btn.disabled = false; btn.textContent = "下载"; }, 2500);
 }
 
+// 进度条容器：jobId → DOM 引用。native host 那边是独立进程，进度靠
+// 它写状态文件 + background 轮询 + native:progress 消息送回来。
 const jobEls = new Map();
 
+/** 提交成功后立刻插一条「准备中…」的进度条，等 background 推真实进度来更新 */
 function addJob(id, name) {
   const wrap = el("div", "job");
   const label = el("div", null, "准备中… " + (name || ""));
@@ -477,6 +589,12 @@ function addJob(id, name) {
   jobEls.set(id, { wrap, label, fill, name });
 }
 
+/**
+ * 按 background 推来的 native:progress 更新进度条。
+ *
+ * 消息有两种形状（历史原因）：带 action 的（pong/done/error）和带 status 的
+ * （downloading/done/error），两种都认，避免漏更新。
+ */
 function updateJob(msg) {
   const job = jobEls.get(msg.id);
   if (!job) return;
@@ -499,7 +617,14 @@ function updateJob(msg) {
 
 // ---------------------------------------------------------------- 预览
 
+/**
+ * 预览模态框。用 <img>/<video>/<audio> 直接指向 it.u —— 浏览器会带上当前
+ * 会话的 Cookie，所以对多数站点能直接播；个别站点校验 Referer 会加载失败，
+ * error 事件里给一句说明，而不是干瞪眼。
+ */
 function showPreview(it) {
+  // 复用 <video> 元素展示图片时它会报成视频（见 background 的 ctxBlobImg 注释），
+  // 这里按 k 严格建对应标签，不要偷懒
   const body = $("#previewBody");
   body.replaceChildren();
   let node;
@@ -524,6 +649,11 @@ function showPreview(it) {
   $("#preview").classList.remove("hidden");
 }
 
+/**
+ * 关预览。必须先 pause + removeAttribute("src") + load()：
+ * 直接 replaceChildren 会把视频从 DOM 摘掉但**继续在后台解码播放**，
+ * 关掉弹窗后声音还在响（踩过）。
+ */
 function closePreview() {
   const body = $("#previewBody");
   const v = body.querySelector("video, audio");
@@ -538,6 +668,12 @@ function closePreview() {
 
 // ---------------------------------------------------------------- 本地下载器状态
 
+/**
+ * 本地下载器状态灯。
+ *
+ * ok 传 null 表示「检测中」——此时 setHost 不会把它置成 false，等 2 秒
+ * 还没有 pong 才由 pingHost 判为无响应（见下面的 setTimeout）。
+ */
 function setHost(ok, text) {
   hostOk = ok;
   const pill = $("#hostState");
@@ -546,6 +682,12 @@ function setHost(ok, text) {
   pill.title = ok ? "" : "请先运行 media-sniffer/native-host/install.bat 安装本地组件";
 }
 
+/**
+ * 检测本地宿主是否在线。发 native:ping，宿主回 pong（带 yt-dlp/ffmpeg 路径）。
+ *
+ * 这里不 await 等结果：宿主首次拉起要几百毫秒，等了会让弹窗白屏一下。
+ * 改成「先显示检测中，2 秒内收到 pong 就由 onMessage 更新，否则判无响应」。
+ */
 async function pingHost() {
   setHost(null, "检测本地下载器…");
   const res = await chrome.runtime.sendMessage({ type: "native:ping" });
@@ -560,6 +702,8 @@ async function pingHost() {
 
 // ---------------------------------------------------------------- 事件
 
+// ⟳ 重新载入：改完代码、或首次打开扩展时需要重载页面，注入脚本才会重新跑。
+// 延迟 900ms 再 load()，给页面留出开始发请求的时间。
 $("#reload").addEventListener("click", async () => {
   if (tabId != null) {
     await chrome.tabs.reload(tabId);
@@ -616,6 +760,12 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closePreview();
 });
 
+/**
+ * background 推来的消息总入口。四种：
+ *   native:progress      下载进度 / pong（宿主在线宣告）
+ *   native:disconnected  宿主断了（Chrome 关掉宿主进程时会发）
+ *   ms:saved             页面保存完成（页面主世界 → background → 这里）
+ */
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg) return;
   if (msg.type === "native:progress") {

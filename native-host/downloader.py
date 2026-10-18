@@ -7,9 +7,16 @@
   Chrome 的 service worker / 扩展弹窗随时可能被回收，如果下载跑在 native host
   里，一关弹窗就断了。这里让下载彻底独立，宿主死了也照下不误。
 
+三条下载路径（main() 里按 URL 特征分发）：
+  · run_merge     音视频分离的两条流 → ffmpeg -c copy 合单文件（B 站）
+  · run_ytdlp     m3u8 / mpd / 站点页 → yt-dlp（HLS 分片支持最好）
+  · run_urllib    已知直链 → 自己发 Range 请求（最简单可控，支持续传）
+
+状态写 %LOCALAPPDATA%\\MediaSniffer\\jobs\\<id>.json，宿主轮询它回传进度。
+取消靠同目录下的 <id>.cancel 文件，worker 每轮 stat 一次。
+
 用法（内部）：
     python downloader.py <job.json>
-状态写入 %LOCALAPPDATA%\\MediaSniffer\\jobs\\<id>.json
 """
 import json
 import os
@@ -38,14 +45,25 @@ RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
 
 
 def status_path(job_id):
+    """状态文件路径。<id>.json；对照的取消标记是同目录的 <id>.cancel"""
     return os.path.join(JOBS_DIR, job_id + ".json")
 
 
 def cancel_path(job_id):
+    """取消标记路径。宿主写、worker 只读，存在即取消。"""
     return os.path.join(JOBS_DIR, job_id + ".cancel")
 
 
 def write_status(job_id, **fields):
+    """**合并式**写状态：读出旧内容、update 新字段、原子替换。
+
+    三个刻意的设计：
+      · 合并而不是覆盖 —— 调用方每次只传几个字段（percent/speed/eta），
+        覆盖会把 status/file 这些冲掉
+      · 写 .tmp 再 os.replace —— 宿主是另一个进程，正在轮询读这个文件，
+        直接 open("w") 有窗口期读到空/半个 JSON，宿主会当成「没状态」
+      · "updated" 每次刷新 —— 宿主据此判断任务是否还活着
+    """
     os.makedirs(JOBS_DIR, exist_ok=True)
     path = status_path(job_id)
     data = {}
@@ -62,7 +80,21 @@ def write_status(job_id, **fields):
     os.replace(tmp, path)
 
 
+def read_status(job_id):
+    """读状态文件，读不到/坏 JSON 一律返回空 dict（调用方用 .get 就不会炸）"""
+    try:
+        return json.load(open(status_path(job_id), encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def sanitize(name, fallback="video"):
+    """洗成合法的 Windows 文件名。
+
+    处理四件事：非法字符换 _、去掉首尾的点和空格（Windows 上以点/空格结尾
+    的文件名建不出来）、保留设备名（con/prn/aux/nul/com1-9/lpt1-9 会失败）
+    换掉、超长按「主干 100 减扩展名长度」截断以保住扩展名。
+    """
     name = (name or "").strip()
     name = ILLEGAL.sub("_", name).strip(" .")
     if not name or RESERVED.match(name):
@@ -79,6 +111,11 @@ PROJECT_BIN = os.path.join(
 
 
 def find_tool(names):
+    """三级查找：项目 bin/ → 系统 PATH → 常见包管理器目录。
+
+    与 sniffer_host.find_tool 逻辑一致（宿主和 worker 是不同进程，
+    不能共用模块级函数，只能各留一份）。
+    """
     # 优先用项目自带的 bin/（随插件一起分发，不依赖系统 PATH 和 C 盘）
     for n in names:
         for cand in (n, n + ".exe"):
@@ -103,12 +140,16 @@ def find_tool(names):
 
 
 def is_cancelled(job_id):
+    """取消靠「标记文件存在」传递：跨进程、不用 socket、worker 还没起来时
+    写的标记也会在它起来后立刻被看到。"""
     return os.path.exists(cancel_path(job_id))
 
 
 # ---------------------------------------------------------------- yt-dlp 路径
 
 PROGRESS_TPL = (
+    # --progress-template 的机器可读格式：用 | 分隔，行首 MSPROG| 做识别。
+    # 不要改成人类可读的那个模板，解析会随 yt-dlp 版本漂。
     "download:MSPROG|%(progress._percent_str)s|%(progress._speed_str)s|"
     "%(progress._eta_str)s|%(progress.downloaded_bytes)s|"
     "%(progress.total_bytes_estimate)s"
@@ -116,6 +157,16 @@ PROGRESS_TPL = (
 
 
 def run_ytdlp(job, ytdlp, ffmpeg):
+    """跑 yt-dlp。适合 m3u8 / mpd / 「一个网页里藏着视频」这几类，
+    HLS 分片它比我们自己拼强得多（并发、重试、音视频合并都能处理）。
+
+    输出模板 `<base>.%(ext)s` 而不是写死 .mp4：yt-dlp 自己决定最终容器，
+    写死会出现「已经 .mp4 又拼一个 .mp4」。真正的落盘名靠 --print
+    after_move:FILE: 那一行回读，比猜扩展名可靠。
+
+    cookie 走 --add-header 而不是 --cookies 文件：我们没有 Netscape 格式的
+    cookie 文件，只能把整条 Cookie 头递过去。
+    """
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
     os.makedirs(outdir, exist_ok=True)
@@ -208,6 +259,8 @@ def run_ytdlp(job, ytdlp, ffmpeg):
 
 
 def _origin(tab_url):
+    """从标签页地址取 scheme://host，给 Origin 头用。
+    部分 CDN（B 站、各视频站）会校验它，缺了直接 403。"""
     try:
         from urllib.parse import urlparse
         p = urlparse(tab_url)
@@ -219,6 +272,15 @@ def _origin(tab_url):
 # ---------------------------------------------------------------- 普通文件路径
 
 def run_urllib(job):
+    """自己发 HTTP 下直链。相比 yt-dlp 的好处：完全可控、支持断点续传、
+    没有「把 URL 当网页爬」的误判。
+
+    续传协议：数据先写 <名字>.part，写完了才 os.replace 到正式名。
+      · 重跑时看到 .part 就带 `Range: bytes=<已有长度>-` 继续
+      · 服务器回 206 才追加；回 200 说明对方不支持 Range（可能整个重发），
+        必须 wb 重写，否则拼接出来是坏的
+      · 正式文件永远只有「完整」这一种状态，用户不会看到半截图
+    """
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
     os.makedirs(outdir, exist_ok=True)
@@ -297,6 +359,7 @@ def run_urllib(job):
 
 
 def fmt_speed(bps):
+    """字节/秒 → 「1.5 MB/s」。B/s 不显示小数（「1 B/s」比「1.00 B/s」自然）"""
     for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
         if bps < 1024:
             return f"{bps:.2f} {unit}" if unit != "B/s" else f"{int(bps)} {unit}"
@@ -307,7 +370,11 @@ def fmt_speed(bps):
 # ---------------------------------------------------------------- 音视频合并（B 站等双流站点）
 
 def probe_duration(ffprobe, path):
-    """用 ffprobe 问时长（秒）。问不出来返回 0，进度条就退化为不定态。"""
+    """用 ffprobe 问时长（秒）。问不出来返回 0，进度条就退化为不定态。
+
+    必须在合并**之前**问：合并过程中源流文件还完整，合并完就被删了，
+    那时候再想问也问不到。时长只用来把 out_time 换算成百分比。
+    """
     try:
         out = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
@@ -325,6 +392,11 @@ def run_merge(job):
 
     成功后删掉两条源流（单文件是这次合并的全部意义）；失败则保留源流，
     错误信息里说明两个文件还在。进度从 ffmpeg 的 -progress 机器输出里解析。
+
+    两个容易踩的地方：
+      · stderr 必须开线程排空（见下面 drain_err 的注释），否则死锁
+      · out_time_us 在旧版 ffmpeg 里叫 out_time_ms，且**值同样是微秒**
+        （这是 ffmpeg 的历史 bug，字段名写 ms 实际是 us），所以两处都 /1e6
     """
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
@@ -455,6 +527,8 @@ MEDIA_EXT = re.compile(
 
 
 def _short(s, n=400):
+    """错误信息截断。ffmpeg/yt-dlp 的报错经常几百行，全塞进状态文件
+    会让 popup 的高度撑爆。"""
     return (s or "")[:n]
 
 

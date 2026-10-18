@@ -7,6 +7,19 @@ Media Sniffer 本地组件安装器
     python setup.py install      安装（写 manifest + 注册表）
     python setup.py uninstall    卸载（清注册表）
     python setup.py status       查看当前状态
+    python setup.py bin          说明 ffmpeg 怎么弄、自检宿主能不能起来
+
+安装到底在做什么（三步，缺一不可）：
+  1. 写 python_path.txt —— 记下当前这个 Python 解释器，run_host.bat 要用
+  2. 写 host_manifest.json —— 浏览器据此知道去哪启动宿主、允许哪个扩展调用
+  3. 写注册表 HKCU\\Software\\<浏览器>\\NativeMessagingHosts\\<host_name>
+     —— 让浏览器能「找到」上面那个 manifest
+
+只写 HKEY_CURRENT_USER，不需要管理员权限；Chrome/Edge/Chromium 各注册一份，
+同一份脚本通吃三个浏览器。
+
+注意：manifest 里记的是**本机绝对路径**，所以它不进仓库（见 .gitignore），
+每台机器装一次生成一次。
 """
 import json
 import os
@@ -27,6 +40,9 @@ REG_ROOTS = [
 
 
 def out(msg=""):
+    """打印。Windows 控制台默认是 GBK/cp1252，中文会炸 UnicodeEncodeError，
+    这里强制 UTF-8 + errors=replace（replace 是兜底：某些管道不支持重设，
+    宁可显示成 ? 也不能因为打印一个中文就把安装流程打断）。"""
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -57,6 +73,16 @@ def extension_id():
 
 
 def write_manifest():
+    """生成 host_manifest.json。
+
+    三个字段是浏览器的硬要求，写错一个宿主就起不来：
+      · path：**必须是可执行文件**。这里是 run_host.bat 而不是
+        "python sniffer_host.py"——Chrome 不接受带参数的命令行
+      · type：stdio（本项目用的协议）
+      · allowed_origins：只放行这一个扩展 ID，别的扩展调不动宿主
+
+    注意 path 是绝对路径，所以这个文件不能进仓库（每台机器不同）。
+    """
     manifest = {
         "name": HOST_NAME,
         "description": "Media Sniffer native host (yt-dlp bridge)",
@@ -70,12 +96,25 @@ def write_manifest():
 
 
 def write_python_path():
+    """记下当前解释器的绝对路径，run_host.bat 启动宿主时优先用它。
+
+    为什么要记：Chrome 启动宿主时的 PATH 跟用户终端里的不一样，经常
+    找不到 python（或找到另一个没有依赖的 python）。写死路径最省事。
+    跨机器/换 Python 版本后重跑一次 install 即可。
+    """
     with open(os.path.join(HERE, "python_path.txt"), "w", encoding="utf-8") as f:
         f.write(sys.executable)
     return sys.executable
 
 
 def reg_add(root, value):
+    """在 HKCU 下建键并把默认值设为 manifest 路径。
+
+    用 HKEY_CURRENT_USER 而不是 LOCAL_MACHINE：不需要管理员权限，
+    这也是 Chrome 文档推荐的用户级位置（HKLM 那份是给全机器安装用的）。
+    建键用 CreateKeyEx 而不是 CreateKey：后者在已存在时会带写权限打开，
+    行为更隐晦，前者语义明确。
+    """
     try:
         import winreg
     except ImportError:
@@ -92,6 +131,8 @@ def reg_add(root, value):
 
 
 def reg_del(root):
+    """删掉注册表键（默认值随之消失）。键不存在返回 False，不报错 ——
+    卸载一个本来就没装的东西不该是「失败」。"""
     try:
         import winreg
     except ImportError:
@@ -109,6 +150,7 @@ def reg_del(root):
 
 
 def reg_get(root):
+    """读注册表默认值（manifest 路径）。没注册返回 None。"""
     try:
         import winreg
     except ImportError:
@@ -152,6 +194,8 @@ def find_tool(names):
 
 
 def cmd_install():
+    """完整安装流程。顺序不能换：先写 python_path（run_host.bat 依赖它），
+    再写 manifest，最后写注册表（注册表指向 manifest，manifest 必须先存在）。"""
     out("=" * 64)
     out(" Media Sniffer 本地组件安装")
     out("=" * 64)
@@ -193,6 +237,12 @@ def cmd_install():
 
 
 def cmd_uninstall():
+    """只清注册表，不动文件、不动扩展。
+
+    刻意不删 host_manifest.json / python_path.txt：用户可能只是想让浏览器
+    别再调它，过两天又装回来；而且删了 Python 也删不掉别的 Python，
+    留着无害。
+    """
     out("卸载 Media Sniffer 本地组件 …")
     for root, label in REG_ROOTS:
         if reg_del(root):
@@ -203,6 +253,12 @@ def cmd_uninstall():
 
 
 def cmd_status():
+    """体检。除了列出各浏览器的注册值，还要**判断注册表指向的是不是本目录**。
+
+    这是排查「改了代码不生效」的关键一步：仓库可能有多份拷贝（下载解压了
+    两次、或 Git 工作区 + 旧目录），注册表指向的是哪份，浏览器就调哪份。
+    只显示路径不判断会让人盯着新代码死活想不通。
+    """
     out("扩展 ID     : %s" % extension_id())
     out("Launcher    : %s (%s)" % (LAUNCHER, "存在" if os.path.exists(LAUNCHER) else "缺失"))
     out("Manifest    : %s (%s)" % (MANIFEST, "存在" if os.path.exists(MANIFEST) else "缺失"))
