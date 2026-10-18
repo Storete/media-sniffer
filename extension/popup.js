@@ -772,17 +772,9 @@ $("#openOut").addEventListener("click", async () => {
   setTimeout(() => ($("#hint").textContent = ""), 4000);
 });
 
-$("#openLog").addEventListener("click", async () => {
-  const res = await chrome.runtime.sendMessage({ type: "native:open-log" });
-  if (res && res.ok) {
-    $("#hint").textContent = "已打开日志";
-  } else {
-    $("#hint").textContent = "打不开日志：" + ((res && res.error) || "本地宿主无响应");
-  }
-  setTimeout(() => ($("#hint").textContent = ""), 4000);
-});
+// （日志按钮已按用户要求移除；host.log 仍照常写盘，排查时直接开文件即可）
 
-// 「打开所在文件夹」：优先定位到最近下载完成的文件（若有），否则退回打开下载目录。
+// 「所在文件夹」：定位到最近下载完成的文件（若有），否则退回打开下载目录。
 $("#openFile").addEventListener("click", async () => {
   const res = await chrome.runtime.sendMessage({ type: "native:reveal-file" });
   if (res && res.ok) {
@@ -795,6 +787,64 @@ $("#openFile").addEventListener("click", async () => {
     $("#hint").textContent = "打不开：" + ((res && res.error) || "本地宿主无响应");
   }
   setTimeout(() => ($("#hint").textContent = ""), 4000);
+});
+
+// ---- 本次下载记录（storage.session，浏览器关闭自动清空）----
+
+/** 渲染「本次记录」面板；hideNow=true 时只收起不重取 */
+function renderHistory(items, hideNow) {
+  const box = $("#history");
+  if (hideNow || !items || !items.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = "";
+  const h = document.createElement("h4");
+  h.append("本次下载记录");
+  const clr = document.createElement("button");
+  clr.textContent = "清空";
+  clr.addEventListener("click", async () => {
+    await chrome.storage.session.set({ history: [] });
+    renderHistory([], false);
+  });
+  h.append(clr);
+  box.append(h);
+  for (const it of items.slice().reverse()) {  // 新的在上
+    const row = document.createElement("div");
+    row.className = "h-item " + (it.ok ? "ok" : "err");
+    const t = document.createElement("span");
+    t.className = "t";
+    const d = new Date(it.time || Date.now());
+    t.textContent = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    const n = document.createElement("span");
+    n.className = "n";
+    n.textContent = (it.ok ? "" : "✗ ") + (it.name || "");
+    n.title = it.ok ? (it.name || "") : (it.error || it.name || "下载失败");
+    row.append(t, n);
+    if (it.size) {
+      const s = document.createElement("span");
+      s.className = "s";
+      s.textContent = fmtSize(it.size);
+      row.append(s);
+    }
+    box.append(row);
+  }
+  box.classList.remove("hidden");
+}
+
+/** 「本次记录」按钮：切显隐；每次展开都现取 session storage（保证是最新） */
+let historyShown = false;
+$("#historyBtn").addEventListener("click", async () => {
+  historyShown = !historyShown;
+  if (!historyShown) { renderHistory(null, true); return; }
+  const { history } = await chrome.storage.session.get({ history: [] });
+  renderHistory(history, false);
+  if (!(history || []).length) {
+    $("#hint").textContent = "本次会话还没有下载记录";
+    setTimeout(() => ($("#hint").textContent = ""), 3000);
+    historyShown = false;   // 没内容就当没展开，下次再点还能重新取
+  }
 });
 
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;

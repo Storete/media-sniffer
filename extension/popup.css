@@ -212,6 +212,59 @@ footer {
 
 .hint { font-size: 11px; color: var(--text-dim); margin-left: auto; }
 
+/* 底部文字按钮（「打开文件夹」「本次记录」）：比图标按钮醒目，用户反馈图标看不懂 */
+.btn-txt {
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-txt:hover { background: var(--brand-soft); color: var(--brand); border-color: #c7d7fe; }
+
+/* 本次下载记录（浏览器会话内，关浏览器即清） */
+.history {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  max-height: 140px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.history.hidden { display: none; }
+.history h4 {
+  margin: 0 0 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.history h4 button {
+  border: none; background: none; cursor: pointer;
+  font-size: 10.5px; color: var(--brand);
+}
+.history .h-item {
+  font-size: 11px;
+  color: var(--text);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  word-break: break-all;
+}
+.history .h-item .t { color: var(--text-dim); flex: none; }
+.history .h-item.ok .n { color: var(--text); }
+.history .h-item.err .n { color: var(--err); }
+.history .h-item .s { color: var(--text-dim); flex: none; }
+
 .jobs { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 84px; overflow-y: auto; }.job { font-size: 11px; color: var(--text-dim); }
 .job .bar {
   height: 3px;

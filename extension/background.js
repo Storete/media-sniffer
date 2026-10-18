@@ -255,7 +255,7 @@ function markDoneBadge(tabId, text, color) {
   // 不设自动消失：常驻到用户点开插件或关闭浏览器
 }
 
-function notifySaved(p) {
+async function notifySaved(p) {
   const ok = p.ok !== false;
   const name = (p.filename || p.key || "").split(/[\\/]/).pop() || "媒体";
   const sizeText = p.size ? `（${(p.size / 1048576).toFixed(1)}MB）` : "";
@@ -263,7 +263,7 @@ function notifySaved(p) {
   try {
     markDoneBadge(p.__tabId, ok ? "✓" : "✗", ok ? "#16a34a" : "#dc2626");
   } catch (e) { /* 忽略 */ }
-  // 2. 记下最近一次完成/失败的结果，供 popup 的「打开所在文件夹」和标题展示用
+  // 2. 记下最近一次完成/失败的结果，供 popup 的「打开所在文件夹」用
   try {
     chrome.storage.local.set({
       lastResult: {
@@ -275,6 +275,15 @@ function notifySaved(p) {
         time: Date.now(),
       },
     });
+  } catch (e) { /* 忽略 */ }
+  // 3. 追加进本次会话的下载记录（chrome.storage.session：浏览器一关就自动清空）。
+  //    供 popup 的「本次记录」面板展示；最多留 100 条，满了丢最旧的。
+  try {
+    const { history } = await chrome.storage.session.get({ history: [] });
+    const list = Array.isArray(history) ? history : [];
+    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80) });
+    while (list.length > 100) list.shift();
+    await chrome.storage.session.set({ history: list });
   } catch (e) { /* 忽略 */ }
 }
 
