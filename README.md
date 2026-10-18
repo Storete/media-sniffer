@@ -28,9 +28,46 @@
 - Chrome / Edge / Chromium（Manifest V3）
 - **Python 3.8+**（本地组件用，只依赖标准库，不需要 `pip install` 任何东西）
 - **yt-dlp**（可选，没有它会退化到单线程通用下载）
-- **ffmpeg**（可选，但 DASH 站点——B 站、大部分视频站——必须靠它合并音视频）
+- **ffmpeg**（可选，但 B 站这类音视频分开的站点必须靠它合并成一个文件）
 
-yt-dlp 和 ffmpeg 装到系统 `PATH` 就行；也可以直接把 `ffmpeg.exe` / `ffprobe.exe` 丢进项目根目录的 `bin/`（`setup.py status` 会告诉你它找到的是哪个）。
+#### ffmpeg 怎么装（三选一）
+
+**方式 A：一条命令（推荐，有 winget 就行）**
+
+```bat
+winget install Gyan.FFmpeg
+```
+
+装完**新开一个终端**，跑 `ffmpeg -version` 有输出就成了。
+
+**方式 B：下载解压到 `bin/`**（没有 winget 时用这个）
+
+1. 浏览器打开：https://github.com/BtbN/FFmpeg-Builds/releases/latest
+2. 下载 `ffmpeg-master-latest-win64-gpl.zip`（**不要**选带 `-shared` 的，那个还要拖一堆 dll）
+3. 解压，进到 `...\bin\` 目录，把里面的 **`ffmpeg.exe`** 和 **`ffprobe.exe`** 复制到本项目的 `bin\` 目录
+
+项目里放 ffmpeg 的地方就是 `bin\`，放好之后是这样：
+
+```
+media-sniffer\
+└── bin\
+    ├── ffmpeg.exe
+    └── ffprobe.exe
+```
+
+**方式 C：电脑上已经有 ffmpeg 了**
+
+很多软件自带（OBS、剪映、格式工厂、各种下载器）。如果它已经在系统 `PATH` 里，直接就能用。不确定的话跑：
+
+```bat
+python native-host\setup.py status
+```
+
+输出里 `ffmpeg :` 后面有路径就说明找到了，不需要再装。
+
+> **为什么仓库里不带 ffmpeg？** 两个 exe 加起来 323 MB，超过 GitHub 单文件 100 MB 的上限，而且会把仓库撑爆、每个 clone 的人都要多下三百多兆。ffmpeg 是第三方软件，本来也应该由用户自己装。
+
+> **B 站合并需要的是 ffmpeg，不是 ffprobe**——但建议两个都放，`setup.py status` 会一起检查。
 
 ### 1. 装本地组件
 
