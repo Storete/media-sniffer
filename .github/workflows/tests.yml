@@ -1,0 +1,67 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  js:
+    name: JS 单元测试
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 三个套件都是纯 Node 脚本（vm 沙箱 + 假宿主），不需要 npm install
+      - name: main-hook（120 项）
+        run: node test/main-hook.test.js
+
+      - name: background（88 项）
+        run: node test/background.test.js
+
+      - name: range_parallel（14 项）
+        run: node test/range_parallel.test.js
+
+      - name: 语法检查
+        run: |
+          for f in extension/*.js; do
+            node --check "$f" || exit 1
+          done
+
+  python:
+    name: 宿主侧测试（${{ matrix.os }} / py${{ matrix.python }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: windows-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 只依赖标准库，不需要 pip install
+      - name: 语法检查
+        run: python -m compileall -q native-host test
+
+      # -r 让 -m unittest 能发现 test/ 下的子目录模块
+      # 只跑不依赖本机条件的套件；见下方「跳过」说明
+      - name: 运行测试
+        run: python test/run_all.py

@@ -1,5 +1,7 @@
 # 资源嗅探 Media Sniffer
 
+[![tests](https://github.com/Storete/media-sniffer/actions/workflows/tests.yml/badge.svg)](https://github.com/Storete/media-sniffer/actions/workflows/tests.yml)
+
 一个自己写的 Chrome 扩展：**自动嗅探当前网页的所有资源**，视频/音频交给本地 yt-dlp 多线程下载，图片/文档等直接抓取。没有限额、没有限速、不采集数据。
 
 ![B 站视频嗅探](docs/screenshot-bili.png)
@@ -267,10 +269,16 @@ node test/background.test.js       # 88 项
 node test/range_parallel.test.js   # 14 项
 
 # Python（不需要 pytest，也不装任何依赖）
+python test/run_all.py             # 一串跑完并汇总（没装 ffmpeg 的套件自动 SKIP）
+
+# 或单个跑
 cd test && for f in *_test.py; do python "$f"; done
 ```
 
-`big_file_test.py` 是慢速大文件测试，跑到 120 秒超时是预期的。
+`big_file_test.py` 是慢速大文件测试（默认不纳入 `run_all.py`），跑到 120 秒超时是预期的。
+
+推送到 GitHub 时 `tests.yml` 会自动跑上面这些：JS 三套在 Node 18/20/22 上各跑一遍，
+Python 在 Ubuntu + Windows 上跑（`host_merge_test.py` 等需要真 ffmpeg 的套件在没装 ffmpeg 的环境里自动跳过）。
 
 ---
 
