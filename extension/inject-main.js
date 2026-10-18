@@ -328,8 +328,42 @@
     return "";
   }
 
+  /** 当前帖子的标题（小红书详情页）
+   *
+   * 用户诉求第 2 条的后半句：「名字对不上」。
+   *
+   * 真机实测：小红书视频帖的 `note.title` **经常是空串**，真正的文字内容在
+   * `note.desc`（例如本测试帖 title="" / desc="哇塞！"）。
+   * 而 `guessTitle` 靠向上找 DOM 容器，视频元素 `class=""`、祖先全是
+   * `player-el xgplayer` 这类播放器控件，抓到的净是进度/按钮文字，
+   * 于是条目要么没名字，要么名字是垃圾。
+   *
+   * 这里直接从 `__INITIAL_STATE__` 取，优先级：title → desc → 首行文字。
+   * 和 `xhsVideoSource()` 用同一份数据源，不额外发请求。 */
+  function xhsNoteTitle() {
+    try {
+      const id = xhsCurrentNoteId();
+      if (!id) return "";
+      const st = window.__INITIAL_STATE__;
+      const map = st && st.note && st.note.noteDetailMap;
+      if (!map) return "";
+      const entry = map[id];
+      const note = entry && entry.note;
+      if (!note) return "";
+      const cand = note.title || note.desc || "";
+      const s = String(cand).replace(/\s+/g, " ").trim();
+      if (!s) return "";
+      return sanitize(s.slice(0, 90));
+    } catch (e) { return ""; }
+  }
+
   function guessTitle(el) {
     try {
+      // 小红书详情页：标题在 __INITIAL_STATE__ 里，DOM 上找不到（见 xhsNoteTitle 注释）
+      if (isXhsHost() && xhsCurrentNoteId()) {
+        const t = xhsNoteTitle();
+        if (t) return t;
+      }
       const t = el.getAttribute("title") || el.getAttribute("aria-label") || el.title;
       if (t && t.trim() && !isJunkTitle(t)) return sanitize(t);
       // 优先用气泡正文：它是这段媒体真正的「标题」，比往上抓整层 innerText 干净
@@ -382,9 +416,27 @@
       if (rw && rh && rw <= 96 && rh <= 96) return;
 
       // 标题：拿到一次就不再扫（guessTitle 要遍历 DOM，轮询时反复调太贵）
-      if (!titles.get(url)) {
-        const title = guessTitle(el);
+      //
+      // ⚠️ 2026-10-18 第十轮：原来这里只在 `!titles.get(url)` 时发一条 progress，
+      // 而下面的 found 消息**不带 title**。背景里的 recordPageMedia 靠
+      // `if (p.title) existed.title = p.title` 维护标题，但 `p.title` 为 undefined
+      // 时这条分支根本不执行 —— 小红书「名字对不上」的直接原因。
+      // 现在把 title 直接塞进 found，同时保留 progress 那条路。
+      let title = titles.get(url) || "";
+      // lateTitle：本轮拿到的标题**赶不上首条 found**，需要补发一条带 title 的。
+      //
+      // 判断链条（踩过两次才发现）：
+      //   · 首轮就有标题（Telegram 等）→ 标题直接进首条 found，不补发
+      //   · 首轮没标题、found 已发 → 次轮才拿到标题 → 必须补发
+      // 所以判据是「这一轮是不是首轮」（!seenSrc.has(url)）：
+      //   seenSrc 在首轮 found 后立刻加入，次轮进来时它已存在。
+      // 不能用 titles 判断（首次 titles 必空，两次都成立）。
+      const isFirstRound = !seenSrc.has(url);
+      let lateTitle = false;
+      if (!title) {
+        title = guessTitle(el);
         if (title) {
+          lateTitle = !isFirstRound; // 不是首轮才需要补发
           titles.set(url, title);
           post({ cmd: "progress", key: url, title });
         }
@@ -409,6 +461,26 @@
       const ord = ordOfMedia(el);
       if (ord >= 0) post({ cmd: "progress", key: url, ord });
 
+      // 小红书特有：__INITIAL_STATE__ 是异步挂到 window 上的，第一轮轮询时
+      // guessTitle 大概率还取不到标题；而 found 只发一次（seenSrc 挡着），
+      // 于是「第一条 found 不带 title」会一直留到用户点开 popup。
+      // 这里在标题「从无到有」的瞬间补发一条 found，让 background 补上 title。
+      //
+      // 只在**首轮没取到标题**（lateTitle）时才补发。标题一开始就有的情况
+      // （Telegram 等）补发会造成重复 found 消息，测试 `[2b]` 正是按
+      // 「一条 found」断言的。
+      if (title && lateTitle) {
+        if (!seenSrc.titlePatched) seenSrc.titlePatched = new Set();
+        if (!seenSrc.titlePatched.has(url)) {
+          seenSrc.titlePatched.add(url);
+          post({
+            cmd: "found", source: isBlob ? "mediasrc" : "httpmedia", key: url,
+            size: 0, mime: isAudio ? "audio/mpeg" : "video/mp4", ext: isAudio ? ".mp3" : ".mp4",
+            w, h, dur, title, mid: ctx.mid, ord, ref: ctx.ref,
+          });
+        }
+      }
+
       if (!seenSrc.has(url)) {
         seenSrc.add(url);
         const ct = mediaSeen.get(url);
@@ -421,6 +493,7 @@
           mime,
           ext: isAudio ? ".mp3" : ".mp4",
           w, h, dur,
+          title,
           mid: ctx.mid,
           ord,
           ref: ctx.ref,
@@ -494,23 +567,48 @@
    */
   const XHS_NOTE_IMG = /sns-(webpic|img)(-qc)?\.xhscdn\.com\/[^"'\s]*1040g/i;
 
+  /** 小红书**评论图**的 URL 特征（2026-10-18 第十轮真机实测）
+   *
+   * 实测同一张 CDN 上的图片，正文图和评论图**只差路径里一段 `/comment/`**：
+   *   正文图 `https://sns-webpic-qc.xhscdn.com/202610181505/{hash}/1040g2sg326dsc2...!n`
+   *   评论图 `https://sns-webpic-qc.xhscdn.com/202610181505/{hash}/comment/1040g4b8326f...`
+   * 两者都带 1040g 签名，光看签名分不开——这正是「评论区图片也会抓取」的原因之一。
+   * URL 判据比 class 判据稳（class 会随前端改版变，路径约定很少变），所以优先用。 */
+  const XHS_COMMENT_IMG = /xhscdn\.com\/[^"'\s]+\/comment\/[^"'\s]*1040g/i;
+
   /** 小红书装饰图（头像/logo/二维码）的 class 特征 */
   const XHS_DECOR_CLASS = /author-avatar|logo|qrcode|qr-code|\bicon\b|profile|avatar/i;
 
   /** 这张图是不是小红书正文配图（只认 CDN URL 签名，不认 class） */
   function imgIsXhsNote(src) {
     try {
-      return XHS_NOTE_IMG.test(src || "");
+      return XHS_NOTE_IMG.test(src || "") && !XHS_COMMENT_IMG.test(src || "");
     } catch (e) { return false; }
   }
 
-  /** 这张图是不是小红书的装饰图（头像/logo/二维码）——详情页和首页都该跳过 */
+  /** 这张图是不是论坛/评论区的图（URL 带 /comment/ 段） */
+  function imgIsXhsComment(src) {
+    try { return XHS_COMMENT_IMG.test(src || ""); } catch (e) { return false; }
+  }
+
+  /** 这张图是不是小红书的装饰图（头像/logo/二维码）——详情页和首页都该跳过
+   *
+   * 2026-10-18 第十轮真机补强：侧栏用户头像的 DOM 是
+   *   `<span class="reds-image-container gray responsive reds-avatar size-s">`
+   *     → `<picture class="reds-img-box">` → `<img class="reds-img">`
+   * `reds-img` / `reds-img-box` 本身都不含 "avatar"，原来只拼「自己 + 父亲」两级，
+   * 于是这个头像（360×360，尺寸判据也拦不住）成了漏网的「图片」。
+   * 修法：沿祖先链往上走 6 层，任意一级命中装饰特征就算装饰 ——
+   * 这是小红书自家组件库的命名（reds-*），稳定性比业务 class 好。 */
   function imgIsXhsDecor(el) {
     try {
-      const hint = String(el.className || "") + " " + String(el.id || "") + " " +
-        String(el.getAttribute && el.getAttribute("alt") || "") + " " +
-        String(el.parentElement && el.parentElement.className || "");
-      if (XHS_DECOR_CLASS.test(hint)) return true;
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 6) {
+        const hint = String(n.className || "") + " " + String(n.id || "") + " " +
+          String(n.getAttribute && n.getAttribute("alt") || "");
+        if (XHS_DECOR_CLASS.test(hint)) return true;
+        n = n.parentElement; d++;
+      }
       const w = el.naturalWidth || 0, h = el.naturalHeight || 0;
       if (w && h && w <= 120 && h <= 120) return true; // 极小图 = 头像/徽章
       return false;
@@ -533,21 +631,43 @@
   //
   // 这条规则只在**详情页**生效；首页/搜索页没有「当前帖子」，照旧全部放行。
 
-  /** 这些 class/id 命中的祖先，说明是「别的帖子」（相关推荐/评论区卡片），直接排除。
+  /** 这些 class/id 命中的祖先，说明**不是正文媒体**，直接排除。
    *
-   * ⚠️ 2026-10-18 第十轮修正：这串**是猜的**（拿不到小红书真实 DOM 时写下 的），
-   * 真机上小红书的推荐容器叫 `note-item` / `search-item` 一类，命不中就没用。
-   * 所以它现在只是「快速排除」的辅助线，**主判据已改为下面的祖先链推算**，
-   * 即使这行完全失效，归属判断依然成立。 */
+   * 2026-10-18 第十轮先用真机 DOM 校准过一轮（详情页 dump），实际看到的容器：
+   *   - 信息流/推荐卡片：`note-item`（`<section>`，带 `data-note-id`）
+   *   - 评论区：`comment-item` / `comment-inner-container` / `parent-comment` /
+   *     `comment-picture`（**评论里贴的图同样带 1040g 签名，光看 URL 分不出来**）
+   *   - 侧栏：`side-bar` / `bottom-channel`
+   * 所以 `comment` 这一项不是猜的，是实测命中；其余几项是保守补充。 */
   const XHS_OTHER_NOTE_CLASS = /note-item|feed-item|recommend|related|sidebar|comment|suggest|search-result/i;
 
-  /** 元素是否落在「别的帖子」子树里（相关推荐/评论区/侧栏） */
+  /** 元素是否落在「别的帖子 / 评论区 / 侧栏」子树里 */
   function xhsInOtherNote(el) {
     try {
       let n = el, d = 0;
       while (n && n.nodeType === 1 && d < 30) {
         const hint = String(n.className || "") + " " + String(n.id || "");
         if (XHS_OTHER_NOTE_CLASS.test(hint)) return true;
+        n = n.parentElement; d++;
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+
+  /** 元素是否在**评论区**里（第 1 条诉求：评论区图片不该抓）
+   *
+   * 单独拎出来是因为：评论区常常在正文容器**内部**（小红书详情页的右栏），
+   * 所以「祖先链核对 noteId」这一关它过得去（同一个 note-id），
+   * 必须在归属判断里**先**用这一条把它拦掉，否则会被当成正文图。
+   * 判据用真机实测过的类名，不看 noteId。 */
+  const XHS_COMMENT_CLASS = /comment-item|comment-inner-container|parent-comment|comment-picture|comment-list|list-container|reply-container|comments-container|comment-container/i;
+
+  function xhsInComment(el) {
+    try {
+      let n = el, d = 0;
+      while (n && n.nodeType === 1 && d < 30) {
+        const hint = String(n.className || "") + " " + String(n.id || "");
+        if (XHS_COMMENT_CLASS.test(hint)) return true;
         n = n.parentElement; d++;
       }
       return false;
@@ -594,13 +714,22 @@
     } catch (e) { return []; }
   }
 
-  /** 元素祖先链上有没有「标记为别的帖子」的属性 */
+  /** 元素祖先链上的 noteId 标记（当前帖子容器 or 别的帖子卡片）
+   *
+   * ⚠️ 真机上小红书的两种属性名**同时存在**（2026-10-18 第十轮真机实测）：
+   *   - 信息流卡片 `<section class="note-item" data-note-id="...">`  → 带 data- 前缀
+   *   - 正文容器 `<div class="note-detail-mask" note-id="...">`     → **不带** data- 前缀
+   *
+   * 早期只查了 `data-note-id` / `data-noteid` / `data-note` 三个带前缀的，
+   * 结果正文容器完全命不中，视频/图片的归属判断退化成兜底分支——
+   * 这正是「评论区图片仍被抓」和「本帖子视频不认」的直接原因之一。
+   * 所以 `note-id` 必须一起查。 */
   function xhsAncestorNoteId(el) {
     try {
       let n = el, d = 0;
       while (n && n.nodeType === 1 && d < 40) {
-        const id = n.getAttribute && (n.getAttribute("data-note-id") || n.getAttribute("data-noteid")
-          || n.getAttribute("data-note"));
+        const id = n.getAttribute && (n.getAttribute("note-id") || n.getAttribute("data-note-id")
+          || n.getAttribute("data-noteid") || n.getAttribute("data-note"));
         if (id && /^[0-9a-f]{24}$/i.test(String(id).trim())) return String(id).trim().toLowerCase();
         n = n.parentElement; d++;
       }
@@ -614,14 +743,28 @@
       if (!cur) return true; // 非详情页不做归属判断
       const curId = cur.toLowerCase();
 
+      // ⓪ 评论区一律排除（第 1 条：评论区里贴的图不该抓）
+      //
+      // 必须放在最前面：评论区在小红书详情页里通常位于正文容器**内部**
+      // （同一个 note-id 属性下），如果先走 ② 的 noteId 核对，它会一路通过；
+      // 评论图的 URL 也可能带当前 noteId，① 同样拦不住。
+      // 所以用「DOM 位置」这条独立判据先行拦截。
+      if (xhsInComment(el)) return false;
+
       // ① URL 里的 noteId
+      //
+      // ⚠️ 视频不能用 el.src：真机实测正文视频的 src 是 `blob:https://www.xiaohongshu.com/uuid`，
+      // 里面没有任何 noteId 信息（播放器把 mp4 读进 MSE 后把 src 换成了 blob）。
+      // 真实地址在 `__INITIAL_STATE__` 里，见 xhsVideoSource() 的说明。
       let src = "";
       try { src = el.currentSrc || el.src || ""; } catch (e) { src = ""; }
       const ids = xhsIdInUrl(src);
       if (ids.includes(curId)) return true;           // 明确是自己的
       if (ids.length && !ids.includes(curId)) return false; // 明确是别人的
 
-      // ② 祖先链上的 data-note-id
+      // ② 祖先链上的 note-id / data-note-id
+      // 真机上正文容器是 `note-id`（无 data- 前缀），信息流卡片是 `data-note-id`，
+      // 两种都要认，否则正文容器命不中（见 xhsAncestorNoteId 的注释）。
       const anc = xhsAncestorNoteId(el);
       if (anc) return anc === curId;
 
@@ -681,7 +824,81 @@
     } catch (e) { return false; }
   }
 
-  // 2c. 轮询 currentSrc 兜底
+  // ---- 小红书视频的真实地址（2026-10-18 第十轮真机实测后新增）
+  //
+  // 用户诉求第 2 条：「小红书的视频无法读取、名字对不上」。
+  //
+  // 【现象】真机详情页里 `<video>` 的 src 是
+  //   `blob:https://www.xiaohongshu.com/364d1c52-6dbe-4b87-8c6a-77bed12edb94`
+  // 里面**没有任何 CDN 地址**——播放器把 mp4 读进内存后把 src 换成了 blob。
+  // 所以 `handleMediaSrc(el, src)` 上报的是这个 blob，浏览器端根本 fetch 不到，
+  // 下载自然全失败；而 webRequest 抓到的是 MP4 分段 Range 请求，
+  // 主文件那条往往因为 Service Worker / media 缓存看不到。
+  //
+  // 【真实地址在哪】`window.__INITIAL_STATE__.note.noteDetailMap[noteId].note.video.media.stream`
+  // 是个 Map（key 是清晰度编号 EF4/EF5/EF6/EF7），每个 key 对应一个数组：
+  //   [{ masterUrl: "http://sns-video-v6.xhscdn.com/stream/1/110/332/xxx.mp4?sign=...",
+  //      backupUrls: [...], width: 1080, height: 2416, duration: 95134, format: "mp4" }]
+  // 同一个视频常有多套清晰度（EF4=572x1280 / EF5=1080x2416），
+  // 这里**取像素面积最大**的那条主地址（和图片「取体量最大」的策略一致）。
+  //
+  // 【为什么不 hook MSE / 不走 sidx】见 DEVELOPMENT.md 第 7 章：小红书是
+  // 普通 Range 请求整段 mp4（不是分片 MSE），拿到 URL 直接 Range 下载即可。
+
+  /** 从 __INITIAL_STATE__ 里取当前帖子的视频真实地址（取分辨率最高的那条）
+   * @returns {{url:string, w:number, h:number, duration:number}|null}
+   */
+  function xhsVideoSource() {
+    try {
+      const id = xhsCurrentNoteId();
+      if (!id) return null;
+      const st = window.__INITIAL_STATE__;
+      const map = st && st.note && st.note.noteDetailMap;
+      if (!map) return null;
+      const entry = map[id] || map[Object.keys(map).find((k) => k === id)];
+      const note = entry && entry.note;
+      if (!note || note.type !== "video") return null;
+      const media = note.video && note.video.media;
+      const streams = media && media.stream;
+      if (!streams) return null;
+
+      let best = null, bestArea = -1;
+      // streams 在真机上是对象（Map 序列化成对象），但旧的 mock/别的版本可能是数组，
+      // 两种都兜住。每个 value 才是「同一清晰度下的候选列表」。
+      const groups = Array.isArray(streams) ? [streams] : Object.keys(streams).map((k) => streams[k]);
+      for (const group of groups) {
+        const list = Array.isArray(group) ? group : [group];
+        for (const s of list) {
+          if (!s) continue;
+          const u = s.masterUrl || s.url || "";
+          if (!/^https?:\/\//i.test(u)) continue;
+          const area = (s.width | 0) * (s.height | 0);
+          if (area > bestArea) { bestArea = area; best = s; }
+        }
+      }
+      if (!best) return null;
+      // ⚠️ 统一成 https：真机上 masterUrl 给的是 `http://sns-video-v6...`，
+      // 而 webRequest 和播放器自己发的是 `https://...`，两条协议会被当成
+      // 两个不同的 key，列表里就出现「同一个视频两条，一条有名字一条没名字」。
+      // CDN 本来就支持 https（HEAD 200），按 https 报上去让它们合并成一条。
+      const raw = String(best.masterUrl || best.url || "");
+      const url = raw.replace(/^http:\/\//i, "https://");
+      return {
+        url,
+        w: best.width | 0,
+        h: best.height | 0,
+        duration: best.duration | 0,
+        backup: String((best.backupUrls || []).find((b) => /^https?:\/\//i.test(b)) || "").replace(/^http:\/\//i, "https://"),
+      };
+    } catch (e) { return null; }
+  }
+
+  /** 当前帖子的视频条目准备就绪时返回 true（供 scanMedia 判断要不要上报封面） */
+  function xhsVideoReady() {
+    return !!xhsVideoSource();
+  }
+
+
   function scanMedia() {
     try {
       const els = document.querySelectorAll("video, audio");
@@ -692,10 +909,15 @@
         if (!src) continue;
         // 小红书（2026-10-18 第七轮）：视频逻辑和图片一样 ——
         // 详情页只要当前帖子的视频，跳过装饰/其他帖子的视频。
-        // 小红书的视频 src 直接是 mp4 CDN 地址（不是 MSE），所以走到这里就是能下的。
         if (isXhsHost() && el.tagName === "VIDEO") {
           if (videoIsXhsDecor(el)) continue;
           if (xhsCurrentNoteId() && !imgBelongsToCurrentNote(el)) continue;
+          // 第十轮：blob: 地址页面侧根本下不了，换成 __INITIAL_STATE__ 里的真实 mp4。
+          // 换不到就退回 blob（至少 UI 里能看到条目），比直接丢掉好。
+          if (/^(blob|data):/i.test(src)) {
+            const real = xhsVideoSource();
+            if (real) { src = real.url; }
+          }
         }
         handleMediaSrc(el, src);
       }
@@ -708,6 +930,8 @@
   window.__msXhsBelongs = imgBelongsToCurrentNote;
   window.__msXhsIdInUrl = xhsIdInUrl;
   window.__msXhsAncestorNoteId = xhsAncestorNoteId;
+  window.__msXhsVideoSource = xhsVideoSource;
+  window.__msXhsNoteTitle = xhsNoteTitle;
 
 
   // B 站 __playinfo__ 是 playurl XHR 返回后才挂上 window 的，没有可监听事件，
@@ -789,6 +1013,11 @@
         // 小红书：详情页只抓当前帖子的正文配图，首页/详情页都要跳过装饰图（头像/logo/二维码）。
         if (isXhsHost()) {
           if (imgIsXhsDecor(el)) continue;
+          // 评论区里贴的图（第 1 条诉求）。两条独立判据，任一命中就跳过：
+          //   · URL 带 `/comment/` 段（正文图没有这段，实测差异稳定）
+          //   · DOM 在评论区容器里（`comment-item` / `comment-picture` 等）
+          // 两条都要有：URL 判据防前端改版后 class 变了，DOM 判据防 URL 格式变了。
+          if (imgIsXhsComment(src) || xhsInComment(el)) continue;
           // 详情页（有 noteId）：先按 CDN 大图签名筛掉明显不是正文的，
           // 再用 DOM 归属判断「这张图属于当前帖子还是相关推荐里的别的帖子」。
           // 只靠 URL 签名区分不开——别的帖子的正文配图也是同一个 1040g 签名。
