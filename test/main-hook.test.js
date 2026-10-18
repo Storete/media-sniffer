@@ -678,6 +678,100 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   fakeDocument._imgEls = [];
   fakeDocument._mediaEls = [];
 
+  // ------------------------------------------------------------ 小红书：__INITIAL_STATE__ 直读（第十一轮）
+  //
+  // 用户发来一个「小红书去水印」iOS 快捷指令，它的做法是抓分享页 HTML 正则扫
+  // imageList / masterUrl。顺着这条线实测本机详情页，imageList 比 DOM 扫描全得多：
+  // 7 张图尺寸齐全、顺序就是发布顺序；DOM 那边 77 个 1040g 的 <img> 里
+  // 只有 2 张解码出来了，还得靠祖先链猜归属。
+  // 所以改成「直读为主、DOM 兜底」：这里有 __INITIAL_STATE__ 就走直读，没有就退回 DOM。
+  console.log("\n[5v] 小红书 __INITIAL_STATE__ 直读配图");
+  sandboxLocation.href = "https://www.xiaohongshu.com/explore/6ab221bd000000003602a63e";
+  sandboxLocation.hostname = "www.xiaohongshu.com";
+  sandboxLocation.pathname = "/explore/6ab221bd000000003602a63e";
+
+  const XHS_NID = "6ab221bd000000003602a63e";
+  // 真机样本：两张图各带 2 个档位（infoList），URL 前缀是 http://，必须转成 https://
+  win.__INITIAL_STATE__ = {
+    note: {
+      noteDetailMap: {
+        [XHS_NID]: {
+          note: {
+            type: "normal",
+            title: "",
+            desc: "这就是标题",
+            imageList: [
+              {
+                fileId: "spectrum/1040g34o325dkebtl4a20415if87gclpj20lh3rg",
+                width: 1672, height: 941,
+                infoList: [
+                  { url: "http://sns-webpic-qc.xhscdn.com/202610181653/aaa/spectrum/1040g34o325dkebtl4a20415if87gclpj20lh3rg!nc_n_webp_mw_1" },
+                  { url: "http://sns-webpic-qc.xhscdn.com/202610181653/bbb/spectrum/1040g34o325dkebtl4a20415if87gclpj20lh3rg!nd_dft_wgth_webp_3" },
+                ],
+              },
+              {
+                fileId: "spectrum/1040g34o325dkdh8bk610415if87gclpjti1acp8",
+                width: 1600, height: 900,
+                infoList: [
+                  { url: "http://sns-webpic-qc.xhscdn.com/202610181653/ccc/spectrum/1040g34o325dkdh8bk610415if87gclpjti1acp8!nd_dft_wgth_webp_3" },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    },
+  };
+  const noteImgs = sandbox.window.__msXhsNoteImages();
+  check("读出 imageList 的张数", noteImgs && noteImgs.length === 2, noteImgs && noteImgs.length);
+  check("取每个 infoList 的最后一个档位（大图）",
+    noteImgs && noteImgs[0].url.includes("!nd_dft_wgth_webp_3"), noteImgs && noteImgs[0].url.slice(-40));
+  check("http:// 被转成 https://（否则和 webRequest 那条分成两条）",
+    noteImgs && noteImgs.every((x) => x.url.startsWith("https://")), noteImgs && noteImgs.map((x) => x.url.slice(0, 8)));
+  check("带原图像素尺寸", noteImgs && noteImgs[0].w === 1672 && noteImgs[0].h === 941, noteImgs && [noteImgs[0].w, noteImgs[0].h]);
+  check("顺序就是 imageList 数组顺序",
+    noteImgs && noteImgs[0].url.includes("pj20lh3rg") && noteImgs[1].url.includes("ti1acp8"),
+    noteImgs && noteImgs.map((x) => x.url.slice(-14)));
+  check("nid 不是详情页时返回 null（首页不直读）", (() => {
+    sandboxLocation.pathname = "/explore";
+    const r = sandbox.window.__msXhsNoteImages();
+    sandboxLocation.pathname = "/explore/" + XHS_NID;
+    return r === null;
+  })());
+  check("没有 __INITIAL_STATE__ 时返回 null（退回 DOM 扫描）", (() => {
+    const saved = win.__INITIAL_STATE__;
+    delete win.__INITIAL_STATE__;
+    const r = sandbox.window.__msXhsNoteImages();
+    win.__INITIAL_STATE__ = saved;
+    return r === null;
+  })());
+
+  // 端到端：直读通路真的会把 2 张图 post 出去，且 ord 用数组下标、w/h 来自 imageList
+  messages.length = 0;
+  fakeDocument._imgEls = []; // DOM 里一张图都没有 —— 全靠直读
+  sandbox.window.__msImgScan();
+  const direct = messages.filter((m) => m.source === "imgctx");
+  check("DOM 里没有图也能上报（直读通路生效）", direct.length === 2, direct.length);
+  check("直读上报带 ord = 数组下标", direct.length === 2 && direct[0].ord === 0 && direct[1].ord === 1,
+    direct.map((m) => m.ord));
+  check("直读上报带 imageList 的原始尺寸", direct.length === 2 && direct[0].w === 1672 && direct[1].h === 900,
+    direct.map((m) => [m.w, m.h]));
+  check("直读上报带标题（title 为空时取 desc）", direct.length === 2 && direct[0].title === "这就是标题",
+    direct.length && direct[0].title);
+  check("直读走 hint=xhs-note 标记", direct.length === 2 && direct[0].hint === "xhs-note", direct.length && direct[0].hint);
+  // 重复扫描不重复上报
+  messages.length = 0;
+  sandbox.window.__msImgScan();
+  check("直读通路重复扫描不重复上报", messages.filter((m) => m.source === "imgctx").length === 0,
+    messages.filter((m) => m.source === "imgctx").length);
+
+  // 清场：切回 Telegram 并移除 __INITIAL_STATE__，别影响后面的既有用例
+  delete win.__INITIAL_STATE__;
+  sandboxLocation.href = "https://web.telegram.org/a/";
+  sandboxLocation.hostname = "web.telegram.org";
+  delete sandboxLocation.pathname;
+  fakeDocument._imgEls = [];
+
 
   // blob: 的图现在也要上报（Telegram 把消息照片 fetch 回来 createObjectURL
   // 后才塞给 <img>，webRequest 经常看不到那次 fetch，imgctx 是唯一来源），

@@ -295,6 +295,11 @@ function recordPageMedia(tabId, pageUrl, p) {
     }
     // 页面内 http 媒体（Telegram 等）：交给页面里抓；blob 图直接就是页面条目
     if ((isHttp && !ctxOnly) || ctxBlobImg) existed.page = 1;
+    // imgctx 条目刚拿到 title/mid 时也要补一次 page：
+    // webRequest 常常比页面的 found 消息先到，那时 confirmPageItem 因为
+    // 条目上还没有 title 直接返回了，page 就永远停在 0。小红书这类
+    // 「图片本体由 webRequest 抓、上下文由 imgctx 报」的站点全靠这一步。
+    confirmPageItem(existed);
     existed.t = now;
     flushSoon(tabId);
     return;
@@ -352,6 +357,11 @@ const CDN_HINT = /hdslb\.com|alicdn\.com|bdstatic\.com|gtimg\.cn|byteimg\.com|36
 // 这里也能把走 webRequest-only 路径抓到的头像/二维码判成 icon（popup 已过滤 icon）。
 const XHS_AVATAR_HINT = /xhscdn\.com\/[^"'\s]*view2\/\d+\/w\/\d+\//i;
 const XHS_QR_HINT = /xhscdn\.com\/[^"'\s]*(qrcode|qr-code|logo|icon)[^"'\s]*/i;
+// 小红书正文图的路径特征。定义在这里而不是去重逻辑旁边，是因为 looksLikeIcon()
+// 也要用它来区分「笔记配图」和「站点素材」；两份常量各写一次迟早会改歪。
+const XHS_ASSET_PATH = /(?:^|\/)(spectrum|notes_pre_post|notes|oss-sg|comment)\/(1040g[0-9a-z]{20,})(?=$|[!?_])/i;
+/** 评论区贴的图：路径里多一段 /comment/（页面侧和这里共用同一条判据） */
+const XHS_COMMENT_IMG = /xhscdn\.com\/[^"'\s]+\/comment\/[^"'\s]*1040g/i;
 
 // ---------------------------------------------------------------------------
 // 「这张图是不是站点装饰（图标/logo/徽章/头像）」
@@ -460,6 +470,21 @@ function looksLikeIcon(it, rec) {
   if (/img-apple-64|\/assets\//i.test(u)) return true;
   // 小红书头像/二维码（走 webRequest-only 无 DOM 上下文时靠 URL 特征兜底）
   if (XHS_AVATAR_HINT.test(u) || XHS_QR_HINT.test(u)) return true;
+  // 小红书的站点素材（2026-10-18 第十轮真机）：这些图走 webRequest-only、没有 DOM
+  // 上下文，体积又会骗过下面的 24KB 线 —— 实测 svg-sprite.6.57.6.svg 有 80.7KB、
+  // fe-platform.xhscdn.com 的 104101l…png 只有 1KB，两条都混进了正文图片列表。
+  // 它们的共同点是「不是笔记配图」：配图一定在 sns-webpic/sns-img 的
+  // spectrum|notes_pre_post|notes|oss-sg 目录下且带 1040g fileId，
+  // 其余 xhscdn.com / xiaohongshu.com 上的图片一律按站点装饰处理。
+  if (/xiaohongshu\.com\/[^"'\s]*\.(svg|ico)(\?|$)/i.test(u)) return true;
+  if (/fe-(static|platform)\.xhscdn\.com\//i.test(u)) return true;
+  // 小红书评论区里的图（路径里多一段 /comment/）：页面侧 imgIsXhsComment 已拦了一道，
+  // 但走 webRequest-only 的条目没有 DOM 上下文，只能在这里按路径兜底。
+  // 用户明确要求「评论区里的图片也会抓取，这个要改」。
+  // 注意顺序：这条必须在下面 XHS_ASSET_PATH 那行之前，因为 /comment/ 本身
+  // 也匹配 XHS_ASSET_PATH 的类型段，先判类型段会把它当成正文图放行。
+  if (XHS_COMMENT_IMG.test(u)) return true;
+  if (/xhscdn\.com\//i.test(u) && !XHS_ASSET_PATH.test(u)) return true;
   if (s && s > 24 * 1024) return false;          // 大于 24KB 的先当真图
   if (THUMB_HINT.test(u)) return true;
   if (/\.(svg|ico)(\?|$)/i.test(u)) return true; // svg/ico 基本都是图标
@@ -560,16 +585,42 @@ function isXhsDetailUrl(u) {
 }
 
 /**
- * 小红书图片的「内容身份」：同一张图的不同尺寸/裁切版本会得到同一个值。
- * 做法是取 pathname 并砍掉 `!` 之后的部分（`!nc_n_webp_mw_1` 这类图片服务参数），
- * query string 因为不在 pathname 里，天然被排除。
- * 取不到 URL 时返回空串 —— 调用方据此放弃去重，绝不误删。
+ * 小红书 CDN 路径里「稳定的那一段」的正则：`<路径类型>/<fileId>`。
+ *
+ * 一条完整的图 URL 长这样（真实样本）：
+ *   https://sns-webpic-qc.xhscdn.com / 202610181600 / 004ef081518e... / spectrum / 1040g34o325dkebtl4a204... / !nd_dft_wgth_webp_3
+ *                                    ↑ 时间戳        ↑ 随机 hash       ↑ 路径类型  ↑ fileId（真正的身份证）      ↑ 档位后缀
+ *
+ * 前三段里**时间戳和 hash 每次请求都会变**（实测同一张图 16:00 抓到的 hash 是
+ * `004ef08…`，16:05 变成 `b5b96ec…`），所以拿整条 pathname 当身份永远对不上，
+ * 一张图会被记成 3~4 条。只有 `<类型>/<fileId>` 这一段是稳定的。
+ */
+// XHS_ASSET_PATH 定义在图标判定区（那里也要用），这里不再重复声明。
+/** 路径里没有已知类型段时的兜底：直接找 fileId */
+const XHS_ASSET_BARE = /(?:^|\/)(1040g[0-9a-z]{20,})(?=$|[!?_])/i;
+/** 头像专用来路，fileId 格式和正文图一样但绝不能参与正文去重 */
+const XHS_AVATAR_PATH = /\/avatar\//i;
+
+/**
+ * 小红书图片的「内容身份」：同一张图的不同档位/不同抓取时刻会得到同一个值。
+ *
+ * 两条实测出来的规则：
+ *   · 档位后缀（`!nc_n_webp_mw_1` 缩略图 / `!nd_dft_wgth_webp_3` 正文大图）不算身份，
+ *     否则同一张图的缩略图和大图会被当成两张；
+ *   · 时间戳段和 hash 段也不算身份，否则同一张图刷新一次就多一条。
+ *
+ * 取不到稳定段时返回空串 —— 调用方据此放弃去重，**绝不误删**（最坏退回旧行为）。
  */
 function xhsImgIdentity(u) {
   try {
     const p = new URL(u).pathname;
-    const bang = p.indexOf("!");
-    return bang >= 0 ? p.slice(0, bang) : p;
+    const m = XHS_ASSET_PATH.exec(p);
+    // 带类型段：identity 里也保留类型，免得 `spectrum/X` 和 `comment/X` 撞车
+    if (m) return m[1].toLowerCase() + "/" + m[2].toLowerCase();
+    // 头像：明确排除。头像 fileId 也是 1040g 开头，靠裸正则会被认成正文图
+    if (XHS_AVATAR_PATH.test(p)) return "";
+    const bare = XHS_ASSET_BARE.exec(p);
+    return bare ? bare[1].toLowerCase() : "";
   } catch { return ""; }
 }
 
@@ -584,28 +635,60 @@ function xhsImgIdentity(u) {
  * @returns {Array} 去重后的新数组
  */
 function dedupeXhsNoteImages(items) {
-  const best = new Map();      // 身份 -> {score, u}
-  for (const it of items) {
+  const best = new Map();      // 身份 -> {score, idx}
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
     if (it.k !== "image") continue;
     const u = String(it.u || "");
     if (!/1040g/i.test(u)) continue;
     const id = xhsImgIdentity(u);
     if (!id) continue;
-    // 优先比字节数（同一张图的大档一定比小档大）；没有 s 就退回像素面积
-    const score = (it.s | 0) || (((it.w | 0) * (it.h | 0)) | 0) || 0;
+    // 优先比字节数（同一张图的大档一定比小档大）；没有 s 就退回像素面积。
+    // 两者都没有时给 1，比「纯 0」高一点点，保证同组里至少有一条能被选中，
+    // 而不是因为全员 0 分导致 best 里存下第一条之后谁都不替换。
+    const score = (it.s | 0) || (((it.w | 0) * (it.h | 0)) | 0) || 1;
     const cur = best.get(id);
-    if (!cur || score > cur.score) best.set(id, { score, u });
+    if (!cur || score > cur.score) best.set(id, { score, idx: i });
   }
   if (!best.size) return items;
-  const keep = new Set();
-  for (const v of best.values()) keep.add(v.u);
-  return items.filter((it) => {
+  // 按「身份」保留，而不是按 URL：同一张图可能有多条完全相同的 URL
+  // （webRequest 与 DOM 扫描各记一次），按 URL 比较会把它们都留下。
+  const keepIdx = new Set();
+  for (const v of best.values()) keepIdx.add(v.idx);
+  return items.filter((it, i) => {
     if (it.k !== "image") return true;
     const u = String(it.u || "");
     if (!/1040g/i.test(u)) return true;
-    const id = xhsImgIdentity(u);
-    if (!id) return true;
-    return keep.has(u);
+    if (!xhsImgIdentity(u)) return true;
+    return keepIdx.has(i);
+  });
+}
+
+/**
+ * 小红书详情页：页面既然已经读到了 `__INITIAL_STATE__.note.imageList`（那条最权威的
+ * 「这个帖子有哪些图」），就别再从 webRequest 的一堆请求里猜了。
+ *
+ * 真机证据（2026-10-18 第十一轮，帖子 6ab221bd…）：页面上报了 7 条 `hint === "xhs-note"`
+ * 的直读条目（编号 ①~⑦，尺寸/标题/顺序全对），但同一时刻 webRequest 还记着 22 条噪声：
+ *   · `svg-sprite.6.57.6.svg#me` —— 站点雪碧图，82KB，骗过了体积线；
+ *   · 一堆 `!nc_n_webp_mw_1` 缩略图 —— 信息流里**别的帖子**的封面，fileId 各不相同，
+ *     按身份去重根本去不掉；
+ *   · 几条无后缀的随机 hex `.png` —— 小红书 UI 素材。
+ * 这些在 popup 里被一起编了号，用户看到的就是「②③④…不止 7 张」。
+ *
+ * 所以：只要页面报过直读条目，就**只保留直读条目**（外加视频/音频，它们不走这条路）。
+ * 没报过（老版本注入脚本、页面结构变了、`__INITIAL_STATE__` 没注入）就别动，
+ * 原样返回 —— 宁可多几条噪声，也不能让列表整个空掉。
+ */
+function preferXhsNoteList(items) {
+  const direct = items.filter((it) => String(it.hint || "") === "xhs-note");
+  if (!direct.length) return items;
+  return items.filter((it) => {
+    // 直读条目本身
+    if (String(it.hint || "") === "xhs-note") return true;
+    // 视频/音频不受影响：它们本来就该由 webRequest + 页面 hook 抓
+    if (it.k === "video" || it.k === "audio") return true;
+    return false;
   });
 }
 
@@ -842,7 +925,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const visible = items.filter((it) => it.k !== "icon");
         // 小红书详情页：同一张图被页面用不同尺寸/裁切后缀引用多次（封面最容易中招），
         // 按「内容身份」只留体量最大的一条，避免列表里一张图出现两次。
-        const shown = isXhsDetailUrl(tabUrl) ? dedupeXhsNoteImages(visible) : visible;
+        // 再叠一层「页面直读优先」：imageList 已经给出完整清单时，webRequest 抓到的
+        // 缩略图/雪碧图/别的帖子封面全是噪声（详见 preferXhsNoteList 的注释）。
+        const shown = isXhsDetailUrl(tabUrl)
+          ? preferXhsNoteList(dedupeXhsNoteImages(visible))
+          : visible;
         const counts = {};
         for (const it of shown) counts[it.k] = (counts[it.k] || 0) + 1;
         sendResponse({ ok: true, items: shown, counts, tabUrl, order: KIND_ORDER });

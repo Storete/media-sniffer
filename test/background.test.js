@@ -415,11 +415,16 @@ console.log("\n[4] 小红书：详情页封面去重（用户真机反馈「封�
 // 小红书这几个函数只依赖 URL / 条目对象，抽出来单独跑
 const xhsStart = bgCode.indexOf("// ---------------------------------------------------------------- 小红书");
 const xhsEnd = bgCode.indexOf("// ---------------------------------------------------------------- 监听", xhsStart);
+// 小红书去重用的 XHS_ASSET_PATH 定义在图标判定区（looksLikeIcon 也要用），
+// 不在「小红书」注释块里面。切片起点往前挪到那行，否则 xhsImgIdentity 里
+// 引用的是个未定义变量，身份恒为空串、去重整个失效。
+const assetDefPos = bgCode.indexOf("const XHS_ASSET_PATH", 0);
+const xhsSliceStart = assetDefPos >= 0 && assetDefPos < xhsStart ? assetDefPos : xhsStart;
 const xhsCtx = vm.createContext({ console, Map, Set, String, Number, RegExp, URL });
-vm.runInContext(bgCode.slice(xhsStart, xhsEnd), xhsCtx, { filename: "xhs-rules" });
+vm.runInContext(bgCode.slice(xhsSliceStart, xhsEnd), xhsCtx, { filename: "xhs-rules" });
 const xhs = vm.runInContext(
-  "({ isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages })", xhsCtx, { filename: "xhs-export" });
-const { isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages } = xhs;
+  "({ isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList })", xhsCtx, { filename: "xhs-export" });
+const { isXhsHostUrl, isXhsDetailUrl, xhsImgIdentity, dedupeXhsNoteImages, preferXhsNoteList } = xhs;
 
 // ---- 域名 / 详情页判定
 check("识别小红书域名", isXhsHostUrl("https://www.xiaohongshu.com/explore") === true);
@@ -440,15 +445,45 @@ check("别的站点同名路径不算详情页",
   isXhsDetailUrl("https://evil.com/explore/6a7546a50000000032030d6d") === false);
 
 // ---- 内容身份
-const U1 = "https://sns-webpic-qc.xhscdn.com/202510181115/aaa/notes_pre_post/1040g3k03xyz!nc_n_webp_mw_1";
-const U2 = "https://sns-webpic-qc.xhscdn.com/202510181115/aaa/notes_pre_post/1040g3k03xyz!nc_n_webp_mw_2";
+// 用真实长度的 fileId（37 位）。早期测试用的是 `1040g3k03xyz` 这种短串，
+// 真实 CDN 上不存在，正则按 `{20,}` 要求后它们会退化到「裸匹配」分支，
+// 测出来的行为和线上不一致。
+const FID_A = "1040g3k0326952rj244005p5rujnl7eaonshedm8";
+const FID_B = "1040g34o325dkdh8bk610415if87gclpjti1acp8";
+const U1 = `https://sns-webpic-qc.xhscdn.com/202510181115/aaa/notes_pre_post/${FID_A}!nc_n_webp_mw_1`;
+const U2 = `https://sns-webpic-qc.xhscdn.com/202510181115/aaa/notes_pre_post/${FID_A}!nc_n_webp_mw_2`;
 check("同一张图的两个尺寸后缀 → 同一身份", xhsImgIdentity(U1) === xhsImgIdentity(U2), [xhsImgIdentity(U1), xhsImgIdentity(U2)]);
 check("身份里不含 `!` 及其后的参数", !xhsImgIdentity(U1).includes("!"), xhsImgIdentity(U1));
 check("query string 不进身份",
   xhsImgIdentity(U1 + "?imageView2/2/w/1080") === xhsImgIdentity(U1));
-const U_DIFF = "https://sns-webpic-qc.xhscdn.com/202510181115/bbb/notes_pre_post/1040g3k03abc!nc_n_webp_mw_1";
+const U_DIFF = `https://sns-webpic-qc.xhscdn.com/202510181115/bbb/notes_pre_post/${FID_B}!nc_n_webp_mw_1`;
 check("不同图识别为不同身份", xhsImgIdentity(U1) !== xhsImgIdentity(U_DIFF));
 check("坏 URL 的身份为空串（调用方就放弃去重）", xhsImgIdentity("不是URL") === "");
+
+// ---- 真机那条坑：同一张图，时间戳段和 hash 段都变了
+// 实测样本：16:00 抓到 hash=004ef08…，16:05 变成 b5b96ec…，路径里只剩
+// `spectrum/<fileId>` 是稳定的，靠它才能认出是同一张图。
+const REAL_FID = "1040g34o325dkebtl4a20415if87gclpj20lh3rg";
+const R1 = `https://sns-webpic-qc.xhscdn.com/202610181600/004ef081518ed93d28996909b3298510/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`;
+const R2 = `https://sns-webpic-qc.xhscdn.com/202610181605/b5b96ec2cd88010f4432ffed37d87241/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`;
+const R3 = `https://sns-webpic-qc.xhscdn.com/202610181559/b3718a91a4d4150cdb9d4e13ec6b61b0/spectrum/${REAL_FID}!nc_n_webp_mw_1`;
+check("时间戳+hash 变了、fileId 没变 → 仍是同一身份",
+  xhsImgIdentity(R1) === xhsImgIdentity(R2) && xhsImgIdentity(R1) === xhsImgIdentity(R3),
+  [xhsImgIdentity(R1), xhsImgIdentity(R2)]);
+check("身份里不含时间戳段和 hash 段",
+  xhsImgIdentity(R1) === "spectrum/" + REAL_FID, xhsImgIdentity(R1));
+
+// 头像必须排除：fileId 同样 1040g 开头，混进正文去重会误删
+const AV1 = "https://sns-avatar-qc.xhscdn.com/avatar/1040g2jo31pcvrtgu24004a1ke1jil4hm9p0h1k0?imageView2/2/w/60/format/webp";
+const AV2 = "https://sns-avatar-qc.xhscdn.com/avatar/1040g2jo31pcvrtgu24004a1ke1jil4hm9p0h1k0?imageView2/2/w/120/format/jpg";
+check("头像的身份是空串（不参与正文去重）", xhsImgIdentity(AV1) === "" && xhsImgIdentity(AV2) === "",
+  [xhsImgIdentity(AV1), xhsImgIdentity(AV2)]);
+
+// 同一 fileId 出现在不同路径类型下，不能算同一张图
+check("spectrum 和 comment 下的同 fileId 不混为一谈",
+  xhsImgIdentity(`https://sns-webpic-qc.xhscdn.com/ts/h/spectrum/${REAL_FID}!x`)
+  !== xhsImgIdentity(`https://sns-webpic-qc.xhscdn.com/ts/h/comment/${REAL_FID}!x`));
+
 
 // ---- 去重行为
 const mkImgItem = (u, extra) => Object.assign({ u, k: "image" }, extra || {});
@@ -457,7 +492,7 @@ const dupItems = [
   mkImgItem(U1, { s: 480000 }),
   mkImgItem(U2, { s: 120000 }),
   mkImgItem(U_DIFF, { s: 300000 }),
-  mkImgItem("https://sns-webpic-qc.xhscdn.com/202510181115/ccc/notes_pre_post/1040g3k03def!nc_n_webp_mw_1", { s: 250000 }),
+  mkImgItem(`https://sns-webpic-qc.xhscdn.com/202510181115/ccc/notes_pre_post/1040g3k0326952rj244005p5rujnl7eaonshedm9!nc_n_webp_mw_1`, { s: 250000 }),
 ];
 const deduped = dedupeXhsNoteImages(dupItems);
 check("封面重复被合掉：4 条 → 3 条", deduped.length === 3, deduped.map((x) => x.u.slice(-40)));
@@ -465,7 +500,7 @@ check("封面保留体量最大的那条（s 大的赢）",
   deduped.some((x) => x.u === U1) && !deduped.some((x) => x.u === U2),
   deduped.map((x) => [x.u.slice(-30), x.s]));
 check("其它两张正文图原样保留",
-  deduped.some((x) => x.u === U_DIFF) && deduped.some((x) => x.u.includes("1040g3k03def")));
+  deduped.some((x) => x.u === U_DIFF) && deduped.some((x) => x.u.includes("1040g3k0326952rj244005p5rujnl7eaonshedm9")));
 
 // 没有 s 时退回像素面积
 const byArea = dedupeXhsNoteImages([
@@ -487,6 +522,19 @@ check("只合 1040g 的重复图，非 1040g 的小图都留着",
   mixedOut.filter((x) => x.k === "image").length === 3,
   mixedOut.map((x) => [x.k, x.u.slice(-16)]));
 check("视频条目完全不受影响", mixedOut.some((x) => x.k === "video"));
+
+// 真机形态：一张图 4 条记录（3 个不同 URL + 1 个重复 URL），必须只留 1 条
+const realDup = [
+  mkImgItem(`https://sns-webpic-qc.xhscdn.com/202610181600/004ef08aaa/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`, { s: 201614, w: 1672, h: 941 }),
+  mkImgItem(`https://sns-webpic-qc.xhscdn.com/202610181605/b5b96ecbbb/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`, { s: 201614, w: 1672, h: 941 }),
+  mkImgItem(`https://sns-webpic-qc.xhscdn.com/202610181559/b3718a91cc/spectrum/${REAL_FID}!nc_n_webp_mw_1`, { s: 48850, w: 640, h: 360 }),
+  mkImgItem(`https://sns-webpic-qc.xhscdn.com/202610181605/b5b96ecbbb/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`, { s: 0, w: 0, h: 0 }),
+];
+const realOut = dedupeXhsNoteImages(realDup);
+check("真机形态：一张图 4 条记录 → 只剩 1 条", realOut.length === 1, realOut.map((x) => [x.u.slice(-28), x.s]));
+check("保留的那条是大档（201614 字节），不是缩略图也不是 s=0 的",
+  realOut.length === 1 && realOut[0].s === 201614, realOut.map((x) => x.s));
+
 
 // 完全没重复时不能少东西
 const noDup = [
@@ -516,6 +564,35 @@ check("编号按 DOM 顺序（ord=0 得 ①、ord=1 得 ②、ord=2 得 ③）",
   && recX.items.get("https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k03ccc!x").mark === "②"
   && recX.items.get("https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k01aaa!x").mark === "③",
   xMarks);
+
+console.log("\n[4c] 小红书详情页：页面直读了 imageList 就只认直读条目");
+// 真机证据（帖子 6ab221bd…）：页面上报了 7 条 hint=xhs-note 的直读条目，
+// webRequest 同时还记着 22 条噪声（站点雪碧图 / 信息流里别的帖子的封面缩略图 /
+// UI 素材 png）。它们在 popup 里被一起编了号，用户看到「不止 7 张」。
+const D1 = `https://sns-webpic-qc.xhscdn.com/202610181653/aaa/spectrum/${REAL_FID}!nd_dft_wgth_webp_3`;
+const D2 = `https://sns-webpic-qc.xhscdn.com/202610181653/bbb/spectrum/${FID_B}!nd_dft_wgth_webp_3`;
+const NOISE_THUMB = `https://sns-webpic-qc.xhscdn.com/202610181653/ccc/spectrum/1040g2t0326dl1a0p00005n33mumk2o11tqs8apg!nc_n_webp_mw_1`;
+const NOISE_SVG = "https://sns-webpic-qc.xhscdn.com/202610181653/ddd/notes_pre_post/svg-sprite.6.57.6.svg#me";
+const NOISE_PNG = "https://sns-webpic-qc.xhscdn.com/202610181653/eee/notes_pre_post/36c01bac91a3eb7284b6e107e4714d7c06da.png";
+const withDirect = [
+  { u: D1, k: "image", hint: "xhs-note", ord: 0, w: 1672, h: 941, title: "标题" },
+  { u: D2, k: "image", hint: "xhs-note", ord: 1, w: 1600, h: 900, title: "标题" },
+  { u: NOISE_THUMB, k: "image", s: 9224 },
+  { u: NOISE_SVG, k: "image", s: 82659 },
+  { u: NOISE_PNG, k: "image", s: 638 },
+  { u: "https://sns-video-v6.xhscdn.com/stream/1/110/332/abc_332.mp4", k: "video", title: "标题" },
+];
+const kept = preferXhsNoteList(withDirect);
+check("只留下 2 条直读图片", kept.filter((x) => x.k === "image").length === 2,
+  kept.filter((x) => x.k === "image").map((x) => String(x.u).slice(-24)));
+check("噪声缩略图被丢掉", !kept.some((x) => String(x.u).includes("!nc_n_webp_mw_1")));
+check("站点雪碧图被丢掉", !kept.some((x) => String(x.u).includes("svg-sprite")));
+check("无后缀 UI 素材 png 被丢掉", !kept.some((x) => String(x.u).includes("36c01bac")));
+check("视频不受影响（它不走直读这条路）", kept.some((x) => x.k === "video"), kept.map((x) => x.k));
+check("有没有直读条目时原样返回（不能把列表整个清空）",
+  preferXhsNoteList(withDirect.filter((x) => x.hint !== "xhs-note")).length === 4,
+  preferXhsNoteList(withDirect.filter((x) => x.hint !== "xhs-note")).length);
+check("空数组原样返回", preferXhsNoteList([]).length === 0);
 
 // 同一页里的视频单独一组、也编号
 const recXV = mkRec([

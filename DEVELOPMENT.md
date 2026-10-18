@@ -289,7 +289,7 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 | 3 | 视频或图片的水印能否去掉 | 待评估 | 见 9.3 的风险说明，大概率属于「做不到/不建议做」 |
 | 4 | 给代码添加注释 | **已完成** | popup 11%→36%，host 系列 6~11%→16~22%，整体 39%，见 9.2 |
 | 5 | 给功能分组，方便快速定位问题 | **待定** | 用户明确说之后再商量，不动手 |
-| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2 已覆盖大半 |
+| 6 | 开发文档补一节「实现过程中遇到的全部问题与解决方案」 | 进行中 | 本章即为该节落点，逐轮补齐；第 4 章「踩过的坑」与 9.1/9.1b/9.2/9.4 已覆盖大半 |
 
 > 后续顺序：**3 → 5 待用户发话**。第 6 章随每轮进展继续补。
 
@@ -373,5 +373,52 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 
 **建议**：这一条先按「评估结论 = 不做像素级去水印」处理，若用户坚持，再限定为
 「只在能确认水印是独立图层、且不涉及重编码时，提供开关」。实施前需再次确认。
+
+### 9.4 第十一轮：图片预览 / 重复封面 / 列表噪声（用户报「有些图片无法预览」）
+
+用户原话：「有些图片无法预览，例如 https://www.xiaohongshu.com/explore/6ab221bd000000003602a63e」，
+后续澄清「带标题的四张图均无法预览」「的确是有 18 张」「带标题的每行只有一个按钮」。
+
+拆成四个独立缺陷，全部落地并真机验证：
+
+1. **预览按钮根本没有**（不是加载失败）。`popup.js` 的 `renderItem(it)` 按 `it.page` 分支，
+   `isPage` 分支只挂了一个「保存」按钮；小红书图片全部来自页面扫描，走的正是这条分支。
+   → 在该分支补「预览」（只对 `image/video/audio` 且 `http(s)` 地址挂，`blob:`/MSE 在扩展页加载不了）。
+2. **预览按钮不出现还有第二个原因**：`page` 标记永远停在 0。`confirmPageItem` 要求条目
+   已有 `mid` 或 `title`，而 webRequest 常常比页面的 `found` 消息**先到**，那时 title 还是空，
+   直接 return；等 title 补上来，page 就再也没人补了。→ 在 `existed` 更新分支里补调一次 `confirmPageItem(existed)`。
+3. **同一张图记成 3~4 条**。小红书 CDN 路径是
+   `/202610181600/<随机hash>/spectrum/<fileId>!后缀`，**时间戳段和 hash 段每次请求都变**
+   （实测同一张图 16:00 是 `004ef08…`、16:05 变 `b5b96ec…`），拿整条 pathname 当身份永远对不上。
+   → `xhsImgIdentity(u)` 改成只取 `<类型>/<fileId>`；档位后缀（`!nc_n_webp_mw_1` 缩略图 vs
+   `!nd_dft_wgth_webp_3` 大图）也不算身份；头像路径 `/avatar/` 显式排除（头像 fileId 同样是
+   `1040g` 开头，裸正则会把它当成正文图）。取不到稳定段返回空串 ⇒ 放弃去重，**绝不误删**。
+4. **列表里混进噪声**。真机 dump 出来 29 条 image 里只有 7 条是正文图，其余是
+   `svg-sprite.6.57.6.svg`（82KB，骗过体积线）、信息流里**别的帖子**的 `!nc_n_webp_mw_1`
+   封面缩略图（fileId 各不相同，按身份去重根本去不掉）、无后缀随机 hex 的 UI 素材 png。
+   → `sniff:get` 里叠一层 `preferXhsNoteList()`：只要页面报过 `hint === "xhs-note"` 的直读条目，
+   就**只保留直读条目**（视频/音频不受影响）；没报过就原样返回，宁可多几条噪声也不能让列表空掉。
+
+**顺手做的两件事**（源于用户转发的「小红书去水印」iOS 快捷指令）：
+
+- 快捷指令的做法是抓分享页 HTML 正则扫 `imageList` / `masterUrl`，不碰 DOM 也不碰 webRequest，
+  因此**不受懒加载影响**。顺着这条线实测本机详情页，`__INITIAL_STATE__.note.noteDetailMap[id].note.imageList`
+  给出 7 张图、尺寸齐全、顺序就是发布顺序；而 DOM 那边 77 个带 `1040g` 的 `<img>` 里**只有 2 张解码出了尺寸**，
+  其余 `naturalWidth = 0`（swiper 轮播只渲染首张）。
+- 于是新增 `xhsNoteImages()` + `scanXhsNoteImages()`：`scanImages()` 开头先试直读，
+  `ord` 直接用数组下标（不再靠 `getBoundingClientRect` 猜阅读顺序），`w/h` 用 `imageList` 的原始像素，
+  `http://` 一律转 `https://`（否则和 webRequest 那条 https 记录分成两条）。读不到才退回原 DOM 扫描。
+- **快捷指令的 `.shortcut` 文件解不开**：文件头 `AEA1`，offset 12 起的 bplist 只有
+  `SigningCertificateChain`，真正的动作内容在加密块里，需要 Apple 设备私钥。全文件搜 `xiaohongshu`/`mp4`/`watermark`
+  零命中。用户后来提供了「已解析」版本（`小红书去水印-快捷指令解析.md`）才看到逻辑。
+
+**测试**：`main-hook.test.js` 132 → 145（新增 `[5v]` 13 项：imageList 张数 / 取大档 / http→https /
+原始尺寸 / 数组顺序 / 非详情页返回 null / 无 state 返回 null / DOM 空也能上报 / ord 下标 /
+尺寸 / 标题回退 desc / hint 标记 / 重复扫描不重复上报）；
+`background.test.js` 94 → 101（新增 `[4c]` 7 项）。真机最终：`total 7, counts {image: 7}`，
+编号 ①~⑦ 连续，7 行全部带「预览」按钮。
+
+**真机复测的坑**：`loadUnpacked` 之后**必须再刷新页面**，否则页面里仍是旧的注入脚本
+（这次表现为 `window.__msHostPort.disconnected === true`、`found` 一条都发不出去、state 里只剩 4 条 other）。
 
 ---

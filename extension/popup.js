@@ -228,10 +228,15 @@ function visibleItems() {
   return list.slice().sort((a, b) => {
     const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
     if (ka !== kb) return ka - kb;
-    // 同一条消息里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
-    // 否则默认按大小排，序号会乱掉看不出顺序
-    const ma = a.mid ? a.mid : "", mb = b.mid ? b.mid : "";
-    if (ma && mb && ma === mb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
+    // 同一组里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
+    // 否则默认按大小排，序号会乱掉看不出顺序。
+    //
+    // 判据不能只看 mid：小红书的正文图没有消息号（mid 为空），编号是
+    // background 按「整帖一组」编的（见 renumberImages 的 xhsDetail 分支），
+    // 只认 mid 会让这些图退回按大小排，列表里出现 ②⑦①⑥③④⑤ 这种乱序。
+    // 两条都编过号、且同属一组（mid 相同，或两个都没 mid）就按 idx 排。
+    const ma = a.mid || "", mb = b.mid || "";
+    if (ma === mb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     if ((b.s || 0) !== (a.s || 0)) return (b.s || 0) - (a.s || 0);
     return (b.t || 0) - (a.t || 0);
   });
@@ -331,6 +336,19 @@ function renderItem(it) {
     save.title = "在页面里弹出保存面板（数据由页面自己取，能避开 Telegram 的 512KB 限制）";
     save.addEventListener("click", () => savePageItem(it, save));
     ops.append(save);
+
+    // 预览：只对「有直接 http(s) 地址的图片/视频」给。
+    // 页面捕获条目里，图片和视频绝大多数是实打实的 CDN 直链（小红书的
+    // sns-webpic / Telegram 的 /progressive/…），popup 直接 <img src>/<video src>
+    // 就能显示，不需要页面配合——用户反馈「带标题的每行只有一个按钮」正是缺这个。
+    //
+    // 为什么不给 blob:/MSE：那两类地址只在本页主世界有效，扩展页加载不了；
+    // 点了必然报错，比没有按钮更让人困惑。
+    if (["image", "video", "audio"].includes(it.k) && /^https?:/i.test(it.u || "")) {
+      const pv = el("button", "btn", "预览");
+      pv.addEventListener("click", () => showPreview(it));
+      ops.append(pv);
+    }
 
     // 注意：不要在这里给页面媒体加「本地下载器（yt-dlp）」入口。
     // Telegram 的 /progressive/document… 是相对地址，yt-dlp 会把

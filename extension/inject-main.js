@@ -898,6 +898,78 @@
     return !!xhsVideoSource();
   }
 
+  // ---- 小红书笔记的全部配图（2026-10-18 第十一轮新增）
+  //
+  // 【为什么加】用户发来一个「小红书去水印」iOS 快捷指令，它的做法是
+  // 「把分享页 HTML 抓下来，正则扫 imageList / masterUrl」，不碰 DOM。
+  // 顺着这条线实测了本机详情页的 `__INITIAL_STATE__`，结论是**它明显更全**：
+  //
+  //   · imageList 一次给全 7 张，尺寸齐全（1672×941 / 823×770 …），
+  //     数组顺序就是作者发布顺序；
+  //   · DOM 扫描拿到的同样 7 条里有 3 条 naturalWidth=0（swiper 只渲染首张，
+  //     其余懒加载没解码），尺寸拿不到，排序只能靠 ord 猜；
+  //   · 整页带 1040g 签名的 <img> 有 77 个（信息流他帖 + 评论图），
+  //     DOM 这条路得靠「祖先链 + note-id + 评论区类名」一堆启发式去猜哪 7 张是正文——
+  //     而 imageList 本身就是「这个帖子的图」这条定义的标准答案。
+  //
+  // 【做法】优先读 imageList；读不到（页面结构变了 / 不是详情页）就返回 null，
+  // 调用方退回原来的 DOM 扫描。**不是二选一**，是「直读为主、DOM 兜底」。
+  //
+  // 【URL 取哪个】每条 imageList 项带 infoList（2 个档位），实测都是
+  //   `http://sns-webpic-qc.xhscdn.com/<ts>/<hash>/spectrum/1040g…!<后缀>`
+  // 取**最后一个**（infoList 末尾是大图档，和用户在页面上看到的一致）。
+  // 和视频一样必须把 `http://` 换成 `https://`：webRequest 抓的是 https，
+  // 两条协议会产生两个不同的 key，列表里就出现「同一张图两条」。
+
+  /** 从 __INITIAL_STATE__ 取当前帖子的全部配图（按发布顺序）
+   * @returns {Array<{url:string,w:number,h:number,fileId:string}>|null} 读不到时 null
+   */
+  function xhsNoteImages() {
+    try {
+      const id = xhsCurrentNoteId();
+      if (!id) return null;
+      const st = window.__INITIAL_STATE__;
+      const map = st && st.note && st.note.noteDetailMap;
+      if (!map) return null;
+      const entry = map[id] || map[Object.keys(map).find((k) => k === id)];
+      const note = entry && entry.note;
+      if (!note) return null;
+      const list = note.imageList;
+      if (!Array.isArray(list) || !list.length) return null;
+
+      const out = [];
+      for (const im of list) {
+        if (!im) continue;
+        // 优先 infoList 末尾（大图档）；没有再退回 urlDefault / urlPre
+        const infos = Array.isArray(im.infoList) ? im.infoList.filter((x) => x && x.url) : [];
+        const picked = infos.length ? infos[infos.length - 1].url : (im.urlDefault || im.urlPre || "");
+        const raw = String(picked || "");
+        if (!/^https?:\/\//i.test(raw)) continue;
+        const url = raw.replace(/^http:\/\//i, "https://");
+        out.push({
+          url,
+          w: im.width | 0,
+          h: im.height | 0,
+          fileId: String(im.fileId || ""),
+        });
+      }
+      return out.length ? out : null;
+    } catch (e) { return null; }
+  }
+
+  /** 当前帖子是不是「图文笔记但不带视频」（纯图片帖）。视频帖的封面由 imageList[0] 给，
+   * 下面 scanImages 用它决定要不要连封面一起上报。 */
+  function xhsNoteType() {
+    try {
+      const id = xhsCurrentNoteId();
+      if (!id) return "";
+      const st = window.__INITIAL_STATE__;
+      const map = st && st.note && st.note.noteDetailMap;
+      const entry = map && (map[id] || map[Object.keys(map).find((k) => k === id)]);
+      return String((entry && entry.note && entry.note.type) || "");
+    } catch (e) { return ""; }
+  }
+
 
   function scanMedia() {
     try {
@@ -990,8 +1062,52 @@
   }
 
 
+  /**
+   * 把 __INITIAL_STATE__ 里的 imageList 直接上报成 found。
+   *
+   * 和 DOM 扫描那条路的差别：
+   *   · ord 直接取数组下标 —— imageList 的顺序就是作者的发布顺序，
+   *     不需要再靠 getBoundingClientRect 猜阅读顺序（轮播里只有首张可见，
+   *     其余图的 rect 全是 0，猜不出来）；
+   *   · w/h 用 imageList 给的原始像素尺寸（DOM 里懒加载图 naturalWidth=0，
+   *     退回 CSS 尺寸也不准）；
+   *   · 不再走 imgBelongsToCurrentNote —— imageList 本身就是「这个帖子的图」；
+   *   · 仍然带上 title，background 靠 title 判「这条是不是内容」；
+   *   · 这里**不做图标判定**，交给 background 的 looksLikeIcon（头像/二维码
+   *     的 URL 特征那边也有兜底）。
+   */
+  function scanXhsNoteImages(noteImgs) {
+    const title = xhsNoteTitle() || "";
+    for (let i = 0; i < noteImgs.length; i++) {
+      const im = noteImgs[i];
+      const src = im.url;
+      const prev = imgCtx.get(src);
+      const w = im.w || 0, h = im.h || 0;
+      // 只在内容真的变了才上报，避免每 1.2s 重复 post 一条相同载荷
+      if (prev && prev.ord === i && prev.title === title && prev.w === w && prev.h === h
+        && prev.hint === "xhs-note") continue;
+      imgCtx.set(src, { mid: "", title, ord: i, w, h, hint: "xhs-note", inChrome: false });
+      if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
+      post({
+        cmd: "found", source: "imgctx", key: src, mime: "image/*", size: 0,
+        mid: "", title, ord: i, w, h, hint: "xhs-note", inChrome: false,
+      });
+    }
+  }
+
   function scanImages() {
     try {
+      // 小红书详情页：__INITIAL_STATE__ 里有这个帖子的完整配图清单（imageList），
+      // 比 DOM 扫描全（懒加载图 DOM 里根本没解码，尺寸是 0）、也天然只含当前帖子
+      // （不用在 77 个 1040g 的 <img> 里猜哪 7 张是正文）。读到了就走这条路，
+      // DOM 扫描整个跳过；读不到（页面结构变了）自动退回下面的老逻辑。
+      if (isXhsHost() && xhsCurrentNoteId()) {
+        const noteImgs = xhsNoteImages();
+        if (noteImgs && noteImgs.length) {
+          scanXhsNoteImages(noteImgs);
+          return; // 已由直读通路报完，不再跑 DOM 扫描
+        }
+      }
       const els = [...document.querySelectorAll("img")];
       // 一次扫描内先算好位置，避免每张图各调一次 getBoundingClientRect
       const rows = els.map((el) => {
@@ -2807,4 +2923,6 @@
   window.__msBiliPartTag = biliPartTag;     // 分P号后缀
   window.__msIsXhsHost = isXhsHost;         // 小红书排查入口
   window.__msXhsNoteId = xhsCurrentNoteId;  // 当前帖子 noteId（详情页才有）
+  window.__msXhsNoteImages = xhsNoteImages; // __INITIAL_STATE__ 直读的配图清单（测试要断言）
+  window.__msXhsNoteType = xhsNoteType;
 })();
