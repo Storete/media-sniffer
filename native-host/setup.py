@@ -209,12 +209,40 @@ def cmd_status():
     for root, label in REG_ROOTS:
         v = reg_get(root)
         out("%-8s: %s" % (label, v or "未注册"))
-    if not os.path.exists(MANIFEST) or not any(reg_get(r) for r, _ in REG_ROOTS):
+
+    # 注册表指向本目录才算「当前这份代码装好了」。
+    # 注册表指向别处 = 装的是另一份拷贝，浏览器调的是那边，改这里不会生效。
+    registered = [reg_get(r) for r, _ in REG_ROOTS]
+    registered = [v for v in registered if v]
+    mine = os.path.normcase(os.path.abspath(MANIFEST))
+    if not os.path.exists(MANIFEST):
         out("")
-        out("! 还没装（或装到了别的目录）。双击 install.bat，或跑：")
+        out("! 这份代码还没装。双击 install.bat，或跑：")
         out("    python setup.py install")
         out("  它会生成 host_manifest.json + python_path.txt 并写注册表。")
         out("  仓库里不带这两个文件——它们记录的是**本机**绝对路径，每台机器不同。")
+    elif not any(os.path.normcase(os.path.abspath(v)) == mine for v in registered):
+        out("")
+        out("! 注册表指向的是另一份拷贝：")
+        for v in dict.fromkeys(registered):
+            out("    %s" % v)
+        out("  浏览器现在调的是那里，**改当前目录的代码不会生效**。")
+        out("  要用这份代码，重跑 install.bat 覆盖注册表。")
+
+
+def cmd_build_stub():
+    """说明为什么 bin/ 不进仓库。"""
+    out("bin/ 用来放 ffmpeg，但它不进仓库——两个 exe 合计约 323 MB，")
+    out("超过 GitHub 单文件 100 MB 上限，一旦提交就会永久留在 Git 历史里。")
+    out("")
+    out("要自备的话，两条路任选：")
+    out("  1. 装到系统 PATH：  winget install Gyan.FFmpeg")
+    out("  2. 放进 %s" % PROJECT_BIN)
+    out("     ffmpeg.exe / ffprobe.exe 放进去即可，程序优先用这里的。")
+    out("")
+    out("当前状态：ffmpeg = %s" % (find_tool(["ffmpeg"]) or "未找到"))
+    ffprobe = find_tool(["ffprobe"])
+    out("          ffprobe = %s" % (ffprobe or "未找到（B 站合并需要它校验流）"))
     out("yt-dlp      : %s" % (find_tool(["yt-dlp"]) or "未找到"))
     out("ffmpeg      : %s" % (find_tool(["ffmpeg"]) or "未找到"))
     try:
@@ -252,5 +280,7 @@ if __name__ == "__main__":
         cmd_uninstall()
     elif action == "status":
         cmd_status()
+    elif action == "bin":
+        cmd_build_stub()
     else:
-        out("用法: python setup.py [install|uninstall|status]")
+        out("用法: python setup.py [install|uninstall|status|bin]")
