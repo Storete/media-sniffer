@@ -48,6 +48,14 @@ def suites():
 
 
 def main(argv):
+    # 本进程自己的输出也强制 UTF-8：CI 的 Windows runner 默认 cp1252，
+    # 否则汇总行里的中文会直接把脚本搞崩。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     if "--list" in argv:
         for n in suites():
             print(n)
@@ -69,12 +77,19 @@ def main(argv):
             continue
 
         start = time.time()
+        # Windows 上子进程的 stdout 默认走 ANSI 代码页（CI runner 是 cp1252），
+        # 一 print 中文就 UnicodeEncodeError。强制 UTF-8，两个变量都要设：
+        # PYTHONIOENCODING 管 sys.stdout 的编码，PYTHONUTF8 管文件系统/默认编码。
+        child_env = dict(os.environ)
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
         try:
             p = subprocess.run(
                 [sys.executable, os.path.join(HERE, name)],
                 capture_output=True,
                 timeout=TIMEOUT,
                 cwd=HERE,
+                env=child_env,
             )
             out = (p.stdout or b"").decode("utf-8", "replace")
             err = (p.stderr or b"").decode("utf-8", "replace")
