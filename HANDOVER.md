@@ -338,8 +338,8 @@ python native-host\setup.py status
 
 **跑测试**
 ```
-# 注意：本机 bash 里没有 node，用下面这个绝对路径
-N="<HOME>/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe"
+# 注意：本机 bash 里没有 node，用 node 的绝对路径（下面写成 <NODE>）
+N="<NODE>"
 "$N" test/main-hook.test.js                 # 81 项，应全过
 "$N" test/range_parallel.test.js            # 9 项，Range 下载并发上限（PARALLEL 必须是 4）
 "$N" test/background.test.js                # 34 项，定时器白名单 + 图标/序号判定
@@ -1344,7 +1344,7 @@ video: 4    ← 其中 __bili_dash__ 带真实标题，其余 m1/m2/blob 是 MSE
 - **启动带调试端口的 Chrome**（验证时用）：`start_chrome_debug.ps1`，用用户的 `Default` profile + `--remote-debugging-port=9222 --remote-allow-origins=*`。注意：同一 profile 不能同时被两个 Chrome 实例占用，先关掉用户自己的浏览器。
 - **在干净环境验证扩展，用 Edge 而不是 Chrome**：Chrome 155 已禁用 `--load-extension`（详见上一节的三条尝试），Edge 155 仍可用。`cdp_edge_launch.js` 起在 9334 端口、独立 profile，不影响用户自己的浏览器。
 - **确认扩展注册状态**：`<HOME>\AppData\Local\Google\Chrome\User Data\Default\Secure Preferences` → `extensions.settings.fofimjophfaibckjioaffoglkidppifo`，`path` 应为 `D:\WB工作区\media-sniffer\extension`，`location: 4`（解压加载）。
-- **验证脚本**（`D:\WB工作区\media-sniffer\`，统一用 `"<HOME>/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/node/bin/node.exe" xxx.js` 跑）：
+- **验证脚本**（`D:\WB工作区\media-sniffer\`，统一用 `"<NODE>" xxx.js` 跑）：
   - `cdp_e2e_bili.js` —— **B 站 popup 端到端**：打印页面侧 hook/`__playinfo__`/paused、background 里的 `__bili_dash__` 条目、以及模拟 `sniff:get` 后 popup 实际拿到的内容。
   - `cdp_e2e_icon.js` —— **图标过滤端到端**：打开 Telegram 后统计 `k === "icon"` 是否还在 visible 列表里（未登录时页面为空，结果会是 total:0，属正常）。
   - `cdp_e2e_check.js` —— state 总览（各 tab 的 url / 条目数 / 分类计数）。
