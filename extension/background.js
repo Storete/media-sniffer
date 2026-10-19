@@ -424,6 +424,9 @@ function recordPageMedia(tabId, pageUrl, p) {
   // 晚到（播放器挂载后 MSE hook 才建 m1），放进 existed 分支里就永远轮不到。
   if (kind === "video" && p.hint === "xhs-note") {
     rec.xhsVid = isHttp ? mapKey : "";
+    // 记住「这个真实地址属于哪个帖子」——下面的拦截只对同一个 noteId 生效。
+    // 页面侧 reportXhsVideo 会把 noteId 带上来；没带就退回「不过滤」（宁可多留）。
+    if (isHttp && p.noteId) rec.xhsVidNote = String(p.noteId);
     let dropped = 0;
     for (const [itKey, it] of [...rec.items]) {
       if (it.k !== "video") continue;
@@ -440,7 +443,16 @@ function recordPageMedia(tabId, pageUrl, p) {
   //
   // 只做「事后清理」不够：页面每 0.6s 扫一次 <video>，会把 m1/m2 一遍遍
   // 重新播报回来，列表里就永远挂着一个「页面视频（录制中）」。
-  if (!p.hint && rec.xhsVid && kind !== "image" && (p.source === "mse" || /^blob:|^m\d+$/.test(String(key)))) {
+  //
+  // ⚠️ 必须按 noteId 隔离，不能是 tab 级开关。
+  // 旧实现 `if (rec.xhsVid && ...) return;` 是整页共享的：在本帖看过视频之后，
+  // 页面切到另一个帖子（SPA 不换 tab）时，新帖子的 blob/MSE 条目**全被拦掉**，
+  // 表现就是「换了个视频就抓不到了」。用户报的「一个功能好了另一个就失效」，
+  // 有一半来自这类共享状态。现在只拦「当前这个 noteId 已经有真实地址」的情况。
+  const xhsVidNote = rec.xhsVidNote || "";
+  const curNote = p.noteId || "";
+  if (!p.hint && rec.xhsVid && xhsVidNote && curNote && xhsVidNote === curNote
+      && kind !== "image" && (p.source === "mse" || /^blob:|^m\d+$/.test(String(key)))) {
     return;
   }
 
@@ -459,6 +471,7 @@ function recordPageMedia(tabId, pageUrl, p) {
     if (p.ct) existed.m = p.ct;
     if (typeof p.ord === "number") existed.ord = p.ord;
     if (p.hint) existed.hint = p.hint;
+    if (p.noteId) existed.noteId = p.noteId;
     if (typeof p.inChrome === "boolean") existed.ic = p.inChrome ? 1 : 0;
     // 已有条目也要跟着 mime 修正分类：同一 URL 先被当成 video 上报、
     // 后来才拿到 image/jpeg 的情况（Telegram 媒体查看器复用 <video> 元素）会
@@ -507,6 +520,7 @@ function recordPageMedia(tabId, pageUrl, p) {
     ref: p.ref || "",
     ord: typeof p.ord === "number" ? p.ord : -1,
     hint: p.hint || "",
+    noteId: p.noteId || "",
     ic: p.inChrome ? 1 : 0,
   });
   if (p.own) rec.items.get(mapKey).own = 1;

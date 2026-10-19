@@ -81,6 +81,56 @@ check("scanImages 走 site.onScanImages（清单通路）", /site\.onScanImages/
 check("scanMedia 走 site.videoSrc / owns",
   /site\.videoSrc/.test(bodyOf("scanMedia") || "") || /site\.owns/.test(bodyOf("scanMedia") || ""));
 
+console.log("\n[A0-4] 下载层也不许出现站点专属判断（2026-10-19 第二轮模块化）");
+//
+// 背景：扫描层模块化之后，下载调度层还留着 4 处硬编码 ——
+//   startMediaDownload 的 `const useBili = isBiliHost() && biliPlayinfo()`
+//   overlayShow/runSave 的 `if (isBiliHost() && biliPlayinfo())`
+//   overlayShow 底部文案的 `isBiliHost() ? "B 站走完整流…" : "…"`
+//   beginSaveBatch 的 `biliSig = ""`
+// 它们让「加一个新站点」必须回去改通用函数。现在统一走站点对象：
+//   canFeedDownload / feedDownload / saveHint / onSaveStart
+
+check("有 siteCanFeed() 统一入口", /function siteCanFeed\(/.test(SRC));
+check("有 siteSaveHint() 统一入口", /function siteSaveHint\(/.test(SRC));
+check("有 siteResetReport() 统一入口", /function siteResetReport\(/.test(SRC));
+
+const DL_GENERIC = ["startMediaDownload", "overlayShow", "beginSaveBatch"];
+for (const fn of DL_GENERIC) {
+  const body = bodyOf(fn);
+  if (body === null) { check(`能定位到 ${fn}()`, false); continue; }
+  const code = body
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  // overlayShow 里的 runSave 是闭包，bodyOf 拿不到它，单独测（见下）
+  const hit = SITE_HINTS.find((re) => re.test(code));
+  check(`${fn}() 里没有站点专属判断`, !hit, hit ? String(hit) : undefined);
+}
+
+// runSave 是 overlayShow 内部的闭包 —— 单独抠出来测
+const runSaveStart = SRC.indexOf("const runSave = (it, btn) =>");
+const runSaveEnd = runSaveStart < 0 ? -1 : SRC.indexOf("\n    };", runSaveStart);
+const runSaveBody = runSaveStart < 0 ? "" : SRC.slice(runSaveStart, runSaveEnd);
+check("能定位到 overlayShow 里的 runSave", runSaveStart >= 0 && runSaveEnd > runSaveStart);
+check("runSave 里没有站点专属判断",
+  !SITE_HINTS.find((re) => re.test(runSaveBody.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, ""))));
+check("runSave 走 siteCanFeed", /siteCanFeed\(/.test(runSaveBody));
+
+console.log("\n[A0-5] 下载层钩子确实被通用函数用上了");
+
+check("startMediaDownload 走 siteCanFeed", /siteCanFeed\(/.test(bodyOf("startMediaDownload") || ""));
+check("startMediaDownload 走 site.feedDownload",
+  /\.feedDownload\b/.test(bodyOf("startMediaDownload") || ""));
+check("overlayShow 底部文案走 siteSaveHint", /siteSaveHint\(\)/.test(bodyOf("overlayShow") || ""));
+check("hello/rescan 重报走 siteResetReport", /siteResetReport\(\)/.test(SRC));
+
+// B 站站点对象必须把 4 个下载层钩子都实现，否则泄漏只是换了个位置
+const biliPush = (SRC.match(/SITES\.push\(\{\s*\n\s*name:\s*"bilibili"[\s\S]*?\n  \}\);/) || [""])[0];
+check("注册了 bilibili 站点对象", biliPush.length > 0);
+for (const hook of ["canFeedDownload", "feedDownload", "saveHint", "onSaveStart"]) {
+  check(`bilibili 实现了 ${hook}`, new RegExp(hook + "\\s*:").test(biliPush));
+}
+
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

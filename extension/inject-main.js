@@ -574,6 +574,12 @@
   //   feedImages()         当前内容的「完整清单」（如小红书 imageList），没有就返回 null
   //   onScanImages()       每轮图片扫描前的站点钩子（清单类站点在这里一次性上报）
   //
+  // ── 下载层钩子（2026-10-19 第二轮模块化加，之前这些判断硬编码在通用函数里）──
+  //   canFeedDownload(ctx) 这个站点能否接管下载（B 站有 __playinfo__ 时走 DASH）→ true
+  //   feedDownload(name, ctrl, onProgress, onStage)  站点自己的下载实现（返回下载结果）
+  //   saveHint()           浮层底部说明文案（站点专属话术），返回 "" 用通用文案
+  //   onSaveStart()        重置站点自己的上报状态（B 站清去重签名）
+  //
   // 注意定义顺序：这些函数都是 `function` 声明（函数提升），SITES 里的引用
   // 在**调用时**才解析，所以小红书的实现写在本段之后也没问题。
   const SITES = [];
@@ -585,6 +591,27 @@
       }
     } catch (e) { /* 忽略 */ }
     return null;
+  }
+
+  /** 当前站点能否接管下载（有自己更完整的流，比如 B 站的 DASH 清单）。 */
+  function siteCanFeed(ctx) {
+    const s = activeSite();
+    if (!s || !s.canFeedDownload) return false;
+    try { return !!s.canFeedDownload(ctx); } catch (e) { return false; }
+  }
+
+  /** 浮层底部说明文案：站点给了专属话术就用，否则用通用文案。 */
+  function siteSaveHint() {
+    const s = activeSite();
+    if (!s || !s.saveHint) return "";
+    try { return s.saveHint() || ""; } catch (e) { return ""; }
+  }
+
+  /** 让当前站点重置自己的上报状态（签名等），以便重新播报条目。 */
+  function siteResetReport() {
+    const s = activeSite();
+    if (!s || !s.onSaveStart) return;
+    try { s.onSaveStart(); } catch (e) { /* 忽略 */ }
   }
 
   // ------------------------------------------------------------ 小红书：只抓当前帖子
@@ -1281,11 +1308,14 @@
       mime: "video/mp4", ext: ".mp4",
       w: real.w | 0, h: real.h | 0, dur: real.duration ? Math.round(real.duration / 1000) : 0,
       title, mid: "", ord: 0, ref: "", hint: "xhs-note",
+      // noteId 必须带上去：background 靠它把「真实地址 → 帖子」绑定起来，
+      // 这样「拦掉 blob/MSE 分片」只对这一个帖子生效，换帖子后新视频照常能抓。
+      noteId,
     };
     post(payload);
     // 宽高/时长/序号也走 progress，popup 打开时即使 found 发生在很久以前
     //（background 里已有该条目），这些字段也能补上。
-    post({ cmd: "progress", key: url, w: payload.w, h: payload.h, dur: payload.dur, ord: 0, title, hint: "xhs-note" });
+    post({ cmd: "progress", key: url, w: payload.w, h: payload.h, dur: payload.dur, ord: 0, title, hint: "xhs-note", noteId });
     // 同时把「视频没有 <video> 元素」这件事也当作已见，避免之后 handleMediaSrc
     // 再发一条不带 hint 的重复 found。
     try {
@@ -2654,6 +2684,37 @@
     try { return /(^|\.)bilibili\.com$/i.test(location.hostname); } catch (e) { return false; }
   }
 
+  // ---- B 站站点对象（下载层钩子）----
+  //
+  // 以前 `startMediaDownload` 里写死 `const useBili = isBiliHost() && biliPlayinfo()`、
+  // `overlayShow` 里写死 `if (isBiliHost() && biliPlayinfo())`、
+  // `beginSaveBatch` 里写死 `biliSig = ""` —— 通用层认识 B 站，加第二个站点就得再改一遍。
+  // 现在这些判断都收进这个对象，通用层只问 siteCanFeed()/siteSaveHint()/siteOnSaveStart()。
+  SITES.push({
+    name: "bilibili",
+    match: () => isBiliHost(),
+
+    // 有 __playinfo__ 的 DASH 清单才接管；没有（比如首页/动态页）就老实走通用 Range 下载
+    canFeedDownload: (ctx) => !!(biliPlayinfo() && (ctx && ctx.bili !== "off")),
+
+    // 站点自己的下载实现：完整 DASH 流（与播放进度无关）
+    feedDownload: (name, ctrl, onProgress, onStage) => runBiliDownload({
+      name,
+      onProgress,
+      onStage,
+      signal: ctrl && ctrl.signal,
+    }),
+
+    // 浮层底部说明：B 站是音视频分开落盘、需要 ffmpeg 合并
+    saveHint: () => (biliPlayinfo()
+      ? "B 站走完整流抓取（视频流 + 音频流分开落盘），与播放进度无关。"
+        + "下载完成后会用 bin/ 目录自带的 ffmpeg 自动合并成单文件。"
+      : ""),
+
+    // 每次开始保存前清空上报签名：否则 SPA 换集后签名不变，popup 标题停在旧集
+    onSaveStart: () => { biliSig = ""; },
+  });
+
   function guessExtFromType(ct) {
     const m = (ct || "").toLowerCase();
     if (m.startsWith("audio/")) return extOf(m) === ".bin" ? ".m4a" : extOf(m);
@@ -2924,14 +2985,15 @@
     const t0 = Date.now();
     startUiHeartbeat();
     try {
-      const useBili = isBiliHost() && biliPlayinfo() && (ctx && ctx.bili !== "off");
-      const r = useBili
-        ? await runBiliDownload({
-            name,
-            onProgress: (got, total, speed) => uiProgress(got, total, speed, name),
-            onStage: (text, pct) => uiStage(text, pct),
-            signal: ctrl.signal,
-          })
+      // 站点能否接管下载（B 站有 __playinfo__ 时走完整 DASH 流）。
+      // 通用层不再写 `isBiliHost()`：加新站点只要在 SITES 里实现 canFeedDownload。
+      const useSite = siteCanFeed(ctx);
+      const site = useSite ? activeSite() : null;
+      const r = (site && site.feedDownload)
+        ? await site.feedDownload(
+            name, ctrl,
+            (got, total, speed) => uiProgress(got, total, speed, name),
+            (text, pct) => uiStage(text, pct))
         : await runRangeDownload({
             key,
             name,
@@ -2950,8 +3012,8 @@
       post({
         cmd: "saved", key, ok: true, filename: r.filename, files: r.files || null,
         size: r.received,
-        format: useBili
-          ? (r.merged ? "B 站完整流（已合并单文件）" : "B 站完整流（视频+音频分开）")
+        format: useSite
+          ? (r.merged ? "完整流（已合并单文件）" : "完整流（视频+音频分开）")
           : "Range 链式下载",
         mode: "page",
       });
@@ -3034,8 +3096,9 @@
     // 真正的「保存」动作抽出来：底部右下的保存按钮和每行的点击都走这里
     const runSave = (it, btn) => {
       // 关键：点击事件在手势栈里，直接发起保存
-      // B 站：blob/MSE 只是「看到哪儿就录到哪儿」，一律改走完整流
-      if (isBiliHost() && biliPlayinfo()) {
+      // 站点能接管下载时（B 站有 __playinfo__）：它那儿的 blob/MSE 只是「看到哪儿
+      // 就录到哪儿」，一律让站点走自己的完整流。通用层不再写 isBiliHost()。
+      if (siteCanFeed({ bili: "on" })) {
         overlayClose();
         startMediaDownload(it.key, it.name, { bili: "on" }, () => {});
         return;
@@ -3093,9 +3156,9 @@
     ].join(";");
     const footText = document.createElement("div");
     footText.style.cssText = "flex:1;min-width:0;font-size:11.5px;opacity:.55;line-height:1.45";
-    footText.textContent = isBiliHost()
-      ? "B 站走完整流抓取（视频流 + 音频流分开落盘），与播放进度无关。下载完成后会用 bin/ 目录自带的 ffmpeg 自动合并成单文件。"
-      : "媒体由页面自己分段取回，直接写入本地下载器目录。多个文件会依次保存。";
+    // 站点专属话术由站点对象给（siteSaveHint），通用层不认识任何站点
+    footText.textContent = siteSaveHint()
+      || "媒体由页面自己分段取回，直接写入本地下载器目录。多个文件会依次保存。";
 
     const saveBtn = document.createElement("button");
     saveBtn.textContent = items.length > 1 ? `全部保存（${items.length}）` : "保存到本地";
@@ -3190,8 +3253,8 @@
       for (const entry of mse.values()) {
         post({ cmd: "found", source: "mse", key: entry.id, size: entry.size, mime: entry.mime, ext: extOf(entry.mime), live: true });
       }
-      // 扩展重载后 background 状态被清，重置签名以便重报 B 站 DASH 条目
-      biliSig = "";
+      // 扩展重载后 background 状态被清，让站点重置自己的上报签名，以便重报条目
+      siteResetReport();
       reportBiliDash();
       return;
     }

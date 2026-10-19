@@ -224,6 +224,31 @@ async function load() {
   if (siteBlocked()) renderBlocked();
   else renderList();
   updateBatchBar();
+
+  // 「扩展重载后页面没刷新」的提示：content.js 发现 context invalidated 时会往
+  // 页面 post 一条 __ms_sniffer_stale，这里顺手问一句页面脚本还在不在。
+  // 不弹窗、不拦路，只把话说清楚，省得用户以为功能坏了。
+  pingPageScript();
+}
+
+/**
+ * 检查当前页的内容脚本是否还活着。
+ *
+ * 为什么需要这个：inject-main.js 是**页面注入脚本**，重载扩展不会重新注入
+ * 已打开的页面。用户重载后不刷新，页面里跑的还是旧脚本（甚至已失效），
+ * 列表看起来"什么都没抓到"，但代码本身没问题。后台没法替用户刷新，
+ * 只能在这里明确提示一句。
+ */
+async function pingPageScript() {
+  if (tabId == null) return;
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: "ms:ping" }, { frameId: 0 });
+    if (pong && pong.ok) return;  // 活着，什么都不说
+  } catch (e) {
+    // 连接失败 = 内容脚本没了（页面没刷新 / 扩展刚重载）
+  }
+  $("#hint").textContent = "本页脚本已失效（扩展更新过），点右上角 ⟳ 重新载入页面";
+  setTimeout(() => ($("#hint").textContent = ""), 8000);
 }
 
 // ---------------------------------------------------------------- 屏蔽 / 重扫 / 批量选择

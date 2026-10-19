@@ -39,9 +39,32 @@
     try {
       chrome.runtime.sendMessage({ type: "ms:page", payload: d });
     } catch (err) {
-      // 扩展被重载/失效时 context invalidated，忽略
+      // 扩展被重载/失效时 context invalidated。
+      //
+      // ⚠️ 这里以前是**完全静默**的 —— 结果是「扩展重载后没刷新页面」时，页面里
+      // 所有 found 消息全部无声丢失，用户看到的就是「什么都没抓到」，却没有任何
+      // 线索指向真正的原因。现在只提示一次（避免每 600ms 刷一条），并在页面上
+      // 给一条看得见的话：让人立刻知道该刷新页面，而不是去怀疑功能坏了。
+      warnInvalidatedOnce(err);
     }
   });
+
+  /** 扩展上下文失效时，只警告一次（刷屏比沉默更难查）。 */
+  let warnedInvalidated = false;
+  function warnInvalidatedOnce(err) {
+    if (warnedInvalidated) return;
+    warnedInvalidated = true;
+    const msg = String((err && err.message) || err || "");
+    // 只有「真的失效」才提示；其它异常（比如消息太大）不该被当成失效
+    if (!/context invalidated|extension context|receiving end/i.test(msg)) return;
+    console.warn("[资源嗅探] 扩展已更新过，本页的嗅探脚本已失效 —— 请刷新页面后重试。", msg);
+    try {
+      window.postMessage({
+        __ms_sniffer_stale: true,
+        text: "资源嗅探扩展刚更新过，本页需要刷新一次才能继续工作。",
+      }, "*");
+    } catch (e) { /* 忽略 */ }
+  }
 
   let hostPort = null;
 
@@ -86,6 +109,11 @@
       // 重载页面反而会丢掉已缓冲的媒体，所以给一个「就地重扫」的入口。
       toPage({ cmd: "rescan" });
       sendResponse({ ok: true });
+    } else if (msg.type === "ms:ping") {
+      // popup 打开时用来判断「本页脚本还活着吗」。
+      // 能走到这里就说明 content.js 还在；页面主世界的 inject-main 是否还活着
+      // 由它自己的 hello 决定，这里只回一个基本存活信号。
+      sendResponse({ ok: true, alive: true });
     }
     return true;
   });
