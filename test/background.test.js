@@ -638,6 +638,41 @@ check("首页（非详情页）不误编号",
   [...recHome.items.values()].every((x) => !x.mark),
   [...recHome.items.values()].map((x) => x.mark));
 
+// A1（用户 m06550）：「既然标题不一样就不要加序号了」。
+// 真机现场：首页信息流封面各自带不同标题（xhsFeedTitle 补的），
+// 结果每张都进了「有标题」分支、被编成各自的 ①，列表里一片「①、①、①」。
+const recHomeTitled = mkRec([
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeedA!x", k: "image", ord: 0, t: 1, title: "千万不要点这个肯德基的虾仁肉堡" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeedB!x", k: "image", ord: 1, t: 2, title: "好像 Maybe Tomorrow" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeedC!x", k: "image", ord: 2, t: 3, title: "存一个血糖爆炸的食物秋秋没烦恼" },
+], "https://www.xiaohongshu.com/explore");
+renumberImages(recHomeTitled);
+check("A1 首页信息流封面有标题也不编号（标题不同就不该有序号）",
+  [...recHomeTitled.items.values()].every((x) => !x.mark && !x.idx),
+  [...recHomeTitled.items.values()].map((x) => [x.title.slice(0, 6), x.mark]));
+
+// 但详情页仍然必须编号：同一帖子的多张图属于一组
+const recDetailStill = mkRec([
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gdetA!x", k: "image", ord: 0, t: 1, title: "帖子标题", hint: "xhs-note" },
+  { u: "https://sns-webpic-qc.xhscdn.com/a/1040gdetB!x", k: "image", ord: 1, t: 2, title: "帖子标题", hint: "xhs-note" },
+], XHS_DETAIL);
+renumberImages(recDetailStill);
+check("A1 详情页不受影响，仍然按 ord 编号 ①②",
+  recDetailStill.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gdetA!x").mark === "①"
+  && recDetailStill.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gdetB!x").mark === "②",
+  [...recDetailStill.items.values()].map((x) => x.mark));
+
+// 非小红书站点（比如 Telegram 相册）有标题有 mid，照常编号
+const recTgAlbum = mkRec([
+  { u: "https://cdn.telegram.org/a.jpg", k: "image", mid: "42", ref: "album", t: 1 },
+  { u: "https://cdn.telegram.org/b.jpg", k: "image", mid: "42", ref: "album", t: 2 },
+], "https://web.telegram.org/a/");
+renumberImages(recTgAlbum);
+check("A1 非小红书站点照常编号（没被误伤）",
+  recTgAlbum.items.get("https://cdn.telegram.org/a.jpg").mark === "①"
+  && recTgAlbum.items.get("https://cdn.telegram.org/b.jpg").mark === "②",
+  [...recTgAlbum.items.values()].map((x) => x.mark));
+
 console.log("\n[4d] 通用图片去重（借鉴 CocoCut 去 query 签名）+ 身份");
 // identityOf：host + pathname，去掉 query 和 hash
 check("身份 = host + pathname（去 query）",
