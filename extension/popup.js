@@ -1042,7 +1042,7 @@ async function deleteHistoryItem(time, box) {
   if (!list.length) { historyShown = false; renderHistory(null, true); }
 }
 
-/** 渲染「本次记录」面板；hideNow=true 时只收起不重取 */
+/** 渲染「下载记录」面板；hideNow=true 时只收起不重取 */
 function renderHistory(items, hideNow) {
   const box = $("#history");
   if (hideNow || !items || !items.length) {
@@ -1052,7 +1052,7 @@ function renderHistory(items, hideNow) {
   }
   box.innerHTML = "";
   const h = document.createElement("h4");
-  h.append("本次下载记录");
+  h.append("下载记录");
   const clr = document.createElement("button");
   clr.textContent = "清空";
   clr.addEventListener("click", async () => {
@@ -1098,7 +1098,7 @@ function renderHistory(items, hideNow) {
   box.classList.remove("hidden");
 }
 
-/** 「本次记录」按钮：切显隐；每次展开都现取 session storage（保证是最新） */
+/** 「下载记录」按钮：切显隐；每次展开都现取 session storage（保证是最新） */
 let historyShown = false;
 $("#historyBtn").addEventListener("click", async () => {
   historyShown = !historyShown;
