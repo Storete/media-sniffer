@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-019](#d-019) | 2026-10-19 | A2：B 站图片只留当前视频封面 | state 取封面 + isImageOnly 过滤，测试桩 FakeURL 教训 |
 | [d-018](#d-018) | 2026-10-19 | 复查 1.3.11：noteId 闸从未生效 | blob/MSE 上报统一补 noteId 让闸可达，另修 4 处提示链路 |
 | [d-017](#d-017) | 2026-10-19 | 「一个功能好了另一个就失效」的机制追问 | 拆掉 4 处下载层站点泄漏 + 修 2 个 tab 级共享状态 |
 | [d-016](#d-016) | 2026-10-19 | B 站视频条目没标题（「完整 DASH 流」占位文案） | `biliTitle()` 改成 `__INITIAL_STATE__` 优先，空标题不再伪造站名 |
@@ -34,6 +35,25 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-019"></a>
+## #d-019 · 2026-10-19 · A2：B 站图片只留所点开视频的封面
+
+**问题**：用户 m11900 第 2 条——「B站的图片获取我想改为仅获取所点开视频的封面」。B 站视频页 DOM 里的 `<img>` 全是噪声（头像、推荐位、广告、直播卡），用户要的只有当前视频那张封面。
+
+**排查**：class 选择器随 B 站改版会变（d-016 刚吃过亏）；唯一稳的判据是「是不是 `__INITIAL_STATE__` 里那个 cover」。`videoData.pic` 是协议相对 `//i0.hdslb.com/...` 且可能带 `http://`，必须规整成 https，否则和 webRequest 抓到的 https 条目对不上。
+
+**解决方案**（`extension/inject-main.js`）：
+- `biliCoverImage()`：候选 `videoData.pic` → `vd.cover` → `epInfo.cover` → `mediaInfo.cover` → `videoData.pages[0].first_frame`，`norm()` 规整协议；返回 `{url, title: biliTitle()}`。
+- 站点钩子 `onScanImages`：有 `__playinfo__` 且拿到封面时，直接发一条 `hint:"bili-cover"` 的 found 并接管本次扫描（return true）；拿不到封面则 return false 退回通用扫描——宁可多抓也不漏。
+- 站点钩子 `isImageOnly`：视频页上非封面的 `<img>` 一律拦下；`biliIsCoverSrc(src, cover)` 用 `new URL(u, location.href)` 取 hostname+pathname、`replace(/@[^/]*$/,"")` 去掉 CDN 的 `@672w_378h` 尺寸段后比对——同一张封面带 query 或 @ 尺寸段都认得。
+
+**教训（测试桩）**：
+1. vm 裸脚本里顶层标识符 `URL` 解析的是 **context 顶层属性**，不是 `window.URL`——`sandbox.window.URL = URL` 无效，必须 `sandbox.URL = URL`（用完换回去）。
+2. 测试里的 `FakeURL` 只解析 href、没有 hostname/pathname，`biliIsCoverSrc` 的 `cut()` 拿到 undefined 全返回 ""，断言全 false 且不报错——**假桩让函数「静默说谎」，先怀疑桩再怀疑实现**。
+3. 测试不能引用别的用例块里的局部函数（`toTelegram()` 是 `[12]` 块内局部函数），清场直接赋值恢复 `sandboxLocation`。
 
 ---
 

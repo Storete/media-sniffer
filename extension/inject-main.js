@@ -1248,6 +1248,7 @@
   setInterval(reportBiliDash, 2500);
   window.__msBiliTitle = biliTitle;          // 供排查「B 站标题取不到」
   window.__msReportBiliDash = reportBiliDash; // 供排查「条目没上报」
+  window.__msActiveSite = activeSite;        // 供测试直接调站点钩子（isImageOnly 等）
 
   // ------------------------------------------------------------ 2d. 图片的 DOM 上下文
   //
@@ -2714,6 +2715,70 @@
     });
   }
 
+  /**
+   * B 站当前视频的封面图地址（A2：只取所点开视频的封面）。
+   *
+   * 为什么不用 DOM 扫：视频页上 `<img>` 有一大堆——UP 主头像、推荐位封面、
+   * 广告位、番剧卡片——它们的天然尺寸和 class 都没法可靠区分。而「当前视频
+   * 的封面」在 `__INITIAL_STATE__` 里是明确的一个字段，与 DOM 是否渲染、
+   * 推荐位加载了多少张全都无关。
+   *
+   * 取值顺序（新版 → 旧版）：
+   *   1. videoData.pic         投稿视频（/video/BV…）：//i0.hdslb.com/bfs/archive/xxx.jpg
+   *   2. epInfo.cover          番剧单集
+   *   3. mediaInfo.cover       番剧总封面
+   *   4. videoData.pages[0].first_frame   分P 首帧（前面都没有时的兜底）
+   *
+   * 返回 `{url, title}`；拿不到返回 null（调用方退回 DOM 扫描，宁可多抓不可漏抓）。
+   */
+  function biliCoverImage() {
+    const norm = (u) => {
+      const s = String(u || "").trim();
+      if (!s) return "";
+      // 协议相对地址（//i0.hdslb.com/...）在页面里就是 https，补全后才能和
+      // webRequest 记下来的 https 条目对上（否则同一张图两条记录）。
+      if (s.startsWith("//")) return "https:" + s;
+      if (s.startsWith("http://")) return s.replace(/^http:\/\//i, "https://");
+      return s;
+    };
+    try {
+      const s = window.__INITIAL_STATE__ || {};
+      const vd = s.videoData || {};
+      const cands = [
+        vd.pic,
+        vd.cover,
+        s.epInfo && s.epInfo.cover,
+        s.mediaInfo && s.mediaInfo.cover,
+        vd.pages && vd.pages[0] && vd.pages[0].first_frame,
+      ];
+      for (const c of cands) {
+        const u = norm(c);
+        if (/^https?:\/\//i.test(u)) return { url: u, title: biliTitle() };
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /**
+   * B 站页面上的某一类图要不要收（A2）。
+   *
+   * 用户在 B 站视频页只想要「所点开视频的封面」，不要推荐位/头像/广告。
+   * 判据用「是不是 __INITIAL_STATE__ 里那个封面 URL」，比猜 class 稳得多；
+   * 同一张封面在 CDN 上常有带 `@` 尺寸参数 / 不带参数的两种写法，
+   * 所以比较时只比路径部分（去 query、去 `@…` 后缀）。
+   */
+  function biliIsCoverSrc(src, coverUrl) {
+    if (!src || !coverUrl) return false;
+    const cut = (u) => {
+      try {
+        const x = new URL(u, location.href);
+        return (x.hostname.toLowerCase() + x.pathname).replace(/@[^/]*$/, "");
+      } catch (e) { return ""; }
+    };
+    const a = cut(src), b = cut(coverUrl);
+    return !!a && a === b;
+  }
+
   function isBiliHost() {
     try { return /(^|\.)bilibili\.com$/i.test(location.hostname); } catch (e) { return false; }
   }
@@ -2751,6 +2816,45 @@
     // hello/rescan 回放时重报 DASH 合成条目（上面 siteResetReport 已清签名，
     // 这里才会真的再发一条 found 而不是被签名去重挡掉）
     replayReport: () => reportBiliDash(),
+
+    // A2 用户诉求：「B 站的图片获取我想改为仅获取所点开视频的封面」。
+    //
+    // 视频页（有 __playinfo__）上 DOM 里的 <img> 全是噪声：UP 主头像、推荐位
+    // 封面、广告位、番剧卡片。它们的 class 会随改版变，唯一稳的判据是
+    // 「这张图是不是 __INITIAL_STATE__ 里那个 cover」。
+    //
+    // 返回 true 表示「这轮 B 站自己报完了，通用 DOM 扫描不用跑了」；
+    // 返回 false（拿不到封面，比如首页/动态页/state 还没就绪）就走通用逻辑，
+    // 宁可多抓也不漏抓——用户报「抓不到」比「多了几张」更难处理。
+    onScanImages: () => {
+      if (!biliPlayinfo()) return false;   // 不是视频页，不接管
+      const cover = biliCoverImage();
+      if (!cover.url) return false;        // state 没就绪，退回 DOM 扫描
+      // 只报封面这一张。source 用 httpmedia（与 webRequest 记下的条目同源合并），
+      // hint 不带 xhs-note，避免被小红书那套「分片让位」规则误伤。
+      post({
+        cmd: "found",
+        source: "httpmedia",
+        key: cover.url,
+        size: 0,
+        mime: "image/*",
+        ext: "",
+        w: 0, h: 0,
+        title: cover.title || "",
+        mid: "", ord: 0, ref: "",
+        hint: "bili-cover",
+      });
+      return true;
+    },
+
+    // 视频页的图片只认封面（onScanImages 已接管；这里是兜底，防 onScanImages
+    // 因 state 未就绪返回 false 之后 DOM 扫描又把一堆推荐图放进来）
+    isImageOnly: (el, src) => {
+      if (!biliPlayinfo()) return true;    // 非视频页不限制
+      const cover = biliCoverImage();
+      if (!cover.url) return true;         // 拿不到封面就不过滤（宁可多抓）
+      return biliIsCoverSrc(src, cover.url);
+    },
   });
 
   function guessExtFromType(ct) {

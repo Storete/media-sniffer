@@ -430,11 +430,11 @@ onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不�
 |---|---|---|---|
 | A1 | 首页信息流封面不加序号 | 已修：`renumberImages()` 里小红书非详情页「有标题就跳过编号」 | **已完成** [d-015](DEVLOG.md#d-015) |
 | A0b | B 站视频条目没标题（显示占位文案「完整 DASH 流」） | `biliTitle()` 改为 `__INITIAL_STATE__` 优先、DOM 兜底、空则返回 `""` | **已完成** [d-016](DEVLOG.md#d-016) |
-| A2 | B 站图片只取所点开视频的封面 | `inject-main.js` 的 `scanImages()` 加 B 站站点钩子，只留 `videoData.pic`，标题复用 `biliTitle()` | 待办 |
+| A2 | B 站图片只取所点开视频的封面 | **已完成（1.3.13）**：`biliCoverImage()` 从 `__INITIAL_STATE__` 取封面（候选 videoData.pic → epInfo.cover → mediaInfo.cover 等），站点钩子 `onScanImages` 发 `hint:"bili-cover"` 条目并接管扫描、`isImageOnly` 拦下视频页其余 img（`biliIsCoverSrc` 去 `@尺寸段` 比对）。详见 [d-019](DEVLOG.md#d-019) | 已完成 |
 | A3 | Telegram 视频和图片下载全部失效 | 先真机复现：重载扩展 → 打开 Telegram → 点保存，看断在 `fetchRange` 还是 `hostRequest` | 待办 |
 | A4 | 「本次记录」改名为「下载记录」 | `popup.html` 的 `historyBtn`、`popup.js` 的 `renderHistory` 标题与空列表提示 | 待办 |
 
-**顺序：A1 ✅ → A0b ✅ → A2 → A3 → A4。**
+**顺序：A1 ✅ → A0b ✅ → A2 ✅ → A3 → A4。**
 
 
 

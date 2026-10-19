@@ -166,6 +166,7 @@ const sandbox = {
   location: sandboxLocation,
 };
 sandbox.window.MediaSource = FakeMediaSource;
+sandbox.window.URL = URL;  // A2: biliIsCoverSrc 用 new URL(u, base) 比对路径，FakeURL 不支持两参构造
 sandbox.window.document = fakeDocument;
 sandbox.window.location = sandboxLocation;
 
@@ -967,6 +968,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await testBiliMergeFlow();
   testBiliTitle();
   testPostNoteId();
+  await testBiliCover();
   testFileNameChain();
   console.log("\n" + "=".repeat(46));
   console.log(`通过 ${pass} 项，失败 ${fail} 项`);
@@ -1725,6 +1727,101 @@ function testBiliTitle() {
   const h = mk({ videoData: { title: "state 标题" } }, { "h1.video-title": "DOM 旧标题" }, "");
   check("⑤ __INITIAL_STATE__ 优先于 DOM（切换集时更准）",
     call(h) === "state 标题", call(h));
+}
+
+// ---------------------------------------------------------------- 13
+// A2（1.3.13）：B 站图片只取所点开视频的封面。
+// biliCoverImage() 从 __INITIAL_STATE__ 取封面（videoData.pic / epInfo.cover /
+// mediaInfo.cover / pages[0].first_frame），协议相对与 http:// 都规整成 https；
+// 站点 onScanImages 有 __playinfo__ + 封面时接管：只报封面一张（hint=bili-cover，
+// 带标题），返回 true 跳过 DOM 扫描；拿不到封面返回 false 退回通用扫描（宁可多抓）。
+// isImageOnly 兜底：视频页 DOM 里只认与封面同路径的图（比较去 query、去 @ 尺寸段）。
+function testBiliCover() {
+  console.log("\n[13] A2 B 站封面：state 取图 + onScanImages 接管 + isImageOnly 兜底");
+  const BV = "https://www.bilibili.com/video/BV1xx411c7mD/";
+  const toBili = () => {
+    sandboxLocation.href = BV;
+    sandboxLocation.hostname = "www.bilibili.com";
+    sandboxLocation.pathname = "/video/BV1xx411c7mD/";
+  };
+
+  // ① 视频页（有 __playinfo__ + videoData.pic）：__msImgScan 只发封面一张
+  toBili();
+  sandbox.window.__playinfo__ = { data: { dash: { video: [{ baseUrl: "https://upos.example/x.m4s", bandwidth: 1 }] } } };
+  sandbox.window.__INITIAL_STATE__ = {
+    videoData: {
+      title: "A2 测试视频",
+      pic: "//i0.hdslb.com/bfs/archive/cover1.jpg",
+    },
+  };
+  messages.length = 0;
+  sandbox.window.__msImgScan();
+  const imgs = foundOf((m) => m.mime && m.mime.startsWith("image/"));
+  check("① 视频页只报封面一张图", imgs.length === 1, imgs.map((m) => String(m.key)));
+  check("①-b 封面 URL 规整成 https（协议相对补全）",
+    imgs.length === 1 && imgs[0].key === "https://i0.hdslb.com/bfs/archive/cover1.jpg",
+    imgs[0] && imgs[0].key);
+  check("①-c 封面带标题（biliTitle）且 hint=bili-cover",
+    imgs.length === 1 && imgs[0].title === "A2 测试视频" && imgs[0].hint === "bili-cover",
+    imgs[0] && ({ t: imgs[0].title, h: imgs[0].hint }));
+
+  // ② http:// 的封面也规整成 https（否则和 webRequest 的 https 条目分成两条）
+  sandbox.window.__INITIAL_STATE__ = { videoData: { title: "A2", pic: "http://i0.hdslb.com/bfs/archive/cover2.jpg" } };
+  messages.length = 0;
+  sandbox.window.__msImgScan();
+  const imgs2 = foundOf((m) => m.mime && m.mime.startsWith("image/"));
+  check("② http:// 封面转 https",
+    imgs2.length === 1 && imgs2[0].key === "https://i0.hdslb.com/bfs/archive/cover2.jpg",
+    imgs2[0] && imgs2[0].key);
+
+  // ③ 番剧页：epInfo.cover 兜得住
+  sandbox.window.__INITIAL_STATE__ = { epInfo: { title: "番剧", cover: "//i0.hdslb.com/bfs/bangumi/ep.jpg" } };
+  messages.length = 0;
+  sandbox.window.__msImgScan();
+  const imgs3 = foundOf((m) => m.mime && m.mime.startsWith("image/"));
+  check("③ 番剧 epInfo.cover 兜得住",
+    imgs3.length === 1 && String(imgs3[0].key).endsWith("/bfs/bangumi/ep.jpg"),
+    imgs3[0] && imgs3[0].key);
+
+  // ④ 拿不到封面（state 空但 playinfo 在）：不接管，退回 DOM 扫描，绝不出错
+  sandbox.window.__INITIAL_STATE__ = {};
+  messages.length = 0;
+  let threw = false;
+  try { sandbox.window.__msImgScan(); } catch (e) { threw = true; }
+  check("④ 无封面时退回通用扫描且不抛错", !threw, threw);
+
+  // ⑤ 非视频页（无 __playinfo__）：完全不接管
+  delete sandbox.window.__playinfo__;
+  delete sandbox.window.__INITIAL_STATE__;
+  messages.length = 0;
+  threw = false;
+  try { sandbox.window.__msImgScan(); } catch (e) { threw = true; }
+  check("⑤ 非视频页不接管（无 bili-cover 条目产生）",
+    !threw && !foundOf((m) => m.hint === "bili-cover").length, threw);
+
+  // ⑥ isImageOnly 兜底：视频页上 DOM 扫描只放行封面同路径的图
+  //    （直接调站点钩子验证判据本身）
+  sandbox.window.__playinfo__ = { data: { dash: { video: [{ baseUrl: "https://upos.example/x.m4s" }] } } };
+  sandbox.window.__INITIAL_STATE__ = { videoData: { title: "A2", pic: "//i0.hdslb.com/bfs/archive/cov.jpg" } };
+  // 顶层 context 的 URL 是 FakeURL（只解析 href），biliIsCoverSrc 需要真 URL 的
+  // hostname/pathname —— 临时换成真 URL，⑥ 系列跑完再换回去，不影响其它用例。
+  const savedURL = sandbox.URL;
+  sandbox.URL = URL;
+  const io = (u) => vm.runInContext('(function(){ const el = {}; return window.__msActiveSite().isImageOnly(el, ' + JSON.stringify(u) + '); })()', sandbox);
+  const io1 = io("https://i0.hdslb.com/bfs/archive/cov.jpg?v=1");
+  const io2 = io("https://i0.hdslb.com/bfs/archive/other.jpg");
+  const io3 = io("https://i0.hdslb.com/bfs/archive/cov.jpg@672w_378h_1c.webp");
+  check("⑥ isImageOnly 放行封面（带 query 也认）", io1 === true, io1);
+  check("⑥-b isImageOnly 拦下别的图", io2 === false, io2);
+  check("⑥-c isImageOnly 认带 @ 尺寸段的同一张", io3 === true, io3);
+  sandbox.URL = savedURL;
+
+  // 清场：别把 B 站状态泄漏给后面的用例
+  delete sandbox.window.__playinfo__;
+  delete sandbox.window.__INITIAL_STATE__;
+  sandboxLocation.href = "https://web.telegram.org/a/";
+  sandboxLocation.hostname = "web.telegram.org";
+  delete sandboxLocation.pathname;
 }
 
 // ---------------------------------------------------------------- 12
