@@ -42,8 +42,28 @@ let allItems = [];     // 从 background 拿到的全量条目（未经任何过
 let filter = "all";    // 当前选中的分类 chip
 let counts = {};       // background 给的各 kind 计数（B 站上会被 shownItems 重算覆盖）
 let hostOk = null;     // 本地下载器状态：null=还没结果 / true=可用 / false=不可用
+let selecting = false; // 批量选择模式
+const picked = new Set(); // 已选条目的 key（就是 it.u）
+let blockedHosts = []; // 用户屏蔽的站点（hostname）
 
 const $ = (sel) => document.querySelector(sel);
+
+/** 只取 hostname（不带端口），屏蔽名单用它做 key */
+function siteOf(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch { return ""; }
+}
+
+async function readBlocked() {
+  try {
+    const s = await chrome.storage.local.get({ blockedHosts: [] });
+    return Array.isArray(s.blockedHosts) ? s.blockedHosts.filter(Boolean) : [];
+  } catch { return []; }
+}
+
+function siteBlocked() {
+  const h = siteOf(tabUrl);
+  return !!h && blockedHosts.includes(h);
+}
 
 /** 「1.5 MB」这种人读的尺寸。0/空返回空串，让调用方用 filter(Boolean) 拼「·」 */
 function fmtSize(n) {
@@ -193,8 +213,135 @@ async function load() {
     tabUrl = res.tabUrl;
     $("#site").textContent = tabUrl;
   }
+  // 屏蔽名单可能在别的标签页改过，每次打开都读一遍
+  blockedHosts = await readBlocked();
+  syncBlockBtn();
+  // 选择状态跟着列表走：已消失的条目不该继续占着「已选」
+  const alive = new Set(shownItems().map((it) => it.u));
+  for (const k of [...picked]) if (!alive.has(k)) picked.delete(k);
+
   renderChips();
+  if (siteBlocked()) renderBlocked();
+  else renderList();
+  updateBatchBar();
+}
+
+// ---------------------------------------------------------------- 屏蔽 / 重扫 / 批量选择
+//
+// 这三件事都是「让用户自己把长尾问题变简单」，而不是继续加判定规则：
+//   · 屏蔽：垃圾站直接静音，不用和误判搏斗（借鉴 CocoCut 的按域名屏蔽）
+//   · 重扫：很多站要先点播放才挂载媒体，给一个不用重载页面的按钮
+//   · 批量：候选列表本身有价值，让人一次勾选比逐条点可靠
+
+function syncBlockBtn() {
+  const b = $("#blockSite");
+  if (!b) return;
+  const on = siteBlocked();
+  b.classList.toggle("on", on);
+  b.title = on ? "已屏蔽此站，点击恢复显示" : "屏蔽此站（不再显示本页资源）";
+}
+
+function renderBlocked() {
+  const box = $("#list");
+  box.replaceChildren();
+  const d = el("div", "empty blocked");
+  d.innerHTML = `已屏蔽 <b>${siteOf(tabUrl) || "此站"}</b> 的资源列表。<br>`
+    + "抓取和收藏不受影响，只是不再在这里显示。";
+  const wrap = el("div", "empty-actions");
+  const btn = el("button", "btn-txt tint-blue", "恢复显示");
+  btn.addEventListener("click", () => setBlocked(false));
+  wrap.append(btn);
+  d.append(wrap);
+  box.append(d);
+}
+
+/** 显式设置「当前站点是否屏蔽」，避免用布尔参数兼作开关时把恢复写成屏蔽 */
+async function setBlocked(want) {
+  const h = siteOf(tabUrl);
+  if (!h) return;
+  const on = !!want;
+  if (on) {
+    if (!blockedHosts.includes(h)) blockedHosts.push(h);
+    $("#hint").textContent = `已屏蔽 ${h}，点右上角 🚫 可恢复`;
+  } else {
+    blockedHosts = blockedHosts.filter((x) => x !== h);
+    $("#hint").textContent = `已恢复 ${h}`;
+  }
+  try { await chrome.storage.local.set({ blockedHosts }); } catch (e) { /* 忽略 */ }
+  syncBlockBtn();
+  if (on) renderBlocked(); else renderList();
+  updateBatchBar();
+  setTimeout(() => ($("#hint").textContent = ""), 4000);
+}
+
+/** 顶栏 🚫：在「屏蔽」和「恢复」之间切换 */
+function toggleBlock() {
+  const h = siteOf(tabUrl);
+  if (!h) return;
+  setBlocked(!blockedHosts.includes(h));
+}
+
+/** 让页面重新扫一遍 DOM。不重载页面，避免丢掉已经播放/缓冲好的媒体。 */
+async function rescanPage(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "扫描中…"; }
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: "ms:rescan" }, { frameId: 0 });
+  } catch (e) { /* 页面没注入（内部页/刚安装）时忽略 */ }
+  // 扫描是同步遍历 + postMessage，给 background 700ms 落库
+  await new Promise((r) => setTimeout(r, 700));
+  await load();
+  if (btn) { btn.disabled = false; btn.textContent = "重新扫描"; }
+}
+
+function setSelecting(on) {
+  selecting = on;
+  if (!on) picked.clear();
+  $("#selectToggle").classList.toggle("on", on);
   renderList();
+  updateBatchBar();
+}
+
+/** 可勾选的条目：只限 page=1（数据必须由页面自己取，和「保存」按钮同一条链路） */
+function selectableItems() {
+  return visibleItems().filter((it) => it.page);
+}
+
+function updateBatchBar() {
+  const bar = $("#batchBar");
+  if (!bar) return;
+  bar.classList.toggle("hidden", !selecting);
+  const n = picked.size;
+  $("#selCount").textContent = `已选 ${n} 项`;
+  $("#selSave").disabled = n === 0;
+  const all = selectableItems();
+  const box = $("#selAllBox");
+  box.checked = all.length > 0 && all.every((it) => picked.has(it.u));
+  box.indeterminate = n > 0 && !box.checked;
+}
+
+async function saveSelected(btn) {
+  const items = selectableItems().filter((it) => picked.has(it.u));
+  if (!items.length) return;
+  btn.disabled = true;
+  btn.textContent = "…";
+  let res;
+  try {
+    res = await chrome.runtime.sendMessage({
+      type: "page:save-batch",
+      tabId,
+      items: items.map(pageSaveItem),
+    });
+  } catch (e) {
+    res = { ok: false, error: "页面未连接（请刷新页面再试）" };
+  }
+  btn.disabled = false;
+  btn.textContent = "保存所选";
+  if (!res || !res.ok) {
+    $("#hint").textContent = "下发失败：" + ((res && res.error) || "页面无响应");
+    return;
+  }
+  $("#hint").textContent = `已在页面弹出 ${items.length} 项，请逐项确认`;
+  setTimeout(() => ($("#hint").textContent = ""), 5000);
 }
 
 // ---------------------------------------------------------------- 渲染
@@ -286,10 +433,20 @@ function renderList() {
         + "封面图和悬停预览只是缩略图，无法下载完整视频。<br>"
         + "<b>点进任意一个视频</b>后，再打开本扩展就能看到「B 站视频（完整 DASH 流）」。";
     } else {
-      tip = "还没有资源。<br>刚打开扩展或刚安装时，<b>点右上角 ⟳ 重新载入页面</b>，才能捕获完整的请求列表。";
+      // 「什么都没有」这句废话解决不了问题。多数站的媒体是播放器挂载后才出现的，
+      // 所以这里给的是可执行动作：先播一下，再就地重扫（不用整页重载）。
+      tip = "还没有资源。<br>如果页面里有视频/音频，<b>先点一下播放</b>，再点下面的「重新扫描」；<br>"
+        + "还不行就点右上角 ⟳ 重载页面。";
     }
     const d = el("div", "empty");
     d.innerHTML = tip;
+    if (/^https?:/i.test(tabUrl)) {
+      const actions = el("div", "empty-actions");
+      const scan = el("button", "btn-txt tint-blue", "重新扫描");
+      scan.addEventListener("click", () => rescanPage(scan));
+      actions.append(scan);
+      d.append(actions);
+    }
     box.append(d);
     return;
   }
@@ -311,6 +468,29 @@ function renderList() {
 function renderItem(it) {
   const row = el("div", "item");
   const isPage = !!it.page;
+
+  // 批量选择只对 page=1 的条目开放：这类数据必须由页面自己取（和「保存」同一条
+  // 链路），直链条目的批量下载另有语义，混在一起容易下出一堆意外文件。
+  if (selecting && isPage) {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "sel-box";
+    box.checked = picked.has(it.u);
+    const sync = () => {
+      if (box.checked) picked.add(it.u); else picked.delete(it.u);
+      row.classList.toggle("picked", box.checked);
+      updateBatchBar();
+    };
+    box.addEventListener("change", sync);
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button") || e.target === box) return;
+      box.checked = !box.checked;
+      sync();
+    });
+    row.classList.add("selectable");
+    if (box.checked) row.classList.add("picked");
+    row.append(box);
+  }
 
   const badge = el("div", "badge " + it.k, KIND_ICON[it.k] || "?");
   badge.title = (isPage ? "页面内捕获 · " : "") + (KIND_LABEL[it.k] || it.k);
@@ -607,6 +787,9 @@ async function startDownload(it, btn) {
     filename: it.f,
     referer: it.i || tabUrl,
     tabUrl,
+    // 抓取时实际发出的请求头（referer/origin/accept/accept-language/user-agent）。
+    // 只带 referer 时，不少 CDN 会因为没有 Origin 或 Accept 直接 403。
+    headers: it.hdr || null,
   });
   if (!res || !res.ok) {
     btn.disabled = false;
@@ -759,6 +942,28 @@ $("#reload").addEventListener("click", async () => {
 });
 
 $("#saveAll").addEventListener("click", (e) => saveAllPageItems(e.currentTarget));
+
+// 批量选择
+$("#selectToggle").addEventListener("click", () => setSelecting(!selecting));
+$("#selAllBox").addEventListener("change", (e) => {
+  const all = selectableItems();
+  if (e.target.checked) for (const it of all) picked.add(it.u);
+  else for (const it of all) picked.delete(it.u);
+  renderList();
+  updateBatchBar();
+});
+$("#selInv").addEventListener("click", () => {
+  for (const it of selectableItems()) {
+    if (picked.has(it.u)) picked.delete(it.u); else picked.add(it.u);
+  }
+  renderList();
+  updateBatchBar();
+});
+$("#selSave").addEventListener("click", (e) => saveSelected(e.currentTarget));
+$("#selDone").addEventListener("click", () => setSelecting(false));
+
+// 站点屏蔽
+$("#blockSite").addEventListener("click", () => toggleBlock());
 
 // 打开文件存放处：目录由本地宿主决定（默认 D:/软件应用/DSH/文件存放处），
 // popup 里不硬编码路径，免得两边不一致。

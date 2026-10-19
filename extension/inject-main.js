@@ -49,20 +49,16 @@
 
   const KEEP_MS = 5 * 60 * 1000;
   const MIN_BLOB = 64 * 1024;
-  // MSE 分片是整块留在页面内存里的，所以这里只能按「内存」设限，不能无限。
-  // 有 performance.memory 就按可用堆的 1/4 算，拿不到就给 512MB 兜底。
+  // 内存预算。以前只有「条数上限」和「单条 MSE 上限」，页面开几个播放器就是
+  // N × 单条上限，blob 更是只数条数不数字节 —— 几十个大 blob 就能把标签页拖崩。
+  // 现在改成两层：单条上限挡住畸形大对象，全局预算保证总和可控。
   // 注意：这不是下载文件的大小上限——B 站/Telegram 走 Range 直传宿主，
   // 文件多大都行，宿主那边已经不设上限了。
-  const MAX_MSE_BYTES = (() => {
-    try {
-      const m = performance && performance.memory;
-      if (m && m.jsHeapSizeLimit > 0) {
-        const cap = Math.floor(m.jsHeapSizeLimit / 4);
-        return Math.max(256 * 1024 * 1024, Math.min(cap, 2 * 1024 * 1024 * 1024));
-      }
-    } catch (e) { /* 拿不到就用兜底值 */ }
-    return 512 * 1024 * 1024;
-  })();
+  const MAX_MSE_ENTRY = 128 * 1024 * 1024;   // 单条 MSE 最多留 128MB
+  const MAX_MSE_TOTAL = 512 * 1024 * 1024;   // 所有 MSE 加起来最多 512MB
+  const MAX_BLOB_ITEM = 256 * 1024 * 1024;   // 单条 blob 超过就不留内存，只上报元信息
+  const MAX_BLOB_TOTAL = 512 * 1024 * 1024;  // 所有 blob 加起来最多 512MB
+  const MSE_TTL = 30 * 60 * 1000;            // 30 分钟没再 append 就回收（够覆盖暂停后保存）
   const MAX_ITEMS = 60;
   const MAX_MEDIA = 300; // 记录多少条原生媒体请求
 
@@ -75,6 +71,8 @@
   const mediaSeen = new Map(); // url -> {kind, ct, size, sample, ts, ref}
   const imgCtx = new Map();  // 图片 url -> {mid, title, ord, w, h}（DOM 上下文）
   let seq = 0;
+  let blobBytes = 0;         // blobs 里实际占用的字节数
+  let mseBytes = 0;          // mse 里实际占用的字节数
 
   const post = (data) => {
     try { window.postMessage({ __ms_sniffer: true, ...data }, "*"); } catch (e) { /* 忽略 */ }
@@ -144,9 +142,13 @@
   }
 
   function trim() {
-    if (blobs.size <= MAX_ITEMS) return;
+    // 条数和字节数任一超限都要裁：只数条数时，60 个大视频照样能吃掉几个 GB。
+    if (blobs.size <= MAX_ITEMS && blobBytes <= MAX_BLOB_TOTAL) return;
     const sorted = [...blobs.values()].sort((a, b) => a.ts - b.ts);
-    for (const old of sorted.slice(0, blobs.size - MAX_ITEMS)) blobs.delete(old.url);
+    while (sorted.length && (blobs.size > MAX_ITEMS || blobBytes > MAX_BLOB_TOTAL)) {
+      const old = sorted.shift();
+      if (blobs.delete(old.url)) blobBytes = Math.max(0, blobBytes - (old.size || 0));
+    }
   }
 
   function ascii(b, off, len) {
@@ -175,8 +177,13 @@
     const url = origCreate(obj);
     try {
       if (obj && typeof obj.size === "number" && obj.size >= MIN_BLOB && typeof obj.type === "string") {
-        blobs.set(url, { url, blob: obj, type: obj.type, size: obj.size, ts: Date.now(), expires: 0 });
-        trim();
+        // 超大单条不留在内存：照样上报（用户能在列表里看到并直接 fetch 保存），
+        // 但不进 blobs，避免一个 1GB 的录制对象把标签页顶爆。
+        if (obj.size <= MAX_BLOB_ITEM) {
+          blobs.set(url, { url, blob: obj, type: obj.type, size: obj.size, ts: Date.now(), expires: 0 });
+          blobBytes += obj.size;
+          trim();
+        }
         // 只上报音视频 blob。Telegram 的图片预览（头像缩略图、查看器里的照片）
         // 也是 createObjectURL 出来的 image/jpeg blob，且常超过 MIN_BLOB；
         // 报给页面媒体列表会变成「页面视频 · image/jpeg」这类假视频条目。
@@ -197,7 +204,10 @@
       rec.expires = Date.now() + KEEP_MS;
       setTimeout(() => {
         const cur = blobs.get(url);
-        if (cur && cur.expires) blobs.delete(url);
+        if (cur && cur.expires) {
+          blobBytes = Math.max(0, blobBytes - (cur.size || 0));
+          blobs.delete(url);
+        }
       }, KEEP_MS + 100);
       post({ cmd: "progress", key: url, state: "released" });
     }
@@ -1045,6 +1055,9 @@
 
   function scanMedia() {
     try {
+      // 后台标签页不扫：600ms 一轮的全文档查询在隐藏页上纯属浪费电量，
+      // 用户切回来时下一轮（≤600ms）就会补齐。
+      if (document.hidden) return;
       const els = document.querySelectorAll("video, audio");
       for (const el of els) {
         let src = "";
@@ -1243,6 +1256,7 @@
 
   function scanImages() {
     try {
+      if (document.hidden) return;
       // 小红书详情页：__INITIAL_STATE__ 里有这个帖子的完整配图清单（imageList），
       // 比 DOM 扫描全（懒加载图 DOM 里根本没解码，尺寸是 0）、也天然只含当前帖子
       // （不用在 77 个 1040g 的 <img> 里猜哪 7 张是正文）。读到了就走这条路，
@@ -1436,7 +1450,7 @@
 
   function hookSourceBuffer(sb, mime) {
     const id = "m" + (++seq);
-    const entry = { id, mime: cleanMime(mime), chunks: [], size: 0, ts: Date.now() };
+    const entry = { id, mime: cleanMime(mime), chunks: [], size: 0, ts: Date.now(), last: Date.now() };
     mse.set(id, entry);
     post({ cmd: "found", source: "mse", key: id, size: 0, mime: entry.mime, ext: extOf(entry.mime), live: true });
 
@@ -1444,14 +1458,18 @@
     let lastReport = 0;
     sb.appendBuffer = function (data) {
       try {
-        if (data && entry.size < MAX_MSE_BYTES) {
+        // 两层限制：单条不超过 MAX_MSE_ENTRY，且所有 MSE 总和不超过 MAX_MSE_TOTAL。
+        // 只限单条时，页面开 5 个播放器就是 5 份，照样能把标签页撑爆。
+        if (data && entry.size < MAX_MSE_ENTRY && mseBytes < MAX_MSE_TOTAL) {
           let buf;
           if (data instanceof ArrayBuffer) buf = data.slice(0);
           else if (ArrayBuffer.isView(data)) buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
           if (buf) {
             entry.chunks.push(buf);
             entry.size += buf.byteLength;
+            mseBytes += buf.byteLength;
             const now = Date.now();
+            entry.last = now;
             if (now - lastReport > 900) {
               lastReport = now;
               post({ cmd: "progress", key: id, size: entry.size, state: "growing" });
@@ -1463,6 +1481,18 @@
       return origAppend.call(this, data);
     };
   }
+
+  // MSE 分片没有 TTL 时会一直躺着：页面切走、用户不保存，那 512MB 就白占。
+  // 30 分钟没新数据就回收（暂停很久再点保存才会受影响，概率远低于 OOM）。
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, e] of mse) {
+      if (now - (e.last || e.ts || 0) > MSE_TTL) {
+        mseBytes = Math.max(0, mseBytes - (e.size || 0));
+        mse.delete(id);
+      }
+    }
+  }, 60 * 1000);
 
   // ------------------------------------------------------------ 本地下载器桥（经 content.js → background → Native Host）
 
@@ -3047,7 +3077,13 @@
 
     if (!d.__ms_sniffer_cmd) return;
 
-    if (d.cmd === "hello") {
+    if (d.cmd === "hello" || d.cmd === "rescan") {
+      if (d.cmd === "rescan") {
+        // 很多站的播放器是用户点播放之后才挂上 <video>/<img> 的。就地重扫一遍，
+        // 比让用户整页重载更轻（重载会丢掉已经缓冲好的媒体，反而更难抓）。
+        try { scanMedia(); } catch (e) { /* 忽略 */ }
+        try { scanImages(); } catch (e) { /* 忽略 */ }
+      }
       for (const rec of blobs.values()) {
         post({ cmd: "found", source: "blob", key: rec.url, size: rec.size, mime: rec.type, ext: extOf(rec.type) });
         if (titles.get(rec.url)) post({ cmd: "progress", key: rec.url, title: titles.get(rec.url) });
@@ -3183,6 +3219,36 @@
   window.__msFileNameTitle = fileNameTitle; // 文件名截断规则（测试要直接断言）
   window.__msSafeFileName = safeFileName;   // 文件名清洗（百分号解码 / 首尾点 / 非法字符）
   window.__msBiliPartTag = biliPartTag;     // 分P号后缀
+  // ------------------------------------------------------------ 9. SPA 导航上报
+  //
+  // pushState/replaceState 不会触发 chrome.tabs.onUpdated，background 以为还在原页面：
+  // 上一个页面的条目、rec.xhsVid 都留在 tab 记录里。真实表现是「换了个视频抓不到」
+  // （xhsVid 那道闸把新页面的 MSE/blob 条目全拦掉）和「列表混着上一页的图」。
+  (function watchSpaNav() {
+    let lastPath = "";
+    try { lastPath = location.pathname + location.search; } catch (e) { /* 忽略 */ }
+    const fire = () => {
+      let cur = "";
+      try { cur = location.pathname + location.search; } catch (e) { return; }
+      if (cur === lastPath) return;
+      lastPath = cur;
+      try { post({ cmd: "nav", url: String(location.href || "") }); } catch (e) { /* 忽略 */ }
+    };
+    for (const name of ["pushState", "replaceState"]) {
+      try {
+        const orig = history[name];
+        if (typeof orig !== "function") continue;
+        history[name] = function () {
+          const ret = orig.apply(this, arguments);
+          setTimeout(fire, 0);
+          return ret;
+        };
+      } catch (e) { /* 忽略 */ }
+    }
+    try { window.addEventListener("popstate", () => setTimeout(fire, 0)); } catch (e) { /* 忽略 */ }
+    try { window.addEventListener("hashchange", () => setTimeout(fire, 0)); } catch (e) { /* 忽略 */ }
+  })();
+
   window.__msIsXhsHost = isXhsHost;         // 小红书排查入口
   window.__msXhsNoteId = xhsCurrentNoteId;  // 当前帖子 noteId（详情页才有）
   window.__msXhsNoteImages = xhsNoteImages; // __INITIAL_STATE__ 直读的配图清单（测试要断言）

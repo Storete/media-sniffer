@@ -686,6 +686,70 @@ check("通用去重：视频条目不受影响",
 // 空输入安全
 check("通用去重：空列表安全返回", Array.isArray(dedupeImagesByIdentity([])) && dedupeImagesByIdentity([]).length === 0);
 
+// ---- 页面 → 宿主 的准入校验
+//
+// 背景：content.js 会把页面 postMessage 发来的 host-send 原样转给宿主，
+// 而页面主世界和注入脚本是同一个执行环境 —— 任何页面脚本都能伪造。
+// 这里锁定几条必须成立的边界。
+console.log("\n[9] validateHostPayload：页面不能指挥宿主");
+const vhp = ctx.validateHostPayload;
+check("存在准入校验函数", typeof vhp === "function");
+
+const PAGE = "https://www.example.com/archives/1/";
+check("拒绝页面发起 download（下载只能由 background 发起）",
+  vhp({ action: "download", id: "x1", url: "https://evil.test/a.mp4" }, PAGE) === null);
+check("拒绝 file:// 本地读取",
+  vhp({ action: "msfile_start", id: "x1", name: "a.mp4", total: 1, url: "file:///C:/Windows/win.ini" }, PAGE) === null);
+check("拒绝 javascript: 伪协议",
+  vhp({ action: "reveal", file: "javascript:alert(1)" }, PAGE) === null);
+check("拒绝路径穿越的 id",
+  vhp({ action: "msfile_start", id: "../../evil", name: "a", total: 1 }, PAGE) === null);
+
+const cleanOut = vhp({ action: "msfile_start", id: "dl-1", name: "a.mp4", total: 10, outdir: "C:\\Windows\\Temp" }, PAGE);
+check("丢弃页面指定的 outdir", cleanOut && cleanOut.outdir === undefined, cleanOut);
+
+const sameSite = vhp({
+  action: "log", id: "l1", url: "https://www.example.com/v.mp4",
+  cookie: "SID=abc", tabUrl: PAGE,
+}, PAGE);
+check("同站保留 Cookie", sameSite && sameSite.cookie === "SID=abc", sameSite);
+
+const crossSite = vhp({
+  action: "log", id: "l2", url: "https://evil.test/v.mp4",
+  cookie: "SID=abc", tabUrl: PAGE,
+}, PAGE);
+check("跨站丢弃 Cookie", crossSite && crossSite.cookie === undefined, crossSite);
+
+check("正常分片请求放行", !!vhp({ action: "msfile_chunk", id: "dl-1", text: "bytes=0-", data: { __b64: "AA==" } }, PAGE));
+
+// ---- 请求头白名单
+//
+// 这些头会被原样重放到 CDN 请求上，所以必须严格：只保留 5 个安全头，
+// 且拒绝 CR/LF（头注入）。Cookie / Authorization 永远不进这条通路。
+console.log("\n[10] pickHeaders：只留白名单，拒绝头注入");
+const ph = ctx.pickHeaders;
+check("存在 pickHeaders", typeof ph === "function");
+const picked = ph([
+  { name: "Referer", value: "https://a.com/p" },
+  { name: "Origin", value: "https://a.com" },
+  { name: "Accept", value: "*/*" },
+  { name: "Accept-Language", value: "zh-CN" },
+  { name: "User-Agent", value: "UA/1" },
+  { name: "Cookie", value: "SID=secret" },
+  { name: "Authorization", value: "Bearer x" },
+  { name: "X-Custom", value: "1" },
+]);
+check("保留 5 个白名单头", Object.keys(picked).length === 5, picked);
+check("键名统一小写", picked.referer === "https://a.com/p" && picked["user-agent"] === "UA/1", picked);
+check("Cookie 被丢弃", !("cookie" in picked));
+check("Authorization 被丢弃", !("authorization" in picked));
+check("自定义头被丢弃", !("x-custom" in picked));
+
+check("CRLF 注入被拒", !("referer" in ph([{ name: "Referer", value: "a\r\nX-Evil: 1" }])));
+check("超长值被拒", !("accept" in ph([{ name: "Accept", value: "a".repeat(400) }])));
+check("空值被拒", !("accept" in ph([{ name: "Accept", value: "" }])));
+check("全是非法头时返回空对象", Object.keys(ph([{ name: "Cookie", value: "x" }])).length === 0);
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

@@ -81,6 +81,11 @@
     } else if (msg.type === "ms:save-batch") {
       toPage({ cmd: "save-batch", items: msg.items || [] });
       sendResponse({ ok: true });
+    } else if (msg.type === "ms:rescan") {
+      // 让页面主世界重新扫一遍 DOM。很多站的 <video> 是点了播放才挂上的，
+      // 重载页面反而会丢掉已缓冲的媒体，所以给一个「就地重扫」的入口。
+      toPage({ cmd: "rescan" });
+      sendResponse({ ok: true });
     }
     return true;
   });

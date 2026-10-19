@@ -125,18 +125,82 @@ def _download_dir():
     return library.library_dir()
 
 
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"}
+_WIN_RESERVED |= {"COM%d" % i for i in range(1, 10)}
+_WIN_RESERVED |= {"LPT%d" % i for i in range(1, 10)}
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _safe_job_id(value):
+    """任务 id 会被拼进 .job.json / .status 文件名，必须先挡住路径分隔符。
+
+    没有这道校验时，页面传 id="../../x" 就能让宿主把文件写到 JOBS_DIR 外面。
+    """
+    s = str(value or "").strip()
+    if not s or s in (".", "..") or not _JOB_ID_RE.match(s):
+        return ""
+    return s
+
+
+def _safe_outdir(value):
+    """下载目录只允许落在资料库目录内；其余一律忽略（用默认目录）。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        p = os.path.abspath(raw)
+        root = os.path.abspath(library.library_dir())
+        if os.path.commonpath([p, root]) != root:
+            log("outdir 越界，已忽略", raw)
+            return ""
+        return p
+    except Exception:
+        # 不同盘符时 commonpath 会抛 ValueError —— 同样按越界处理
+        return ""
+
+
+_HEADER_ALLOW = {"referer", "origin", "accept", "accept-language", "user-agent"}
+
+
+def _safe_headers(value):
+    """页面抓到的请求头 → 只保留白名单里的 5 个。
+
+    扩展侧已经过滤过一遍，这里是第二道：宿主也被别的调用方直接连着。
+    CR/LF 一律丢弃（头注入），值过长也丢（畸形请求）。
+    """
+    out = {}
+    if not isinstance(value, dict):
+        return out
+    for k, v in value.items():
+        key = str(k or "").strip().lower()
+        if key not in _HEADER_ALLOW:
+            continue
+        s = str(v or "")
+        if not s or len(s) > 300 or "\r" in s or "\n" in s:
+            continue
+        out[key] = s
+    return out
+
+
 def _safe_name(name):
     """把页面给的文件名洗成「只剩一个安全文件名」。
 
     先 basename 掉路径（同时把反斜杠统一成斜杠，否则 Windows 上的
     "a\\b.mp4" 在 os.path.basename 里算一个整体），再换掉 Windows 非法字符。
     空名兜底成 media-时间戳，避免存成一个叫 "" 的文件。最长 150 字符。
+
+    另外处理两个 Windows 专有的坑：
+      · 保留设备名（CON/NUL/COM1…）——即便带扩展名也非法，open() 会直接报错
+      · 结尾的点和空格——资源管理器不接受，Python 会静默截断
     """
     name = os.path.basename(str(name or "").replace("\\", "/")).strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     name = name.strip(". ")
     if not name:
         name = "media-" + time.strftime("%Y%m%d-%H%M%S")
+    stem = os.path.splitext(name)[0].upper()
+    if stem in _WIN_RESERVED:
+        name = "_" + name
     return name[:150]
 
 
@@ -164,9 +228,15 @@ def do_msfile_start(msg):
     """
     name = _safe_name(msg.get("name"))
     total = int(msg.get("total") or 0)
+    if total < 0:
+        total = 0
     d = _download_dir()
     path = _unique_path(d, name)
-    job_id = msg.get("id") or ("msf-" + uuid.uuid4().hex[:10])
+    raw_id = msg.get("id")
+    job_id = _safe_job_id(raw_id) if raw_id else ("msf-" + uuid.uuid4().hex[:10])
+    if not job_id:
+        send({"id": "", "action": "error", "ok": False, "error": "任务 id 不合法"})
+        return
     with FILE_LOCK:
         fh = open(path, "wb")
         FILE_JOBS[job_id] = {
@@ -532,23 +602,23 @@ def do_open_log(msg):
 
 def _spawn_worker(job_file):
     """以 detached 方式拉起 downloader.py（浏览器/宿主退出后它还活着）。"""
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NO_WINDOW = 0x08000000
-    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-    flags = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
     common = dict(
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        cwd=HERE, creationflags=flags, close_fds=True,
+        cwd=HERE, close_fds=True,
     )
+    if sys.platform == "win32":
+        # 这三个 flag 都只在 Windows 上有效；POSIX 传 creationflags 会直接 ValueError
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NO_WINDOW = 0x08000000
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        common["creationflags"] = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
     try:
         subprocess.Popen([sys.executable, WORKER, job_file], **common)
     except OSError:
         # 某些环境下 BREAKAWAY 不被允许，退回不带它的方式
-        subprocess.Popen(
-            [sys.executable, WORKER, job_file],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            cwd=HERE, creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW, close_fds=True,
-        )
+        if sys.platform == "win32":
+            common["creationflags"] = 0x00000008 | 0x08000000
+        subprocess.Popen([sys.executable, WORKER, job_file], **common)
 
 
 def do_download(msg):
@@ -558,17 +628,32 @@ def do_download(msg):
 
     副作用顺序很重要：先清取消标记（同 id 重试时残留的 .cancel 会让新任务
     一启动就自杀），再写初始状态（扩展在 worker 起来前不能读到空文件）。
+
+    入参全部当作不可信处理：id 拼文件名、url 交给 yt-dlp、outdir 决定落盘位置。
+    扩展侧已有一道校验，这里是独立的一道（宿主也被别的调用方直接连着）。
     """
+    job_id = _safe_job_id(msg.get("id"))
+    if not job_id:
+        send({"id": "", "action": "error", "status": "error",
+              "message": "任务 id 不合法"})
+        return
+    url = str(msg.get("url") or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        send({"id": job_id, "action": "error", "status": "error",
+              "message": "只支持 http/https 地址"})
+        return
+
     job = {
-        "id": msg["id"],
-        "url": msg["url"],
+        "id": job_id,
+        "url": url,
         "kind": msg.get("kind") or "other",
         "filename": msg.get("filename") or "",
         "referer": msg.get("referer") or "",
         "tabUrl": msg.get("tabUrl") or "",
         "cookie": msg.get("cookie") or "",
         "concurrency": int(msg.get("concurrency") or 16),
-        "outdir": msg.get("outdir") or "",
+        "outdir": _safe_outdir(msg.get("outdir")),
+        "headers": _safe_headers(msg.get("headers")),
     }
     os.makedirs(JOBS_DIR, exist_ok=True)
 
@@ -603,9 +688,13 @@ def do_cancel(msg):
     简单，也不怕 worker 还没起来（标记会一直在那儿等着）。
     """
     os.makedirs(JOBS_DIR, exist_ok=True)
-    with open(os.path.join(JOBS_DIR, msg["id"] + ".cancel"), "w") as f:
+    job_id = _safe_job_id(msg.get("id"))
+    if not job_id:
+        send({"id": "", "action": "error", "status": "error", "message": "任务 id 不合法"})
+        return
+    with open(os.path.join(JOBS_DIR, job_id + ".cancel"), "w") as f:
         f.write("1")
-    send({"id": msg["id"], "action": "cancelled", "status": "cancelled"})
+    send({"id": job_id, "action": "cancelled", "status": "cancelled"})
 
 
 def do_list(msg):

@@ -7,6 +7,10 @@
  *  3. 接收 popup 指令，把链接交给本地 Native Host（yt-dlp）下载并回传进度
  */
 
+// 通用媒体判定放在单独文件里（纯函数，可在 Node 里直接测）。
+// service worker 是经典脚本，用 importScripts 挂到全局 MSDetect 上。
+try { importScripts("detect.js"); } catch (e) { console.warn("detect.js 未加载", e); }
+
 const HOST_NAME = "com.starmediasniffer.host";
 const MAX_PER_TAB = 5000;
 const MAX_SEGMENTS = 400;
@@ -125,6 +129,29 @@ function flushSoon(tabId) {
   flushSoon._t = setTimeout(() => flushAll(), FLUSH_DELAY);
 }
 
+// ---------------------------------------------------------------- 错误留痕
+//
+// 以前 flushAll 配额超限、宿主拉起失败都是空 catch：用户只看到「没反应」，
+// host.log 里也没有线索。这里保留最近 30 条，popup 的排障区可以读 msRecentErrors。
+const recentErrors = [];
+let lastErrorFlush = 0;
+
+function noteError(where, detail) {
+  try {
+    recentErrors.push({
+      t: Date.now(),
+      where: String(where || "").slice(0, 40),
+      detail: String(detail || "").slice(0, 200),
+    });
+    if (recentErrors.length > 30) recentErrors.shift();
+    // 写盘节流：页面可以高频触发拒绝，不节流会变成配额攻击
+    const now = Date.now();
+    if (now - lastErrorFlush < 2000) return;
+    lastErrorFlush = now;
+    try { chrome.storage.local.set({ msRecentErrors: recentErrors.slice() }); } catch (e) { /* 忽略 */ }
+  } catch (e) { /* 忽略 */ }
+}
+
 async function flushAll() {
   const payload = {};
   for (const [tabId, rec] of state) {
@@ -139,12 +166,57 @@ async function flushAll() {
   if (!Object.keys(payload).length) return;
   try {
     await chrome.storage.session.set(payload);
-  } catch {
-    /* 超出配额时忽略，内存里仍然可用 */
+  } catch (e) {
+    // 配额超了不会报错给用户，但至少要在排障记录里留下痕迹。
+    // 内存里的 state 仍然可用，只是 service worker 重启后会丢。
+    noteError("session-flush", (e && e.message) || e);
   }
 }
 
 // ---------------------------------------------------------------- 记录一条请求
+
+// ---------------------------------------------------------------- 请求头随 URL 保存
+//
+// CDN 经常同时校验 Referer / Origin / Accept / User-Agent，只带一个 referer 会 403。
+// 这里把 onSendHeaders 看到的「安全头」按 requestId 暂存，record() 时挂到条目上，
+// 下载时 popup → background → 宿主原样重放。
+//
+// 只存白名单里的 5 个：不存 Cookie（另有 chrome.cookies 路径，且要按域过滤）、
+// 不存 Authorization（避免把令牌落到 storage.session）。
+const HDR_ALLOW = new Set(["referer", "origin", "accept", "accept-language", "user-agent"]);
+const HDR_MAX = 5;
+const pendingHeaders = new Map(); // requestId -> { h, t }
+
+function pickHeaders(list) {
+  const out = {};
+  let n = 0;
+  for (const h of list || []) {
+    const k = String((h && h.name) || "").toLowerCase();
+    if (!HDR_ALLOW.has(k)) continue;
+    const v = String((h && h.value) || "");
+    // 头注入：值里出现 CR/LF 一律丢弃；超长值也可能是畸形请求
+    if (!v || v.length > 300 || /[\r\n]/.test(v)) continue;
+    out[k] = v;
+    if (++n >= HDR_MAX) break;
+  }
+  return out;
+}
+
+function rememberHeaders(details) {
+  const h = pickHeaders(details.requestHeaders);
+  if (!Object.keys(h).length) return;
+  pendingHeaders.set(details.requestId, { h, t: Date.now() });
+  // 上限保护：请求量大时按时间淘汰，别让 Map 无限长
+  if (pendingHeaders.size > 800) {
+    const old = [...pendingHeaders.entries()].sort((a, b) => a[1].t - b[1].t).slice(0, 300);
+    for (const [k] of old) pendingHeaders.delete(k);
+  }
+}
+
+function headersOf(requestId) {
+  const rec = pendingHeaders.get(requestId);
+  return rec ? rec.h : undefined;
+}
 
 function headerValue(headers, name) {
   if (!headers) return "";
@@ -172,8 +244,17 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
   }
   const rec = ensureTab(d.tabId);
   const mime = headerValue(d.responseHeaders, "content-type");
-  const kind = classify(d.url, mime);
   const size = Number(headerValue(d.responseHeaders, "content-length")) || 0;
+  let kind = classify(d.url, mime);
+  // 兜底升级：扩展名和 content-type 都给不出结论时（octet-stream、无扩展名的
+  // CDN 地址），用「体积 + 已知 CDN / 扩展名」再判一次，避免真视频落到「其他」栏。
+  if ((kind === "other" || kind === "doc") && self.MSDetect) {
+    try {
+      const alt = self.MSDetect.kindOf(d.url, mime, size);
+      if (alt) kind = alt;
+    } catch (e) { /* 判定失败不影响主流程 */ }
+  }
+  const hdr = headersOf(d.requestId);
 
   // 最小体量门槛（见 MIN_MEDIA_BYTES 注释）：明确小于门槛的完整响应丢弃。
   // 206 分段响应跳过门槛（content-length 只是分段长度，真体量靠后续 existed 分支补）。
@@ -187,6 +268,7 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
     existed.t = now;
     if (size > (existed.s || 0)) existed.s = size; // Range 请求的 content-length 只是分段长度
     if (!existed.m && mime) existed.m = mime;
+    if (hdr && !existed.hdr) existed.hdr = hdr;
     confirmPageItem(existed);
     flushSoon(d.tabId);
     return;
@@ -195,7 +277,7 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
   if (rec.items.size >= MAX_PER_TAB) return;
   if (kind === "seg" && countKind(rec, "seg") >= MAX_SEGMENTS) return;
 
-  rec.items.set(d.url, {
+  const item = {
     u: d.url,
     k: kind,
     m: mime.split(";")[0],
@@ -203,7 +285,9 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
     hits: 1,
     t: now,
     i: d.initiator || "",
-  });
+  };
+  if (hdr) item.hdr = hdr;
+  rec.items.set(d.url, item);
   rec.items.get(d.url).f = fileNameOf(d.url);
   flushSoon(d.tabId);
   bumpBadge(d.tabId, kind, rec);
@@ -918,6 +1002,28 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["http://*/*", "https://*/*"] }
 );
 
+// 请求头在响应之前发出，所以 onSendHeaders 总比 record()（onHeadersReceived）早。
+// extraHeaders 是拿到 Referer/Origin 这类「受限头」的必要条件（Chrome 72+）。
+if (chrome.webRequest.onSendHeaders) {
+  chrome.webRequest.onSendHeaders.addListener(
+    (details) => {
+      if (!loaded || details.tabId < 0) return;
+      rememberHeaders(details);
+    },
+    { urls: ["http://*/*", "https://*/*"] },
+    ["requestHeaders", "extraHeaders"]
+  );
+}
+
+// 请求结束就清掉，避免长会话里 Map 越攒越多
+for (const ev of ["onCompleted", "onErrorOccurred"]) {
+  if (!chrome.webRequest[ev]) continue;
+  chrome.webRequest[ev].addListener(
+    (details) => { pendingHeaders.delete(details.requestId); },
+    { urls: ["http://*/*", "https://*/*"] }
+  );
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   state.delete(tabId);
   badgeTimer.delete(tabId);
@@ -1004,8 +1110,93 @@ function ensureNativeForBridge(port) {
   return np;
 }
 
+// ---------------------------------------------------------------- 页面 → 宿主的准入校验
+//
+// content.js 会把页面通过 postMessage 发来的 cmd:"host-send" 原样转到这个端口。
+// 页面主世界（MAIN world）里的脚本和注入脚本是同一个执行环境，**任何页面脚本**
+// 都能伪造这条消息，因此这里必须当成不可信输入处理：
+//
+//   · 只放行页面真正需要的动作（下载任务由 background 自己发起，页面不需要 download）
+//   · URL 只允许 http/https，挡掉 file:/javascript:/data: 这些本地读取入口
+//   · outdir 一律丢弃：下载目录只能来自扩展设置，否则页面可以往启动目录写文件
+//   · Cookie 只回传给与页面同站的地址，避免把当前站点 Cookie 发给第三方
+//
+// 宿主侧（sniffer_host.py）还有一层独立的校验，这里是第一道闸。
+const HOST_ACTIONS_PAGE = new Set([
+  "ping", "cancel", "log", "reveal", "open-log", "open_log",
+  "msfile_start", "msfile_chunk", "msfile_end", "msfile_abort", "msfile_merge",
+]);
+const SAFE_JOB_ID = /^[A-Za-z0-9._-]{1,80}$/;
+const HTTP_URL = /^https?:\/\//i;
+
+function urlHost(u) {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(String(u || ""));
+  if (!m) return "";
+  return m[1].replace(/^[^@]*@/, "").replace(/:\d+$/, "").toLowerCase();
+}
+
+/** 只取 path：query/hash 变化不算换页（同页筛选不该清空列表） */
+function pathOfUrl(u) {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*([^?#]*)/i.exec(String(u || ""));
+  return m ? (m[1] || "/") : String(u || "");
+}
+
+/** 取「可注册域名」（近似 eTLD+1），用于判断两个 URL 是否同站 */
+function siteKeyOf(host) {
+  const h = String(host || "").replace(/^\./, "");
+  if (!h) return "";
+  const parts = h.split(".");
+  if (parts.length <= 2) return h;
+  const twoLevel = /^(com|net|org|gov|edu|co|ac|or|ne|go|mil)\.(cn|uk|jp|hk|tw|kr|au|br|nz|za|mx|sg|in|tr)$/;
+  const last2 = parts.slice(-2).join(".");
+  if (twoLevel.test(last2) && parts.length >= 3) return parts.slice(-3).join(".");
+  return last2;
+}
+
+/**
+ * 校验并清洗一条页面发往宿主的消息。
+ * @returns 清洗后的消息；不合法返回 null
+ */
+function validateHostPayload(raw, tabUrl) {
+  if (!raw || typeof raw !== "object") return null;
+  const action = String(raw.action || "");
+  if (!HOST_ACTIONS_PAGE.has(action)) return null;
+
+  const msg = Object.assign({}, raw);
+  // 下载目录只能由扩展设置决定，页面无权指定
+  delete msg.outdir;
+
+  for (const k of ["url", "referer", "tabUrl"]) {
+    if (msg[k] === undefined) continue;
+    const v = String(msg[k] || "");
+    if (v && !HTTP_URL.test(v)) return null;
+    msg[k] = v;
+  }
+
+  // Cookie 只在目标与当前页面同站时携带
+  if (msg.cookie) {
+    const target = urlHost(msg.url || msg.tabUrl);
+    const page = urlHost(tabUrl);
+    if (!target || !page || siteKeyOf(target) !== siteKeyOf(page)) delete msg.cookie;
+  }
+
+  // reveal 的 file 只能是本地路径：挡掉 javascript:/file: 这类伪协议。
+  // 注意不能误伤 Windows 盘符（C:\...）—— 单字母 + 冒号不算协议。
+  if (msg.file !== undefined) {
+    const f = String(msg.file || "");
+    if (f && /^[a-z][a-z0-9+.-]+:/i.test(f)) return null;
+    msg.file = f;
+  }
+
+  // 任务 id 会被宿主拼进文件名，必须挡住路径分隔符
+  if (msg.id !== undefined && msg.id !== "" && !SAFE_JOB_ID.test(String(msg.id))) return null;
+
+  return msg;
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (!port || port.name !== "ms-host-bridge") return;
+  const tabUrl = (port.sender && port.sender.tab && port.sender.tab.url) || "";
 
   port.onMessage.addListener((msg) => {
     const np = ensureNativeForBridge(port);
@@ -1013,11 +1204,22 @@ chrome.runtime.onConnect.addListener((port) => {
       try { port.postMessage({ id: msg && msg.id, action: "error", ok: false, error: "无法连接本地下载器（是否已运行 install.bat？）" }); } catch (e) { /* 忽略 */ }
       return;
     }
+    const safe = validateHostPayload(msg, tabUrl);
+    if (!safe) {
+      try {
+        port.postMessage({
+          id: msg && msg.id, action: "error", ok: false,
+          error: "请求被拒绝：动作或地址不合法",
+        });
+      } catch (e) { /* 忽略 */ }
+      noteError("bridge-reject", String((msg && msg.action) || "?"));
+      return;
+    }
     try {
-      np.postMessage(msg);
+      np.postMessage(safe);
       // 把这条请求的 id 登记为「属于这个页面」，宿主回来后只发给它
-      if (msg && msg.id) bridgeOwner.set(String(msg.id), port);
-      watchFileReq(msg, port);
+      if (safe.id) bridgeOwner.set(String(safe.id), port);
+      watchFileReq(safe, port);
     } catch (e) {
       try { port.postMessage({ id: msg && msg.id, action: "error", ok: false, error: String(e.message || e) }); } catch (err) { /* 忽略 */ }
     }
@@ -1150,6 +1352,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const p = msg.payload || {};
         const tid = sender.tab && sender.tab.id;
         if (tid == null) { sendResponse({ ok: false }); break; }
+        // 单页应用导航（B 站、小红书都是）：pushState 不会触发 tabs.onUpdated，
+        // 上一个页面的条目和 xhsVid 会一直留着，表现为「换了视频就抓不到」、
+        // 「列表里混着已经离开的帖子的图」。这里按 path 变化重置整个 tab。
+        if (p.cmd === "nav") {
+          const nextUrl = String(p.url || "");
+          const cur = state.get(tid);
+          if (nextUrl && (!cur || pathOfUrl(cur.url) !== pathOfUrl(nextUrl))) {
+            state.set(tid, { url: nextUrl, items: new Map(), dirty: false });
+            try { chrome.action.setBadgeText({ tabId: tid, text: "" }); } catch (e) { /* 忽略 */ }
+            try { chrome.storage.session.remove("tab:" + tid); } catch (e) { /* 忽略 */ }
+          } else if (cur && nextUrl) {
+            cur.url = nextUrl;
+          }
+          sendResponse({ ok: true });
+          break;
+        }
         if (p.cmd === "found" || p.cmd === "progress") {
           recordPageMedia(tid, (sender.tab && sender.tab.url) || "", p);
         } else if (p.cmd === "saved") {
@@ -1257,6 +1475,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             referer: msg.referer || "",
             tabUrl: msg.tabUrl || "",
             cookie,
+            // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
+            // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
+            headers: msg.headers || {},
             concurrency: settings.concurrency || 16,
             outdir: settings.outdir || "",
           });

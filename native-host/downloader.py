@@ -30,6 +30,11 @@ import urllib.error
 import urllib.request
 
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MediaSniffer")
+
+# CREATE_NO_WINDOW 只在 Windows 上成立。POSIX 只要传了 creationflags 就抛
+# ValueError("creationflags is only supported on Windows platforms")，
+# 所以这里预先把参数做成空字典，调用点统一用 **展开。
+_NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import library  # noqa: E402  统一的下载目录定位（默认 D:/软件应用/DSH/文件存放处）
@@ -42,16 +47,26 @@ UA = (
 
 ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _job_id_or_raise(job_id):
+    """job id 会被拼进文件名。宿主侧已经校验过一次，这里再挡一次：
+    手工改过的 job 文件、旧版本残留的坏 id 都不该把文件写到 jobs/ 之外。"""
+    jid = str(job_id or "")
+    if not JOB_ID_RE.match(jid):
+        raise ValueError("invalid job id: %r" % (jid[:80],))
+    return jid
 
 
 def status_path(job_id):
     """状态文件路径。<id>.json；对照的取消标记是同目录的 <id>.cancel"""
-    return os.path.join(JOBS_DIR, job_id + ".json")
+    return os.path.join(JOBS_DIR, _job_id_or_raise(job_id) + ".json")
 
 
 def cancel_path(job_id):
     """取消标记路径。宿主写、worker 只读，存在即取消。"""
-    return os.path.join(JOBS_DIR, job_id + ".cancel")
+    return os.path.join(JOBS_DIR, _job_id_or_raise(job_id) + ".cancel")
 
 
 def write_status(job_id, **fields):
@@ -188,12 +203,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         "--hls-prefer-native",
         "--output", outtmpl,
     ]
-    if job.get("referer"):
-        cmd += ["--referer", job["referer"]]
-    if job.get("cookie"):
-        cmd += ["--add-header", "Cookie:" + job["cookie"]]
-    if job.get("tabUrl"):
-        cmd += ["--add-header", "Origin:" + _origin(job["tabUrl"])]
+    cmd += ytdlp_header_args(job)
     if ffmpeg:
         cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
         if job.get("kind") in ("video", "audio"):
@@ -210,7 +220,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
+        **_NO_WINDOW,  # Windows 上不弹窗
     )
 
     final_file = ""
@@ -269,6 +279,40 @@ def _origin(tab_url):
         return ""
 
 
+def ytdlp_header_args(job):
+    """把 Referer / Cookie / Origin / 抓到的请求头 转成 yt-dlp 参数。
+
+    单独拎出来是为了能测：这里的顺序和去重直接决定 CDN 会不会 403。
+    同名头只加一次 —— 重复的 Origin 会让一部分 CDN 直接拒绝。
+    """
+    args = []
+    seen = set()
+
+    def add(key, value):
+        args.extend(["--add-header", "%s:%s" % (key, value)])
+        seen.add(key.lower())
+
+    if job.get("referer"):
+        args += ["--referer", job["referer"]]
+        seen.add("referer")
+    if job.get("cookie"):
+        add("Cookie", job["cookie"])
+
+    # 抓取时实际发出的头（宿主侧已按白名单过滤）。先于下面「从 tabUrl 推导
+    # Origin」加入，这样真实 Origin 优先于推导值。
+    for hk, hv in (job.get("headers") or {}).items():
+        key = str(hk).lower()
+        if key in seen:
+            continue
+        add(key.title(), hv)
+
+    if "origin" not in seen and job.get("tabUrl"):
+        origin = _origin(job["tabUrl"])
+        if origin:
+            add("Origin", origin)
+    return args
+
+
 # ---------------------------------------------------------------- 普通文件路径
 
 def run_urllib(job):
@@ -298,6 +342,13 @@ def run_urllib(job):
         headers["Referer"] = job["referer"]
     if job.get("cookie"):
         headers["Cookie"] = job["cookie"]
+    # 抓取时看到的头：补上 Origin / Accept / Accept-Language / UA。
+    # 已有同名头时不覆盖（referer/cookie/ua 上面的取值更可信）。
+    for hk, hv in (job.get("headers") or {}).items():
+        name_k = str(hk).title()
+        if name_k in headers:
+            continue
+        headers[name_k] = hv
 
     part = path + ".part"
     resumed = 0
@@ -380,7 +431,7 @@ def probe_duration(ffprobe, path):
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=30,
-            creationflags=0x08000000,
+            **_NO_WINDOW,
         )
         return float(out.stdout.strip() or 0) or 0.0
     except Exception:
@@ -440,7 +491,7 @@ def run_merge(job):
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
+        **_NO_WINDOW,  # Windows 上不弹窗
     )
 
     # stderr 必须排空，否则错误输出攒多了会把管道写满、ffmpeg 卡死

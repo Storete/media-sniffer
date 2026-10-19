@@ -24,6 +24,11 @@ NH = os.path.join(ROOT, "native-host")
 PY = sys.executable
 sys.path.insert(0, NH)
 
+
+def _no_window():
+    """POSIX 上传 creationflags 会 ValueError，只有 Windows 需要这个参数。"""
+    return {"creationflags": 0x08000000} if os.name == "nt" else {}
+
 TMP = tempfile.mkdtemp(prefix="ms-merge-test-")
 JOBS = os.path.join(TMP, "jobs")
 os.makedirs(JOBS, exist_ok=True)
@@ -69,22 +74,36 @@ def make_streams(dirpath):
         sys.exit(0)
     video = os.path.join(dirpath, "t-video.mp4")
     audio = os.path.join(dirpath, "t-audio.m4a")
-    cf = 0x08000000  # CREATE_NO_WINDOW
-    subprocess.run(
-        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", video],
-        check=True, capture_output=True, creationflags=cf)
+    # POSIX 上传 creationflags 会 ValueError，只有 Windows 需要
+    cf = _no_window()
+
+    def make_video(codec):
+        return subprocess.run(
+            [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
+             "-c:v", codec, "-pix_fmt", "yuv420p", video],
+            capture_output=True, **cf)
+
+    # 精简版 ffmpeg（很多 Linux 发行版/容器）没有 libx264，退回 mpeg4。
+    # 这个测试验的是「合并流程」，编码器不是被测对象，有能用的就行。
+    r = make_video("libx264")
+    if r.returncode != 0:
+        r = make_video("mpeg4")
+    if r.returncode != 0:
+        print("SKIP ffmpeg 没有可用的视频编码器（libx264/mpeg4 都失败）")
+        print((r.stderr or b"")[-400:].decode("utf-8", "replace"))
+        sys.exit(0)
+
     subprocess.run(
         [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
          "-c:a", "aac", audio],
-        check=True, capture_output=True, creationflags=cf)
+        check=True, capture_output=True, **cf)
     return video, audio, ffmpeg
 
 
 def probe_streams(ffprobe, path):
     out = subprocess.run(
         [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", path],
-        capture_output=True, text=True, creationflags=0x08000000)
+        capture_output=True, text=True, **_no_window())
     try:
         data = json.loads(out.stdout)
     except Exception:

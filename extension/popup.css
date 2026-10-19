@@ -341,3 +341,30 @@ footer {
   word-break: break-all;
   text-align: center;
 }
+
+/* ---------------------------------------------------------------- 批量选择 */
+.sel-box {
+  width: 15px; height: 15px; flex: 0 0 15px;
+  margin: 0 2px 0 0;
+  cursor: pointer;
+  accent-color: var(--brand);
+}
+.item.selectable { cursor: pointer; }
+.item.selectable.picked { border-color: var(--brand); background: var(--brand-soft); }
+
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+.batch-bar.hidden { display: none; }
+.batch-bar .sel-all { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.batch-bar .sel-count { margin-left: auto; color: var(--text-dim); font-size: 12px; }
+.icon-btn.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+
+/* 空态里的操作按钮 */
+.empty-actions { display: flex; gap: 8px; justify-content: center; margin-top: 14px; }
+.empty.blocked b { color: var(--text); }

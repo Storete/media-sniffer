@@ -15,7 +15,9 @@
       </div>
     </div>
     <div class="actions">
+      <button id="selectToggle" class="icon-btn" title="批量选择页面内捕获的条目">☑</button>
       <button id="saveAll" class="icon-btn" title="把所有页面内捕获的视频/音频交给页面保存">⇩</button>
+      <button id="blockSite" class="icon-btn" title="屏蔽此站（不再显示本页资源）">🚫</button>
       <button id="reload" class="icon-btn" title="重新载入页面以捕获全部资源">⟳</button>
       <button id="clear" class="icon-btn" title="清空当前列表">🗑</button>
     </div>
@@ -26,6 +28,14 @@
   <main id="list" class="list">
     <div class="empty">正在读取…</div>
   </main>
+
+  <div id="batchBar" class="batch-bar hidden">
+    <label class="sel-all"><input id="selAllBox" type="checkbox" /> 全选</label>
+    <button id="selInv" class="btn-txt">反选</button>
+    <span id="selCount" class="sel-count">已选 0 项</span>
+    <button id="selSave" class="btn-txt tint-blue" disabled>保存所选</button>
+    <button id="selDone" class="btn-txt">完成</button>
+  </div>
 
   <div id="preview" class="preview hidden">
     <button id="previewClose" class="icon-btn preview-close" title="关闭预览">✕</button>
