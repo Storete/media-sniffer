@@ -393,12 +393,18 @@ onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不�
 
 | # | 问题 | 排查起点 | 状态 |
 |---|---|---|---|
-| A1 | 首页信息流封面不加序号 | `background.js` 的 `renumberImages()`：`isXhsDetailUrl(tabUrl)` 为假时跳过编号 | 待办 |
+| A1 | 首页信息流封面不加序号 | 已修：`renumberImages()` 里小红书非详情页「有标题就跳过编号」 | **已完成** [d-015](DEVLOG.md#d-015) |
 | A2 | B 站图片只取所点开视频的封面 | `inject-main.js` 的 `scanImages()` 加 B 站站点钩子，只留 `videoData.pic` | 待办 |
 | A3 | Telegram 视频和图片下载全部失效 | 先真机复现：重载扩展 → 打开 Telegram → 点保存，看断在 `fetchRange` 还是 `hostRequest` | 待办 |
 | A4 | 「本次记录」改名为「下载记录」 | `popup.html` 的 `historyBtn`、`popup.js` 的 `renderHistory` 标题与空列表提示 | 待办 |
 
-**顺序：A1 → A2 → A3 → A4。**
+**顺序：A1 ✅ → A2 → A3 → A4。**
+
+> **编号的语义**：它表达的是「**同一条内容里的第几张**」。
+> 所以 Telegram 相册、小红书详情页要编号；信息流、推荐位、搜索结果的每条
+> 都是独立内容，**编号从语义上就无意义**——不是实现问题（[d-015](DEVLOG.md#d-015)）。
+> 改动 `renumberImages` 时注意：`mark` 是**状态**不是每轮重算的结果，
+> 不在分组里的条目会保留上一轮的值。
 
 ### 9.5 新计划（未开始）：MSE buffer 重组
 
