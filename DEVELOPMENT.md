@@ -317,13 +317,70 @@ URL 不同就记成两条。修法是 `dedupeXhsNoteImages()` 按 pathname（砍
 
 | # | 问题 | 现象 / 排查起点 | 状态 |
 |---|---|---|---|
-| A0 | **功能模块化（先讨论方案）** | 用户 m06569：「图片和视频下载是否有通用的代码，是否需要针对特定应用添加逻辑。明天开始先讨论这个问题，讨论出方案，再解决其他问题」。核心：现在 `inject-main.js` 里图片扫描 / 视频嗅探 / Range 下载 / 站点适配（B 站、小红书、Telegram）是同一套，站点专属逻辑散落在 `scanImages`/`scanMedia`/`guessTitle`/`runRangeDownload` 各处 if 分支。要评估是否抽出通用层（通用扫描器 + 站点插件点），以及各站点真正需要特化的只有哪些点。**讨论完再定，不擅自重构。** | 待讨论 |
+| A0 | **功能模块化（先讨论方案）** | 用户 m06569：「图片和视频下载是否有通用的代码，是否需要针对特定应用添加逻辑」。方案 A 已落地，见 9.0b。 | **已完成（第一步）** |
 | A1 | 首页信息流封面不加序号 | 真机截图：信息流封面标题各不相同却仍带 ①②③ 编号（`①于小…`、`①好…`）。序号机制在 `background.js` 的 `renumberImages()`：详情页整帖共用一个序号池（`gk = "xhs"`）；首页 feed 现在有了 `xhsFeedTitle()` 标题（本轮新加），但分组逻辑仍按 `k+ref` 给编号。改法：首页 feed（`isXhsDetailUrl(tabUrl)` 为假）时跳过编号（每条 mark 置空），只有详情页保留 ①②③。 | 待办 |
 | A2 | B 站图片只取所点开视频的封面 | 现在 B 站页面会把预览图/推荐图/头像等混进列表。改法：在 `inject-main.js` 的 `scanImages()` 加 `isBiliHost()` 分支——视频页（`/video/BV…` 或 `__playinfo__` 存在）时只保留当前视频封面（`__INITIAL_STATE__.videoData.pic` 或 `<img class="bpx-player-cover">` / `.video-info` 内的图），其余图全部跳过。 | 待办 |
 | A3 | Telegram 视频和图片下载全部失效 | 用户原话「Telegram视频和图片下载全部失效」。Telegram 上轮实测依赖 `include` 凭据 + `no-store`；本轮 `fetchRange` 的 `cacheMode` 改过（omit→default），且 `hostWrite` 加了 signal 透传、`msfile_abort` 加了 10s 超时——需先在真机复现：重载扩展→打开 Telegram→点图片「保存」看在哪一步断（fetchRange？hostRequest？）。排查时注意 `onDisc` 分支的「连接已断开」提示和 host.log。 | 待办 |
 | A4 | 「本次记录」改为「下载记录」 | 用户 m06575：「把 本次记录 改为 下载记录」。改 `extension/popup.html` 的 `historyBtn` 文案、`extension/popup.js` 的 `renderHistory` 里 `<h4>` 标题「本次下载记录」→「下载记录」、以及空列表提示「本次会话还没有下载记录」→ 相应措辞。纯文案，无逻辑改动。 | 待办 |
 
 **处理顺序：A0（先讨论方案）→ A1 → A2 → A3 → A4，用户说「继续」即开始。**
+
+### 9.0b A0 功能模块化（2026-10-19，第一步已完成）
+
+**结论：通用层本来就是通用的，病灶只在「站点判断散落各处」。**
+
+先按数据流把 `inject-main.js` 切了一遍，回答用户那个问题「图片和视频下载是否有通用的代码」：
+
+| 层 | 是否通用 | 说明 |
+|---|---|---|
+| 发现层（`scanImages`/`scanMedia` 轮询、`hookSourceBuffer`、`noteMediaResp`） | **100% 通用** | 不认站点 |
+| 上下文层（`guessTitle`/`mediaContext`/`ordOfMedia`） | 接口通用、实现特化 | 最该抽的地方 |
+| 归属层（这张图属于当前内容吗） | 接口通用、实现特化 | 小红书有，Telegram 有（消息 id），B 站没有 |
+| 下载层（`runRangeDownload`/`fetchRange`/`probeTotal`） | **100% 通用** | 与站点无关 |
+| 清单层（从哪儿拿完整清单） | 只有 B 站 / 小红书有 | `__playinfo__` / `imageList` |
+
+**病灶**：站点判断散在 5 个通用函数里（`guessTitle`、`scanImages`、`scanMedia`、`handleMediaSrc`、`reportXhsVideo`），
+每加一个站点就要改 4~5 个通用函数。这不叫模块化，叫 if 汤。
+
+**方案 A（用户 m06576 选定），两步走：**
+
+- **第一步（本轮完成）**：建 `SITES` 注册表 + `activeSite()`，把 5 个通用函数里的
+  `if (isXhsHost())` 换成 `site.xxx?.()` 调用。**特化实现一行没搬**（仍调用原有 `xhs*` 函数），
+  所以行为完全不变、回归风险最低。
+- **第二步（后续轮次）**：把 555–1118 的小红书代码和 B 站那 389 行物理搬进各自对象内部。
+
+**站点钩子（全部可选，不实现走通用默认）：**
+
+```js
+match()            // 是否当前站点（唯一必须实现的）
+isDecorImg(el,src) // 装饰图：头像/logo/二维码/评论图
+isImageOnly(el,src)// 只对 <img> 生效的额外筛选（如「只认某个 CDN 签名」）
+isDecorVideo(el)   // 装饰视频
+owns(el)           // 归属：属于「当前正在看的内容」吗
+title(el)          // 标题（返回 "" = 没结论，交给通用实现）
+videoSrc(el,src)   // blob: → 真实可下地址（返回 "" = 拿不到，本轮跳过）
+feedImages()       // 完整清单（如 imageList）
+onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不用扫 DOM
+```
+
+**踩到的坑（重要）**：一开始把 `imgIsXhsNote(src)` 塞进了 `owns` 钩子，结果
+`[5z]` 两项视频测试变红——因为视频的 `<video>` 元素 `src` 是 `blob:`，
+而签名判据针对的是图片 URL，`blob:` 必然不匹配 → 视频被误杀。
+**教训：`owns` 只该回答「归属」，不该掺 URL 签名这类「类型相关」的检查。**
+最终拆成独立钩子 `isImageOnly`，只在校验 `<img>` 时调用。
+
+**新增架构测试 `test/site_registry.test.js`（14 项）**——这是本轮最值钱的产出：
+- `[A0-1]` 注册表存在、每个站点都有 `match`
+- `[A0-2]` **通用函数体内（去掉注释后）不许出现 `isXhsHost()` / `isBiliHost()` / `xiaohongshu` / `bilibili`**
+- `[A0-3]` 钩子确实通过 `site.xxx` 转发，没有硬编码
+
+模块化一旦没有约束，下一个人加站点最省事的做法仍然是在 `scanImages` 里再抄一个 if，
+几个月后又会退化。把它变成测试，退化会立刻变红。
+
+**测试结果**：`site_registry` 14 项全过；全量 JS **364 → 378 项**（main-hook 160 /
+background 135 / range_parallel 14 / detect 30 / pattern_sync 4 / popup_wiring 21 / site_registry 14），
+Python 8 套件全 PASS。CI workflow 已补上新增的 4 个套件。
+
 
 
 ### 9.1 第十轮已完成：小红书「别人帖子的图/视频」彻底剥离

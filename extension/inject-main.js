@@ -369,14 +369,12 @@
 
   function guessTitle(el) {
     try {
-      // 小红书详情页：标题在 __INITIAL_STATE__ 里，DOM 上找不到（见 xhsNoteTitle 注释）
-      if (isXhsHost() && xhsCurrentNoteId()) {
-        const t = xhsNoteTitle();
-        if (t) return t;
-      }
-      // 小红书首页/发现页：封面的标题在它所属 note-item 卡片的文字区里
-      if (isXhsHost()) {
-        const t = xhsFeedTitle(el);
+      // 站点特化（A0 模块化）：先问站点「你知道这段媒体的标题吗」。
+      // 小红书详情页标题在 __INITIAL_STATE__、首页标题在 note-item 卡片的文字区，
+      // 两者 DOM 通用逻辑都抓不到。站点返回 "" 就继续走下面的通用实现。
+      const site = activeSite();
+      if (site && site.title) {
+        const t = site.title(el);
         if (t) return t;
       }
       const t = el.getAttribute("title") || el.getAttribute("aria-label") || el.title;
@@ -550,6 +548,43 @@
       } catch (e) { /* 忽略 */ }
       return origSetAttr.call(this, name, value);
     };
+  }
+
+  // ------------------------------------------------------------ 2c. 站点注册表（SITES）
+  //
+  // 用户诉求（2026-10-19 A0）：功能模块化 —— 「图片和视频下载是否有通用的代码，
+  // 是否需要针对特定应用添加逻辑」。
+  //
+  // 答案：**通用层是真的通用**（扫描 / 上下文 / 归属 / Range 下载全都不认站点），
+  // 需要特化的只有 5 个点。以前这 5 个点是散在通用函数里的 `if (isXhsHost())`，
+  // 每加一个站点就要去改 4~5 个通用函数。现在改成：
+  //
+  //   通用层只问「当前站点是谁」→ 把请求转给对应站点对象 → 站点没实现就用默认实现。
+  //
+  // 加新站点 = 往 SITES 里加一个对象，**不需要再动通用函数**。
+  //
+  // 钩子一览（全部可选，不实现就走通用默认）：
+  //   match()              是否当前站点（必须实现，否则这个对象永远不会被选中）
+  //   isDecorImg(el, src)  装饰图（头像/logo/二维码/站内素材）→ true 就跳过
+  //   isImageOnly(el, src) 只对 <img> 生效的额外筛选（如「只认某个 CDN 签名」）
+  //   isDecorVideo(el)     装饰视频（播放器 UI 的小视频）→ true 就跳过
+  //   owns(el)             归属：这个元素属于「当前正在看的内容」吗（如小红书当前帖子）
+  //   title(el)            标题（返回 "" 表示本钩子没结论，交给下面的通用实现）
+  //   videoSrc(el, src)    把 blob:/占位地址换成真实可下地址（返回 "" / null 表示拿不到）
+  //   feedImages()         当前内容的「完整清单」（如小红书 imageList），没有就返回 null
+  //   onScanImages()       每轮图片扫描前的站点钩子（清单类站点在这里一次性上报）
+  //
+  // 注意定义顺序：这些函数都是 `function` 声明（函数提升），SITES 里的引用
+  // 在**调用时**才解析，所以小红书的实现写在本段之后也没问题。
+  const SITES = [];
+
+  function activeSite() {
+    try {
+      for (const s of SITES) {
+        try { if (s.match && s.match()) return s; } catch (e) { /* 单个站点匹配失败不影响其他 */ }
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
   }
 
   // ------------------------------------------------------------ 小红书：只抓当前帖子
@@ -1053,6 +1088,54 @@
   }
 
 
+  // ---- 小红书站点对象（A0 模块化：把散在通用函数里的 if 收进这里）----
+  //
+  // 只做「转发」，实现仍调用下面那一堆 xhs* 函数，一行没搬、行为不变。
+  SITES.push({
+    name: "xiaohongshu",
+    match: () => isXhsHost(),
+
+    isDecorImg: (el, src) => imgIsXhsDecor(el) || imgIsXhsComment(src) || xhsInComment(el),
+
+    isDecorVideo: (el) => videoIsXhsDecor(el),
+
+    // 详情页：不属于当前帖子的一律不要（含信息流他帖 + 评论区视频）。
+    // 首页/发现页：只要信息流卡片里的图（导航/弹窗杂图不要）。
+    owns: (el) => (xhsCurrentNoteId() ? imgBelongsToCurrentNote(el) : xhsFeedCardImg(el)),
+
+    // 详情页图片还多一道：只认 CDN 大图签名（别的帖子的封面、站内素材没有这个签名，
+    // 但它们有尺寸、有 class，装饰图判据拦不住）。只对 <img> 生效，视频不适用。
+    isImageOnly: (el, src) => !xhsCurrentNoteId() || imgIsXhsNote(src),
+
+    // 详情页标题在 __INITIAL_STATE__，首页标题在 note-item 卡片的文字区
+    title: (el) => (xhsCurrentNoteId() ? xhsNoteTitle() : "") || xhsFeedTitle(el),
+
+    // blob: → __INITIAL_STATE__ 里的真实 mp4；拿不到返回 ""（本轮回退为跳过）
+    videoSrc: (el) => {
+      const real = xhsVideoSource();
+      if (!real || !real.url) return "";
+      try {
+        if (real.w && real.h) { el.__msW = real.w; el.__msH = real.h; }
+        if (real.duration) el.__msDur = Math.round(real.duration / 1000);
+      } catch (e) { /* 忽略 */ }
+      el.__msOrd = 0;   // 视频帖里视频是正文第一件东西
+      return real.url;
+    },
+
+    // 详情页有完整配图清单（比 DOM 扫描全，且天然只含当前帖子）
+    feedImages: () => (xhsCurrentNoteId() ? xhsNoteImages() : null),
+
+    // 清单通路：一次性报完配图 + 视频本体，然后告诉通用层「这轮不用扫 DOM 了」
+    onScanImages: () => {
+      if (!xhsCurrentNoteId()) return false;
+      const noteImgs = xhsNoteImages();
+      if (!noteImgs || !noteImgs.length) return false;
+      scanXhsNoteImages(noteImgs);
+      reportXhsVideo(xhsNoteVideoInfo());
+      return true;
+    },
+  });
+
   function scanMedia() {
     try {
       // 后台标签页不扫：600ms 一轮的全文档查询在隐藏页上纯属浪费电量，
@@ -1064,35 +1147,22 @@
         try { src = el.currentSrc || ""; } catch (e) { /* 忽略 */ }
         if (!src && typeof el.src === "string") src = el.src;
         if (!src) continue;
-        // 小红书（2026-10-18 第七轮）：视频逻辑和图片一样 ——
-        // 详情页只要当前帖子的视频，跳过装饰/其他帖子的视频。
-        if (isXhsHost() && el.tagName === "VIDEO") {
-          if (videoIsXhsDecor(el)) continue;
-          if (xhsCurrentNoteId() && !imgBelongsToCurrentNote(el)) continue;
-          // 第十轮：blob: 地址页面侧根本下不了，换成 __INITIAL_STATE__ 里的真实 mp4。
-          //
-          // 第十一轮补（真机帖子 6ad46958…）：原来只在 src 是 blob 时才换，
-          // 而且换失败就原样上报 blob。两个后果都对不上用户看到的画面：
-          //   · `__INITIAL_STATE__` 还没挂上时先报了 `blob:…`，它成为该视频的
-          //     唯一 found（seenSrc 挡着后续），弹出「页面视频（录制中）」，
-          //     点保存存下来是坏的；
-          //   · 同一元素还会被 MSE hook 记成 `m1`/`m2` 两条，列表里同时出现
-          //     「页面视频（录制中）」和「页内 m1」三个视频，用户不知道点哪个。
-          // 现在：小红书视频**只认真实地址**，拿不到就这一轮跳过（下一轮 600ms
-          // 再来），永远不往上报 blob。
-          const real = xhsVideoSource();
-          if (!real || !real.url) continue;
-          src = real.url;
-          // 真实地址拿到后直接给出尺寸/时长：<video> 那时可能还没 loadedmetadata，
-          // handleMediaSrc 会读到 0×0，列表里就是「大小未知」。
-          try {
-            if (real.w && real.h) { el.__msW = real.w; el.__msH = real.h; }
-            if (real.duration) el.__msDur = Math.round(real.duration / 1000);
-          } catch (e) { /* 忽略 */ }
-          // 序号：视频帖里视频是正文第一件东西（imageList 那条只是它的封面）。
-          // 用负数走「页面先把 ord 报给 handleMediaSrc」那条路不现实，这里直接
-          // 记在元素上，handleMediaSrc 末尾统一上报。
-          el.__msOrd = 0;
+        // 站点特化（A0 模块化）：装饰视频 / 归属 / 真实地址 / 尺寸，全交给站点对象。
+        // 以前这里是 `if (isXhsHost() && el.tagName === "VIDEO") { ... }` 一大块，
+        // 每加一个站点就要再抄一遍；现在通用层不认识任何站点。
+        const site = activeSite();
+        if (site && el.tagName === "VIDEO") {
+          if (site.isDecorVideo && site.isDecorVideo(el)) continue;
+          if (site.owns && !site.owns(el)) continue;
+          // blob: 地址在页面侧根本下不了，换成站点给的真实地址。
+          // 拿不到就这一轮跳过（下一轮 600ms 再来），**永远不往上报 blob** ——
+          // 否则它会成为该视频唯一的 found（seenSrc 挡着后续），
+          // 用户看到「页面视频（录制中）」、存下来还是坏的。
+          if (/^blob:/i.test(src) && site.videoSrc) {
+            const real = site.videoSrc(el);
+            if (!real) continue;
+            src = real;
+          }
         }
         handleMediaSrc(el, src);
       }
@@ -1257,21 +1327,11 @@
   function scanImages() {
     try {
       if (document.hidden) return;
-      // 小红书详情页：__INITIAL_STATE__ 里有这个帖子的完整配图清单（imageList），
-      // 比 DOM 扫描全（懒加载图 DOM 里根本没解码，尺寸是 0）、也天然只含当前帖子
-      // （不用在 77 个 1040g 的 <img> 里猜哪 7 张是正文）。读到了就走这条路，
-      // DOM 扫描整个跳过；读不到（页面结构变了）自动退回下面的老逻辑。
-      if (isXhsHost() && xhsCurrentNoteId()) {
-        const noteImgs = xhsNoteImages();
-        if (noteImgs && noteImgs.length) {
-          scanXhsNoteImages(noteImgs);
-          // 视频帖的封面之外还有那个 mp4 本体：它不依赖 <video> 元素（见
-          // reportXhsVideo 开头的说明），在这里一并补报，否则「点开笔记但
-          // 播放器没挂载」时整个视频都抓不到。
-          reportXhsVideo(xhsNoteVideoInfo());
-          return; // 已由直读通路报完，不再跑 DOM 扫描
-        }
-      }
+      // 站点「完整清单」通路（A0 模块化）：小红书详情页的 __INITIAL_STATE__.imageList
+      // 比 DOM 扫描全（懒加载图在 DOM 里根本没解码、尺寸是 0），也天然只含当前帖子。
+      // 站点报完了就 return，DOM 扫描整个跳过；报不出来（页面结构变了）自动退回老逻辑。
+      const site = activeSite();
+      if (site && site.onScanImages && site.onScanImages()) return;
       const els = [...document.querySelectorAll("img")];
       // 一次扫描内先算好位置，避免每张图各调一次 getBoundingClientRect
       const rows = els.map((el) => {
@@ -1290,27 +1350,16 @@
         // SW 缓存），DOM 上下文只有这里能补。真图（消息内容）跟图标（UI 装饰）
         // 靠 background 里的归属判定区分。
         if (!src || !/^(https?:|blob:)/i.test(src)) continue;
-        // 小红书：详情页只抓当前帖子的正文配图，首页/详情页都要跳过装饰图（头像/logo/二维码）。
-        if (isXhsHost()) {
-          if (imgIsXhsDecor(el)) continue;
-          // 评论区里贴的图（第 1 条诉求）。两条独立判据，任一命中就跳过：
-          //   · URL 带 `/comment/` 段（正文图没有这段，实测差异稳定）
-          //   · DOM 在评论区容器里（`comment-item` / `comment-picture` 等）
-          // 两条都要有：URL 判据防前端改版后 class 变了，DOM 判据防 URL 格式变了。
-          if (imgIsXhsComment(src) || xhsInComment(el)) continue;
-          // 详情页（有 noteId）：先按 CDN 大图签名筛掉明显不是正文的，
-          // 再用 DOM 归属判断「这张图属于当前帖子还是相关推荐里的别的帖子」。
-          // 只靠 URL 签名区分不开——别的帖子的正文配图也是同一个 1040g 签名。
-          if (xhsCurrentNoteId()) {
-            if (!imgIsXhsNote(src)) continue;
-            if (!imgBelongsToCurrentNote(el)) continue;
-          } else {
-            // 首页/发现页信息流：图二是捕获到的**别的帖子的封面**（我们是有意
-            // 抓它们的——用户在 feed 里看到想要的封面就该能保存）。这里只做
-            // 两件事：① 给每条封面对上它卡片的标题（xhsFeedTitle）；
-            // ② 排除信息流卡片外壳之外的东西（导航/弹窗里的杂图）。
-            if (!xhsFeedCardImg(el)) continue;
-          }
+        // 站点特化（A0 模块化）：
+        //   · isDecorImg —— 装饰图（小红书头像/logo/二维码；评论区贴图）直接跳过。
+        //     两条独立判据都实现在站点对象里（URL 带 /comment/ + DOM 在评论容器里），
+        //     前者防前端改版后 class 变了，后者防 URL 格式变了。
+        //   · 详情页还要再按 CDN 大图签名筛一层——别的帖子的正文配图也是同一个
+        //     1040g 签名，只靠 URL 区分不开，所以签名筛选和归属判定一起做。
+        if (site) {
+          if (site.isDecorImg && site.isDecorImg(el, src)) continue;
+          if (site.isImageOnly && !site.isImageOnly(el, src)) continue;
+          if (site.owns && !site.owns(el)) continue;
         }
         // 头像 / 贴纸是 Telegram 的 UI 装饰或非「照片内容」，不当作可保存的图片上报。
         // Avatar 类名（成员头像圆圈）、sticker 类名（消息里的贴纸）都跳过，

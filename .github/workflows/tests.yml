@@ -21,15 +21,28 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      # 三个套件都是纯 Node 脚本（vm 沙箱 + 假宿主），不需要 npm install
-      - name: main-hook（120 项）
+      # 纯 Node 脚本（vm 沙箱 + 假宿主），不需要 npm install
+      - name: main-hook（160 项）
         run: node test/main-hook.test.js
 
-      - name: background（88 项）
+      - name: background（135 项）
         run: node test/background.test.js
 
       - name: range_parallel（14 项）
         run: node test/range_parallel.test.js
+
+      - name: detect（30 项）
+        run: node test/detect.test.js
+
+      - name: pattern_sync（4 项）
+        run: node test/pattern_sync.test.js
+
+      - name: popup_wiring（21 项）
+        run: node test/popup_wiring.test.js
+
+      # 架构约束：通用层不许出现站点专属判断（防模块化回退成 if 汤）
+      - name: site_registry（14 项）
+        run: node test/site_registry.test.js
 
       - name: 语法检查
         run: |
