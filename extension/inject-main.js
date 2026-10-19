@@ -75,7 +75,17 @@
   let mseBytes = 0;          // mse 里实际占用的字节数
 
   const post = (data) => {
-    try { window.postMessage({ __ms_sniffer: true, ...data }, "*"); } catch (e) { /* 忽略 */ }
+    try {
+      const d = { __ms_sniffer: true, ...data };
+      // blob/MSE 条目本身不带内容身份（一个 blob: URL 看不出属于哪个帖子），
+      // background 的「同帖分片让位」（xhsVidNote === curNote）全靠这里补上
+      // 当前内容的站点内 id；补不上（非清单站点 / 旧版页面脚本）就不过滤，宁可多留。
+      if ((d.cmd === "found" || d.cmd === "progress") && !d.noteId) {
+        const nid = siteContentId();
+        if (nid) d.noteId = nid;
+      }
+      window.postMessage(d, "*");
+    } catch (e) { /* 忽略 */ }
   };
   const diag = (text) => {
     try { if (typeof window.__msDiag === "function") window.__msDiag(text); } catch (e) { /* 忽略 */ }
@@ -580,6 +590,12 @@
   //   saveHint()           浮层底部说明文案（站点专属话术），返回 "" 用通用文案
   //   onSaveStart()        重置站点自己的上报状态（B 站清去重签名）
   //
+  // ── 内容归属 / 回放钩子（d-018）──
+  //   contentId()          当前内容的站点内 id（小红书 = noteId）。post() 会把它
+  //                        补到不带 noteId 的 found/progress 上，background 靠它
+  //                        把「blob/MSE 分片让位」限定在同一个内容里
+  //   replayReport()       hello/rescan 回放时重报站点自己的合成条目（B 站 DASH）
+  //
   // 注意定义顺序：这些函数都是 `function` 声明（函数提升），SITES 里的引用
   // 在**调用时**才解析，所以小红书的实现写在本段之后也没问题。
   const SITES = [];
@@ -612,6 +628,20 @@
     const s = activeSite();
     if (!s || !s.onSaveStart) return;
     try { s.onSaveStart(); } catch (e) { /* 忽略 */ }
+  }
+
+  /** 当前内容的站点内 id（小红书 = noteId）：post() 给 blob/MSE 条目补内容归属用。 */
+  function siteContentId() {
+    const s = activeSite();
+    if (!s || !s.contentId) return "";
+    try { return String(s.contentId() || ""); } catch (e) { return ""; }
+  }
+
+  /** 重扫/回放时让站点把自己的合成条目重报一遍（B 站的 DASH 条目）。 */
+  function siteReplayReport() {
+    const s = activeSite();
+    if (!s || !s.replayReport) return;
+    try { s.replayReport(); } catch (e) { /* 忽略 */ }
   }
 
   // ------------------------------------------------------------ 小红书：只抓当前帖子
@@ -1121,6 +1151,10 @@
   SITES.push({
     name: "xiaohongshu",
     match: () => isXhsHost(),
+
+    // 当前帖子 id：post() 靠它给 blob/MSE 条目补内容归属，background 的
+    // 「分片让位」只对同一个 noteId 生效（d-018）。首页/发现页返回 ""。
+    contentId: () => xhsCurrentNoteId(),
 
     isDecorImg: (el, src) => imgIsXhsDecor(el) || imgIsXhsComment(src) || xhsInComment(el),
 
@@ -2713,6 +2747,10 @@
 
     // 每次开始保存前清空上报签名：否则 SPA 换集后签名不变，popup 标题停在旧集
     onSaveStart: () => { biliSig = ""; },
+
+    // hello/rescan 回放时重报 DASH 合成条目（上面 siteResetReport 已清签名，
+    // 这里才会真的再发一条 found 而不是被签名去重挡掉）
+    replayReport: () => reportBiliDash(),
   });
 
   function guessExtFromType(ct) {
@@ -3219,10 +3257,39 @@
 
   // ------------------------------------------------------------ 7. 指令
 
+  /** 扩展上下文失效的页内提示条（content.js 发 __ms_sniffer_stale 过来）。
+   *  主世界脚本本身还活着——只是和扩展的消息通道断了，所以这里能替它把话
+   *  亮出来；点一下就关。重复消息只保留一条。 */
+  function showStaleBanner(text) {
+    try {
+      if (document.getElementById("__ms_sniffer_stale_bar")) return;
+      const bar = document.createElement("div");
+      bar.id = "__ms_sniffer_stale_bar";
+      bar.textContent = text || "资源嗅探扩展刚更新过，本页需要刷新一次才能继续工作。";
+      bar.title = "点击关闭";
+      bar.style.cssText = [
+        "position:fixed", "top:14px", "right:14px", "z-index:2147483647",
+        "max-width:320px", "padding:10px 14px", "border-radius:10px",
+        "background:rgba(20,20,24,.92)", "color:#fff", "font-size:13px",
+        "line-height:1.5", "box-shadow:0 4px 16px rgba(0,0,0,.35)",
+        "cursor:pointer", "font-family:system-ui,sans-serif",
+      ].join(";");
+      bar.addEventListener("click", () => bar.remove());
+      (document.body || document.documentElement).appendChild(bar);
+    } catch (e) { /* 忽略 */ }
+  }
+
   window.addEventListener("message", (e) => {
     if (e.source !== window) return;
     const d = e.data;
     if (!d) return;
+
+    // content.js（isolated world）发现「扩展上下文失效」时 post 过来的提醒：
+    // 所有 found/progress 都送不出去了，用户看到的会是「什么都没抓到」。
+    if (d.__ms_sniffer_stale) {
+      showStaleBanner(d.text);
+      return;
+    }
 
     if (d.__ms_sniffer_host) {
       // content.js 转来的 Native Host 消息
@@ -3253,9 +3320,9 @@
       for (const entry of mse.values()) {
         post({ cmd: "found", source: "mse", key: entry.id, size: entry.size, mime: entry.mime, ext: extOf(entry.mime), live: true });
       }
-      // 扩展重载后 background 状态被清，让站点重置自己的上报签名，以便重报条目
+      // 扩展重载后 background 状态被清，让站点重置自己的上报签名并重报条目
       siteResetReport();
-      reportBiliDash();
+      siteReplayReport();
       return;
     }
 

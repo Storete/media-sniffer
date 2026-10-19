@@ -124,12 +124,25 @@ check("startMediaDownload 走 site.feedDownload",
 check("overlayShow 底部文案走 siteSaveHint", /siteSaveHint\(\)/.test(bodyOf("overlayShow") || ""));
 check("hello/rescan 重报走 siteResetReport", /siteResetReport\(\)/.test(SRC));
 
+// d-018：内容归属与回放也走注册表。rescan 块 1.3.11 里还直调 reportBiliDash()，
+// 与 siteResetReport 并排 —— 那是重构停差一行的地方。
+check("回放重报走 siteReplayReport（不许直调 reportBiliDash）",
+  /siteReplayReport\(\)/.test(SRC)
+  && !/siteResetReport\(\);\s*\n\s*reportBiliDash\(\)/.test(SRC));
+check("post() 注入 siteContentId（blob/MSE 条目的 noteId）",
+  /siteContentId\(\)/.test(SRC)
+  && /d\.cmd === "found" \|\| d\.cmd === "progress"/.test(SRC));
+
 // B 站站点对象必须把 4 个下载层钩子都实现，否则泄漏只是换了个位置
 const biliPush = (SRC.match(/SITES\.push\(\{\s*\n\s*name:\s*"bilibili"[\s\S]*?\n  \}\);/) || [""])[0];
 check("注册了 bilibili 站点对象", biliPush.length > 0);
-for (const hook of ["canFeedDownload", "feedDownload", "saveHint", "onSaveStart"]) {
+for (const hook of ["canFeedDownload", "feedDownload", "saveHint", "onSaveStart", "replayReport"]) {
   check(`bilibili 实现了 ${hook}`, new RegExp(hook + "\\s*:").test(biliPush));
 }
+// 小红书必须提供内容 id（background 的按 noteId 隔离全靠它供数）
+const xhsPush = (SRC.match(/SITES\.push\(\{\s*\n\s*name:\s*"xiaohongshu"[\s\S]*?\n  \}\);/) || [""])[0];
+check("注册了 xiaohongshu 站点对象", xhsPush.length > 0);
+check("xiaohongshu 实现了 contentId", /contentId\s*:/.test(xhsPush));
 
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);

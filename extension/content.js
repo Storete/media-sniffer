@@ -37,14 +37,11 @@
     // 宿主消息是 background 回的，不往 background 转
     if (d.__ms_sniffer_host) return;
     try {
-      chrome.runtime.sendMessage({ type: "ms:page", payload: d });
+      // 不带回调的 sendMessage 返回 Promise：「接收端不存在」这类失败是异步
+      // 拒绝，同步 try/catch 接不到（只会在控制台堆未处理的 rejection），
+      // 必须显式 .catch。context invalidated 则是同步抛出，走下面的 catch。
+      chrome.runtime.sendMessage({ type: "ms:page", payload: d }).catch(warnInvalidatedOnce);
     } catch (err) {
-      // 扩展被重载/失效时 context invalidated。
-      //
-      // ⚠️ 这里以前是**完全静默**的 —— 结果是「扩展重载后没刷新页面」时，页面里
-      // 所有 found 消息全部无声丢失，用户看到的就是「什么都没抓到」，却没有任何
-      // 线索指向真正的原因。现在只提示一次（避免每 600ms 刷一条），并在页面上
-      // 给一条看得见的话：让人立刻知道该刷新页面，而不是去怀疑功能坏了。
       warnInvalidatedOnce(err);
     }
   });
@@ -52,13 +49,15 @@
   /** 扩展上下文失效时，只警告一次（刷屏比沉默更难查）。 */
   let warnedInvalidated = false;
   function warnInvalidatedOnce(err) {
+    const msg = String((err && err.message) || err || "");
+    // 只有「真的失效」才提示；其它异常（比如消息太大）不该被当成失效，
+    // 也不该烧掉这次提示的机会——所以先匹配、再动一次性标志（d-018）
+    if (!/context invalidated|extension context|receiving end/i.test(msg)) return;
     if (warnedInvalidated) return;
     warnedInvalidated = true;
-    const msg = String((err && err.message) || err || "");
-    // 只有「真的失效」才提示；其它异常（比如消息太大）不该被当成失效
-    if (!/context invalidated|extension context|receiving end/i.test(msg)) return;
     console.warn("[资源嗅探] 扩展已更新过，本页的嗅探脚本已失效 —— 请刷新页面后重试。", msg);
     try {
+      // 页面主世界（inject-main）还活着，由它把这条话显示在页面上
       window.postMessage({
         __ms_sniffer_stale: true,
         text: "资源嗅探扩展刚更新过，本页需要刷新一次才能继续工作。",

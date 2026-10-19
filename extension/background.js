@@ -425,8 +425,10 @@ function recordPageMedia(tabId, pageUrl, p) {
   if (kind === "video" && p.hint === "xhs-note") {
     rec.xhsVid = isHttp ? mapKey : "";
     // 记住「这个真实地址属于哪个帖子」——下面的拦截只对同一个 noteId 生效。
-    // 页面侧 reportXhsVideo 会把 noteId 带上来；没带就退回「不过滤」（宁可多留）。
+    // 页面侧 reportXhsVideo 会把 noteId 带上来；取不到（非 http / 没带）就清空，
+    // 让拦截退回「不过滤」（宁可多留），不能留着上一个帖子的旧值挡新帖子。
     if (isHttp && p.noteId) rec.xhsVidNote = String(p.noteId);
+    else rec.xhsVidNote = "";
     let dropped = 0;
     for (const [itKey, it] of [...rec.items]) {
       if (it.k !== "video") continue;
@@ -447,8 +449,13 @@ function recordPageMedia(tabId, pageUrl, p) {
   // ⚠️ 必须按 noteId 隔离，不能是 tab 级开关。
   // 旧实现 `if (rec.xhsVid && ...) return;` 是整页共享的：在本帖看过视频之后，
   // 页面切到另一个帖子（SPA 不换 tab）时，新帖子的 blob/MSE 条目**全被拦掉**，
-  // 表现就是「换了个视频就抓不到了」。用户报的「一个功能好了另一个就失效」，
+  // 表现就是「换了个视频就抓不到」。用户报的「一个功能好了另一个就失效」，
   // 有一半来自这类共享状态。现在只拦「当前这个 noteId 已经有真实地址」的情况。
+  //
+  // ⚠️ d-018 教训：noteId 必须真的出现在 blob/MSE 的上报里这道闸才可达。
+  // 1.3.11 只给 reportXhsVideo 的上报带了 noteId，而它们都带 hint=xhs-note、
+  // 被下面的 !p.hint 排除——两条路互斥，闸从未生效过，同帖的重扫重放/进度
+  // 重报会把「页面视频（录制中）」放回来。现在页面侧 post() 统一补 noteId。
   const xhsVidNote = rec.xhsVidNote || "";
   const curNote = p.noteId || "";
   if (!p.hint && rec.xhsVid && xhsVidNote && curNote && xhsVidNote === curNote

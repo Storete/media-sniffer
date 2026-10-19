@@ -966,6 +966,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   testProtocolGuard();
   await testBiliMergeFlow();
   testBiliTitle();
+  testPostNoteId();
   testFileNameChain();
   console.log("\n" + "=".repeat(46));
   console.log(`通过 ${pass} 项，失败 ${fail} 项`);
@@ -1724,4 +1725,80 @@ function testBiliTitle() {
   const h = mk({ videoData: { title: "state 标题" } }, { "h1.video-title": "DOM 旧标题" }, "");
   check("⑤ __INITIAL_STATE__ 优先于 DOM（切换集时更准）",
     call(h) === "state 标题", call(h));
+}
+
+// ---------------------------------------------------------------- 12
+// blob/MSE 上报的内容归属（d-018）：background 的「同帖分片让位」闸要求
+// blob/MSE 条目带 noteId，1.3.11 里这条上报根本不带，闸从未生效。
+// post() 现在统一从 siteContentId() 补；这里验证三个方向：
+// 详情页补上、非详情页不补、reportXhsVideo 自带的 noteId 不被覆盖。
+function testPostNoteId() {
+  console.log("\n[12] blob/MSE 上报的内容归属（noteId 注入）");
+  const NID = "6a7546a50000000032030d99";
+  const toXhsDetail = () => {
+    sandboxLocation.href = "https://www.xiaohongshu.com/explore/" + NID;
+    sandboxLocation.hostname = "www.xiaohongshu.com";
+    sandboxLocation.pathname = "/explore/" + NID;
+  };
+  const toTelegram = () => {
+    sandboxLocation.href = "https://web.telegram.org/a/";
+    sandboxLocation.hostname = "web.telegram.org";
+    delete sandboxLocation.pathname;
+  };
+
+  // ① 详情页：blob found 必须带当前 noteId
+  toXhsDetail();
+  messages.length = 0;
+  const nUrl = FakeURL.createObjectURL(new Blob([new Uint8Array(200 * 1024)], { type: "video/mp4" }));
+  const nf = foundOf((m) => m.source === "blob" && m.key === nUrl);
+  check("① 详情页的 blob found 带 noteId", nf.length === 1 && nf[0].noteId === NID, nf[0] && nf[0].noteId);
+
+  // ② 首页/发现页（没有内容 id）：不补，让 background 退回「不过滤」
+  sandboxLocation.pathname = "/explore";
+  messages.length = 0;
+  const fUrl = FakeURL.createObjectURL(new Blob([new Uint8Array(200 * 1024)], { type: "video/mp4" }));
+  const ff = foundOf((m) => m.source === "blob" && m.key === fUrl);
+  check("② 首页的 blob found 不带 noteId", ff.length === 1 && !("noteId" in ff[0]), ff[0] && ff[0].noteId);
+
+  // ③ reportXhsVideo 的 found 自带 noteId 且带 hint：post() 不能把它弄丢
+  //    （1.3.11 的死门正是「带 noteId 的都带 hint」——万一注入把它覆盖掉，
+  //    门又不可达了，这条守住注入的幂等性）
+  messages.length = 0;
+  fakeDocument._imgEls = [];
+  win.__INITIAL_STATE__ = {
+    note: {
+      noteDetailMap: {
+        [NID]: {
+          note: {
+            type: "video",
+            title: "",
+            desc: "视频帖文案",
+            imageList: [
+              { fileId: "spectrum/1040gcover", width: 800, height: 600,
+                infoList: [{ url: "https://sns-webpic-qc.xhscdn.com/1040gcover!nd_dft_wgth_webp_3" }] },
+            ],
+            video: { media: { stream: {
+              EF4: [{ masterUrl: "http://sns-video-v6.xhscdn.com/stream/abc/110/258/01e8f0.mp4", width: 720, height: 1280, duration: 8000 }],
+            } } },
+          },
+        },
+      },
+    },
+  };
+  toXhsDetail();
+  sandbox.window.__msImgScan();
+  const vidFound = foundOf((m) => m.hint === "xhs-note" && String(m.key).includes("01e8f0.mp4"));
+  check("③ reportXhsVideo 的 found 带正确 noteId",
+    vidFound.length === 1 && vidFound[0].noteId === NID,
+    vidFound.map((m) => ({ k: String(m.key).slice(-20), n: m.noteId, h: m.hint })));
+
+  // ④ 清场：Telegram 上不该有任何 noteId 泄漏
+  delete win.__INITIAL_STATE__;
+  fakeDocument._imgEls = [];
+  fakeDocument._mediaEls = [];
+  toTelegram();
+  messages.length = 0;
+  const tUrl = FakeURL.createObjectURL(new Blob([new Uint8Array(200 * 1024)], { type: "video/mp4" }));
+  const tf = foundOf((m) => m.source === "blob" && m.key === tUrl);
+  check("④ Telegram 的 blob found 不带 noteId", tf.length === 1 && !("noteId" in tf[0]), tf[0] && tf[0].noteId);
 }

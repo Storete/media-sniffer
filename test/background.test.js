@@ -785,6 +785,72 @@ check("超长值被拒", !("accept" in ph([{ name: "Accept", value: "a".repeat(4
 check("空值被拒", !("accept" in ph([{ name: "Accept", value: "" }])));
 check("全是非法头时返回空对象", Object.keys(ph([{ name: "Cookie", value: "x" }])).length === 0);
 
+// ---- recordPageMedia：同帖分片让位闸（d-018）
+//
+// 1.3.11 里这条闸从未生效：带 noteId 的上报都带 hint=xhs-note、被 !p.hint
+// 排除，两条路互斥。页面侧 post() 补 noteId 之后闸才可达。把 recordPageMedia
+// 抽出来直接验证：同帖拦、换帖留、缺 noteId 留、图片和 http 媒体永不拦。
+console.log("\n[11] recordPageMedia：同帖分片让位闸按 noteId 生效");
+const rpmSrc = extractFn(bgCode, "recordPageMedia");
+if (!rpmSrc) {
+  check("能抽到 recordPageMedia", false);
+} else {
+  const tabs = new Map();
+  const rpmCtx = vm.createContext({
+    ensureTab: (tid) => {
+      if (!tabs.has(tid)) tabs.set(tid, { items: new Map(), url: "" });
+      return tabs.get(tid);
+    },
+    flushSoon() {}, bumpBadge() {}, confirmPageItem() {},
+    fileNameOf: (u) => String(u).split("/").pop() || "",
+    String, RegExp, Date, Map, Set, console,
+  });
+  vm.runInContext(rpmSrc, rpmCtx, { filename: "recordPageMedia" });
+  const rpm = rpmCtx.recordPageMedia;
+  const N1 = "6a7546a50000000032030d99", N2 = "6ab221bd000000003602a63e";
+
+  // 真实地址先到：hint=xhs-note + noteId=N1，闸的状态由它点亮
+  rpm(1, "https://www.xiaohongshu.com/explore/" + N1,
+    { cmd: "found", source: "httpmedia", key: "https://sns-video.xhscdn.com/v/real.mp4",
+      mime: "video/mp4", hint: "xhs-note", noteId: N1 });
+  const rec = tabs.get(1);
+  check("真实地址条目建立", rec.items.has("https://sns-video.xhscdn.com/v/real.mp4"));
+  check("xhsVidNote 记下当前帖子", rec.xhsVidNote === N1, rec.xhsVidNote);
+
+  // ① 同帖 blob：必须被拦（1.3.11 死门复活的回归断言）
+  rpm(1, "", { cmd: "found", source: "mediasrc", key: "blob:https://www.xiaohongshu.com/m-1",
+    mime: "video/mp4", noteId: N1 });
+  check("① 同帖 blob 条目被拦", !rec.items.has("page:blob:https://www.xiaohongshu.com/m-1"),
+    [...rec.items.keys()]);
+
+  // ② 同帖 MSE（m1）：必须被拦
+  rpm(1, "", { cmd: "found", source: "mse", key: "m1", mime: "video/mp4", noteId: N1 });
+  check("② 同帖 MSE 条目被拦", !rec.items.has("page:m1"), [...rec.items.keys()]);
+
+  // ③ 换帖（noteId 不同）：照常建条 —— 1.3.11 修的「换个视频抓不到」
+  rpm(1, "", { cmd: "found", source: "mse", key: "m2", mime: "video/mp4", noteId: N2 });
+  check("③ 换帖的 MSE 条目照常建", rec.items.has("page:m2"));
+
+  // ④ 不带 noteId：宁可多留
+  rpm(1, "", { cmd: "found", source: "mse", key: "m3", mime: "video/mp4" });
+  check("④ 不带 noteId 的条目照常建", rec.items.has("page:m3"));
+
+  // ⑤ 图片永不拦（kind !== "image" 排除）
+  rpm(1, "", { cmd: "found", source: "blob", key: "blob:https://www.xiaohongshu.com/img1",
+    mime: "image/jpeg", noteId: N1 });
+  check("⑤ 同帖 blob 图片照常建", rec.items.has("page:blob:https://www.xiaohongshu.com/img1"));
+
+  // ⑥ 同帖的 http 媒体不拦（闸只管 blob:/m\d+/mse 分片副产品）
+  rpm(1, "", { cmd: "found", source: "httpmedia", key: "https://sns-video.xhscdn.com/v/other.mp4",
+    mime: "video/mp4", noteId: N1 });
+  check("⑥ 同帖 http 媒体条目照常建", rec.items.has("https://sns-video.xhscdn.com/v/other.mp4"));
+
+  // ⑦ 下一个真实地址缺 noteId 时：xhsVidNote 必须清空，不能留旧值挡新帖
+  rpm(1, "", { cmd: "found", source: "httpmedia", key: "https://sns-video.xhscdn.com/v/real2.mp4",
+    mime: "video/mp4", hint: "xhs-note" });
+  check("⑦ 真实地址缺 noteId 时 xhsVidNote 清空", rec.xhsVidNote === "", rec.xhsVidNote);
+}
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

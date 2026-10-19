@@ -241,14 +241,20 @@ async function load() {
  */
 async function pingPageScript() {
   if (tabId == null) return;
+  // 内容脚本只注入 http/https 页；chrome://、商店页、PDF 查看器从来没有过
+  // 脚本，ping 失败不能说「已失效」（那是误诊），这类页面干脆不问（d-018）。
+  if (!/^https?:/i.test(tabUrl || "")) return;
   try {
     const pong = await chrome.tabs.sendMessage(tabId, { type: "ms:ping" }, { frameId: 0 });
     if (pong && pong.ok) return;  // 活着，什么都不说
   } catch (e) {
-    // 连接失败 = 内容脚本没了（页面没刷新 / 扩展刚重载）
+    // 连接失败 = 内容脚本没了（扩展刚装页面没刷新 / 扩展刚重载脚本被孤儿化）
   }
-  $("#hint").textContent = "本页脚本已失效（扩展更新过），点右上角 ⟳ 重新载入页面";
-  setTimeout(() => ($("#hint").textContent = ""), 8000);
+  // 文案要同时盖住两种成因：刚装（老页面没注入）和刚更新（脚本连不上扩展）
+  const staleText = "本页没有嗅探脚本（扩展刚装/刚更新过），点右上角 ⟳ 重新载入页面";
+  $("#hint").textContent = staleText;
+  // 只清自己写的那句话：8 秒里用户可能点了别的按钮换了提示，不能一起抹掉
+  setTimeout(() => { if ($("#hint").textContent === staleText) $("#hint").textContent = ""; }, 8000);
 }
 
 // ---------------------------------------------------------------- 屏蔽 / 重扫 / 批量选择

@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-018](#d-018) | 2026-10-19 | 复查 1.3.11：noteId 闸从未生效 | blob/MSE 上报统一补 noteId 让闸可达，另修 4 处提示链路 |
 | [d-017](#d-017) | 2026-10-19 | 「一个功能好了另一个就失效」的机制追问 | 拆掉 4 处下载层站点泄漏 + 修 2 个 tab 级共享状态 |
 | [d-016](#d-016) | 2026-10-19 | B 站视频条目没标题（「完整 DASH 流」占位文案） | `biliTitle()` 改成 `__INITIAL_STATE__` 优先，空标题不再伪造站名 |
 | [d-015](#d-015) | 2026-10-19 | A1 首页信息流封面不加序号 | 「有标题」不等于「该编号」，信息流每张各自独立 |
@@ -33,6 +34,71 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-018"></a>
+## #d-018 · 2026-10-19 · 复查 1.3.11：noteId 闸从未生效（死代码）
+
+**问题**
+对 d-017 的两个提交（b7aa34f / 307d8b9）做复查，逐条核对「拆泄漏是否拆干净、
+noteId 隔离有没有洞、提示会不会误报」。结论：架构方向都对，但**核心修复本身
+是死代码**，另有一批提示链路只接了一半。
+
+**主问题：拦截门不可达**
+background 的「同帖分片让位」闸条件是
+`!p.hint && rec.xhsVid && xhsVidNote === p.noteId && (mse || blob)`。
+但全扩展只有 `reportXhsVideo` 的 found/progress 带 noteId，而它们**都带
+hint=xhs-note** —— 被 `!p.hint` 排除。blob/MSE 那条路（createObjectURL hook、
+MSE hook、rescan 重放、handleMediaSrc）**全都不带 noteId**。两条路互斥，
+`xhsVidNote === curNote` 永远比不中，闸从未拦过任何一条消息：
+
+- 同帖的重扫（popup ⟳）会把 blob/MSE 条目原样重放回来，「页面视频（录制中）」复活；
+- 真实地址上报后，`handleMediaSrc` 的 progress（w/h/dur 后到）也会重建 blob 条目。
+
+「换帖抓不到」的症状实际是更早的 `watchSpaNav`（nav 消息 → 按 path 整个重置 tab）
+兜住的，1.3.11 的净效果等于**删掉了旧闸**，而不是「按 noteId 精准隔离」。
+没有任何行为测试喂过真实形状的消息，所以全绿地漏过去了。
+
+**修法**
+- 页面侧：`post()` 统一给不带 noteId 的 found/progress 注入 `siteContentId()`
+  （新站点钩子，小红书 = `xhsCurrentNoteId()`，首页/其它站点返回 "" 不注）。
+  注入点选在 post 而不是各上报点，是因为 blob/MSE 的上报点有 6+ 处，逐个补
+  必然再漏。`hint=xhs-note` 自带的 noteId 幂等不覆盖。
+- background 侧：`xhsVidNote` 补上生命周期 —— 真实地址缺 noteId 时**清空**，
+  不能留着上一个帖子的旧值挡新帖。
+- 测试：background.test.js 新增 `[11]` 段把 recordPageMedia 抽出来跑七个方向
+  （同帖拦 / 换帖留 / 缺 noteId 留 / 图片留 / http 留 / 状态点亮 / 旧值清空）；
+  main-hook.test.js 新增 `[12]` 段验证 post 注入的三向行为 + 幂等；
+  site_registry.test.js 加「回放不许直调 reportBiliDash」的架构断言。
+
+**顺带修掉的提示链路问题（同一批复查发现）**
+1. `content.js` 的 `sendMessage` 没有回调 —— MV3 里它返回 Promise，
+   「Receiving end doesn't exist」是**异步拒绝**，同步 try/catch 接不到，
+   结果是每条失败消息留一个 unhandled rejection（提示没弹出来，控制台先刷屏了）。
+   补 `.catch(warnInvalidatedOnce)`。
+2. `warnInvalidatedOnce` 的一次性标志**先烧后判**：第一条不匹配的异常
+   （消息太大之类）会烧掉唯一一次提示机会。改成先匹配、再动标志。
+3. `__ms_sniffer_stale` 的 postMessage **没有任何监听者**（inject-main 只认
+   `__ms_sniffer`/`__ms_sniffer_cmd` 两个标志）。补上：inject-main 收到后显示
+   页内提示条（主世界脚本还活着，正好由它把话亮出来），点一下关。
+4. rescan 通用块里 `siteResetReport(); reportBiliDash();` 并排 —— 拆泄漏停在
+   差一行的地方。加 `replayReport()` 站点钩子（bilibili = `reportBiliDash`），
+   通用块改调 `siteReplayReport()`，架构测试同步收紧。
+5. popup 的 pingPageScript 在 chrome:// / 商店页 / PDF 查看器这类**从未注入过
+   脚本的页面**也报「本页脚本已失效」—— 误诊（重载也无用）。加
+   `^https?:` 门禁直接不问；文案改成同时盖住「刚装」和「刚更新」两种成因；
+   8 秒清空定时器加内容守卫（期间用户点了别的按钮不再误清别人的提示）。
+
+**教训**
+- d-017 说「状态的作用域必须和语义一致」，这轮再补半句：**语义对了的闸还必须
+  可达**。`xhsVidNote === curNote` 的语义完全正确，但数据管道没接通，等于没写。
+  判据：给任何门写完，问一句「满足这个条件的消息，真的存在吗？」—— 用真实
+  上报形状在脑子里走一遍，或者直接写成行为测试。
+- 「只提示一次」的防刷屏机制自己也要防两个坑：标志在分流**之前**烧掉
+  （真提示永远不来）、以及异步拒绝走不进同步 catch（提示根本没机会发）。
+- MV3 的 `chrome.runtime.sendMessage` 不带回调时返回 Promise，失败走 rejection
+  而不是同步 throw —— try/catch 包不住，必须显式 `.catch`。
 
 ---
 
