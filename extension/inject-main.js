@@ -1185,6 +1185,8 @@
   // B 站 __playinfo__ 是 playurl XHR 返回后才挂上 window 的，没有可监听事件，
   // 所以周期轮询；reportBiliDash 内部按 baseUrl 签名去重，几乎零开销。
   setInterval(reportBiliDash, 2500);
+  window.__msBiliTitle = biliTitle;          // 供排查「B 站标题取不到」
+  window.__msReportBiliDash = reportBiliDash; // 供排查「条目没上报」
 
   // ------------------------------------------------------------ 2d. 图片的 DOM 上下文
   //
@@ -2368,26 +2370,55 @@
     // 只签 cid+title 会出现「换了集但 popup 不刷新」。cid 变了一般够用，
     // 但有些页面切集后 __INITIAL_STATE__ 滞后，这时 p 号是唯一的信号。
     const part = biliPartTag();
-    const fullSig = cid + "|" + title + "|" + part;
+    // ⚠️ 标题为空时**不进签名**：否则「先空后有」的两次上报签名相同，
+    // 第二次带着好标题的那条会被去重挡掉，popup 就永远显示占位文案。
+    const fullSig = cid + "|" + title + "|" + part + "|" + (title ? "t" : "n");
     if (fullSig === biliSig) return;
     biliSig = fullSig;
     // 名字直接拼成「标题-P2」，和 runBiliDownload 里算文件名用的是同一套规则，
     // 这样列表里看到的和存下来的永远一致。
-    const shown = title || "bilibili";
+    // 取不到标题就**不发 title 字段**（而不是发 "bilibili"）：popup 拿到空标题时
+    // 会保留自己的占位文案，比显示一个假站点名更容易让人看懂「还没取到」。
+    const shown = title ? (part ? title + part : title) : "";
     post({
       cmd: "found", source: "bili", key: BILI_DASH_KEY, size: 0,
-      mime: "video/mp4", title: part ? shown + part : shown,
+      mime: "video/mp4", title: shown,
     });
   }
 
   /**
-   * B 站视频标题。站内改版频繁，选择器按「新旧版 + 兜底」顺序试：
-   *   - 新版视频页：h1.video-title（还在，但 class 可能带 hash 后缀）
-   *   - 旧版/部分页面：#viewbox_report h1、.video-info-title h1
-   *   - 番剧页：.mediainfo_mediaTitle h1
-   *   - 最后兜底 <title>，去掉「_哔哩哔哩」之类的后缀。
+   * B 站视频标题 —— 三级来源，从稳到脆：
+   *
+   *   ① `__INITIAL_STATE__.videoData.title` / `__INITIAL_STATE__.h1Title`
+   *      B 站把页面数据整体塞进这个全局对象，标题是里面的一等字段，
+   *      **不随 DOM 改版失效**。这是主来源（和小红书读 imageList 同一个思路）。
+   *   ② DOM 选择器：只作兜底。站内改版极频繁（2025 年把 h1.video-title 换成了
+   *      #arc_toolbar_report 下的一套），所以新旧两代都列上，按「新的在前」排。
+   *   ③ `<title>` 剥后缀。还在加载/SPA 刚切换时前两级都可能是空的。
+   *
+   * 三个都不中才 return ""（**不再返回 "bilibili"**：那个字符串会让
+   * popup 里出现一条名叫 bilibili 的条目，用户没法判断是标题没取到还是站点名）。
    */
   function biliTitle() {
+    // ① __INITIAL_STATE__（最稳）
+    try {
+      const s = window.__INITIAL_STATE__ || {};
+      const vd = s.videoData || {};
+      const cands = [
+        vd.title,
+        s.h1Title,
+        vd.pages && vd.pages[0] && vd.pages[0].part,   // 合集页的「第 N 话 标题」
+        s.epInfo && s.epInfo.title,                     // 番剧单集
+        s.mediaInfo && s.mediaInfo.title,               // 番剧总标题
+      ];
+      for (const c of cands) {
+        const t = cleanBiliTitle(typeof c === "string" ? c : "");
+        // _INITIAL_STATE__ 里的标题不带站点后缀，但可能是纯空白；过短的也不要
+        if (t && t.length > 1) return t;
+      }
+    } catch (e) { /* 忽略 */ }
+
+    // ② DOM 兜底（新版在前）
     const pick = (sel) => {
       try {
         const n = document.querySelector(sel);
@@ -2396,23 +2427,32 @@
       } catch (e) { return ""; }
     };
     const sels = [
-      "h1.video-title",
-      "h1.video-title[title]",
+      // 新版（2025 起）：标题在 #arc_toolbar_report 或 .video-info-title 里
+      "#arc_toolbar_report h1",
       ".video-info-title h1",
-      "#viewbox_report h1",
-      ".mediainfo_mediaTitle h1",
-      ".video-title",
       "h1[class*=video-title]",
       "h1[class*=videoTitle]",
+      // 旧版（可能仍存在于部分页面/缓存渲染）
+      "h1.video-title",
+      "h1.video-title[title]",
+      "#viewbox_report h1",
+      // 番剧页
+      ".mediainfo_mediaTitle h1",
+      ".video-title",
     ];
     for (const s of sels) {
       const t = pick(s);
       if (t) return cleanBiliTitle(t);
     }
-    // 兜底：<title> 形如 "标题_哔哩哔哩_bilibili" / "标题 - 哔哩哔哩"
+
+    // ③ <title> 兜底：形如 "标题_哔哩哔哩_bilibili" / "标题 - 哔哩哔哩"
     const dt = (document.title || "").trim();
-    if (dt) return cleanBiliTitle(dt);
-    return "bilibili";
+    if (dt) {
+      const t = cleanBiliTitle(dt);
+      // 只有 site 名的 <title> 等于没取到（例如首页/加载中）
+      if (t && !/^bilibili$/i.test(t) && !/^哔哩哔哩$/.test(t)) return t;
+    }
+    return "";
   }
 
   /** 去掉 B 站标题尾巴与多余空白 */
@@ -2421,6 +2461,10 @@
       .replace(/[_\-|]\s*哔哩哔哩.*$/i, "")
       .replace(/\s*[-_|]\s*bilibili.*$/i, "")
       .replace(/\s*[-_|]\s*番剧\s*$/i, "")
+      // 首页/加载中的 <title> 是「哔哩哔哩 (゜-゜)つロ 干杯~」这类纯站点名，
+      // 整条都是噪声 —— 不剥掉的话 biliTitle 会把站名当成视频标题报上去。
+      .replace(/^哔哩哔哩\s*\(.*$/i, "")
+      .replace(/^bilibili\s*\(.*$/i, "")
       .replace(/\s+/g, " ")
       .trim();
   }

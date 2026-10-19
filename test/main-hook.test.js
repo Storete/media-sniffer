@@ -965,6 +965,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await testProbeTotal();
   testProtocolGuard();
   await testBiliMergeFlow();
+  testBiliTitle();
   testFileNameChain();
   console.log("\n" + "=".repeat(46));
   console.log(`通过 ${pass} 项，失败 ${fail} 项`);
@@ -1638,4 +1639,89 @@ function testProtocolGuard() {
   check("https 页面正常装 hook", typeof web.__msScan === "function" && web.__MS_SNIFFER_MAIN__ === true);
   const unknown = mk(undefined);
   check("读不到 location 时照常工作（不误杀）", typeof unknown.__msScan === "function");
+}
+
+/**
+ * [11] B 站标题：__INITIAL_STATE__ 优先，DOM 兜底，全空时返回 ""（绝不返回 "bilibili"）
+ *
+ * 用户报的现象：popup 列表里那条 B 站视频的标题是「B 站视频（完整 DASH 流）」，
+ * 即 popup 的占位文案 —— 说明 reportBiliDash 报上去的 title 是空的。
+ * 旧 biliTitle() 的选择器全是上一代 B 站的（h1.video-title / #viewbox_report h1），
+ * 2025 年改版后一个都命不中，于是退化到 document.title —— 而 SPA 首屏
+ * document.title 常常还是「哔哩哔哩 (゜-゜)つロ 干杯~」这种站点名。
+ */
+function testBiliTitle() {
+  console.log("\n[11] B 站标题来源（__INITIAL_STATE__ 优先 / DOM 兜底 / 不返回站名）");
+  const fs = require("fs");
+  const vm = require("vm");
+  const code = fs.readFileSync(path.join(__dirname, "..", "extension", "inject-main.js"), "utf8");
+  const portCode = fs.readFileSync(path.join(__dirname, "..", "extension", "sniffer-hostport.js"), "utf8");
+
+  // dom: { 选择器: 文本 }，document.title 单独传
+  const mk = (state, dom, docTitle) => {
+    const win = {
+      fetch: async () => ({ ok: true, status: 200, headers: { get: () => null }, async arrayBuffer() { return new ArrayBuffer(0); } }),
+      addEventListener() {}, removeEventListener() {}, postMessage() {},
+      location: { href: "https://www.bilibili.com/video/BV1xx411c7mD/", protocol: "https:", hostname: "www.bilibili.com" },
+      navigator: { userAgent: "test" },
+      setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {}, console,
+      URL, Blob, AbortController, TextDecoder, TextEncoder,
+      MediaSource: FakeMediaSource, HTMLMediaElement: FakeHTMLMediaElement, Element: class {},
+      document: {
+        title: docTitle || "",
+        documentElement: { appendChild() {} }, body: { appendChild() {} },
+        createElement: () => ({ style: {}, append() {}, addEventListener() {}, remove() {} }),
+        querySelector: (sel) => {
+          const t = (dom || {})[sel];
+          return t == null ? null : { textContent: t };
+        },
+        querySelectorAll: () => [], addEventListener() {},
+      },
+    };
+    if (state) win.__INITIAL_STATE__ = state;
+    win.window = win;
+    const sb = vm.createContext(win);
+    vm.runInContext(portCode, sb, { filename: "sniffer-hostport.js" });
+    vm.runInContext(code, sb, { filename: "inject-main.js" });
+    return sb;
+  };
+
+  const call = (sb) => vm.runInContext("window.__msBiliTitle()", sb);
+
+  // ① 主来源：__INITIAL_STATE__.videoData.title（DOM 全空也要拿到）
+  const a = mk({ videoData: { title: "【4K】测试视频标题" } }, {}, "");
+  check("① __INITIAL_STATE__.videoData.title 取到标题",
+    call(a) === "【4K】测试视频标题", call(a));
+
+  // ①-b 顶层 h1Title（部分页面只有这个）
+  const b = mk({ h1Title: "顶层标题" }, {}, "");
+  check("①-b __INITIAL_STATE__.h1Title 兜得住", call(b) === "顶层标题", call(b));
+
+  // ①-c 番剧：epInfo.title
+  const c = mk({ epInfo: { title: "第 3 话 出发" } }, {}, "");
+  check("①-c 番剧 epInfo.title 兜得住", call(c) === "第 3 话 出发", call(c));
+
+  // ② DOM 兜底：state 没有，新版选择器有
+  const d = mk(null, { "#arc_toolbar_report h1": "新版 DOM 标题" }, "哔哩哔哩 (゜-゜)つロ 干杯~");
+  check("② 新版 DOM 选择器兜底（#arc_toolbar_report h1）",
+    call(d) === "新版 DOM 标题", call(d));
+
+  // ②-b 旧版选择器仍然可用
+  const e = mk(null, { "h1.video-title": "旧版 DOM 标题" }, "");
+  check("②-b 旧版选择器仍可用（h1.video-title）", call(e) === "旧版 DOM 标题", call(e));
+
+  // ③ <title> 兜底 + 剥后缀
+  const f = mk(null, {}, "我的视频_哔哩哔哩_bilibili");
+  check("③ <title> 兜底并剥掉站点后缀", call(f) === "我的视频", call(f));
+
+  // ④ 关键回归：全空时返回空串，**不是 "bilibili"**
+  const g = mk(null, {}, "哔哩哔哩 (゜-゜)つロ 干杯~");
+  const got = call(g);
+  check("④ 取不到标题时返回空串，不伪造站名", got === "", got);
+  check("④-b 绝不返回 bilibili 这个假标题", got !== "bilibili", got);
+
+  // ⑤ state 优先于 DOM：两边都有时用 state（DOM 可能还是上一集）
+  const h = mk({ videoData: { title: "state 标题" } }, { "h1.video-title": "DOM 旧标题" }, "");
+  check("⑤ __INITIAL_STATE__ 优先于 DOM（切换集时更准）",
+    call(h) === "state 标题", call(h));
 }

@@ -261,6 +261,16 @@ Python 套件在 Ubuntu（3.9 / 3.12）和 Windows（3.12）上跑。没装 ffmp
 标题要一致的地方有五个（列表、载荷、浮层、文件名、去重签名），漏一个就出现
 「列表对、文件错」——详见 [d-008](DEVLOG.md#d-008)。
 
+**标题从哪来**：`biliTitle()` 是三级来源，从稳到脆——
+① `window.__INITIAL_STATE__`（`videoData.title` / `h1Title` / `pages[0].part` /
+`epInfo.title`）→ ② DOM 选择器（新版 `#arc_toolbar_report h1` 在前）→ ③ `<title>` 剥后缀。
+三者都不中就返回 `""`，**绝不返回 `"bilibili"`**：假数据会让列表里出现一条名叫
+bilibili 的条目，用户分不清是"没取到标题"还是"站点名"。详见 [d-016](DEVLOG.md#d-016)。
+
+> 教训：**选择器是租来的，`__INITIAL_STATE__` 才是自己的。** B 站 2025 年改版把
+> `h1.video-title` 换掉了，旧选择器全灭、静默退化到 `document.title`（SPA 首屏是站名），
+> 表面看就像"标题功能坏了"，实际是从改版起就没生效过。
+
 ### 小红书
 
 详情页的「推荐」「相关」「评论」里全是别的帖子的图，而它们和正文图**共用同一个
@@ -394,11 +404,12 @@ onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不�
 | # | 问题 | 排查起点 | 状态 |
 |---|---|---|---|
 | A1 | 首页信息流封面不加序号 | 已修：`renumberImages()` 里小红书非详情页「有标题就跳过编号」 | **已完成** [d-015](DEVLOG.md#d-015) |
-| A2 | B 站图片只取所点开视频的封面 | `inject-main.js` 的 `scanImages()` 加 B 站站点钩子，只留 `videoData.pic` | 待办 |
+| A0b | B 站视频条目没标题（显示占位文案「完整 DASH 流」） | `biliTitle()` 改为 `__INITIAL_STATE__` 优先、DOM 兜底、空则返回 `""` | **已完成** [d-016](DEVLOG.md#d-016) |
+| A2 | B 站图片只取所点开视频的封面 | `inject-main.js` 的 `scanImages()` 加 B 站站点钩子，只留 `videoData.pic`，标题复用 `biliTitle()` | 待办 |
 | A3 | Telegram 视频和图片下载全部失效 | 先真机复现：重载扩展 → 打开 Telegram → 点保存，看断在 `fetchRange` 还是 `hostRequest` | 待办 |
 | A4 | 「本次记录」改名为「下载记录」 | `popup.html` 的 `historyBtn`、`popup.js` 的 `renderHistory` 标题与空列表提示 | 待办 |
 
-**顺序：A1 ✅ → A2 → A3 → A4。**
+**顺序：A1 ✅ → A0b ✅ → A2 → A3 → A4。**
 
 > **编号的语义**：它表达的是「**同一条内容里的第几张**」。
 > 所以 Telegram 相册、小红书详情页要编号；信息流、推荐位、搜索结果的每条
