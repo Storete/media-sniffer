@@ -799,6 +799,36 @@ function markOf(n) {
 
 const NUMBERED_KINDS = new Set(["image", "video"]);
 
+/**
+ * 只给「最终要显示的那批条目」编号。
+ *
+ * 为什么必须拆成两步（用户 m13975 真机反馈）：「同标题的编号没有聚在一起，
+ * 而且序号和内容对不上，甚至超出了内容数量」。
+ *
+ * 旧实现在 sniff:get 里对**整份 rec.items** 编号，但随后还要过两道滤网：
+ * `visible` 剔掉 icon（头像/贴纸/UI 素材），`shown` 再做去重（同图多档只留一条）
+ * 和小红书「直读优先」。被剔掉的条目序号**照样发出去了**，于是：
+ *   · 列表只剩 6 条，却出现 ⑨ —— 序号超出了内容数量；
+ *   · 真图被判成 icon 之后，它的编号成了空洞，剩下的 ①②④⑦ —— 序号对不上内容。
+ *
+ * 现在的分工：
+ *   renumberImages(rec)      → 只负责「把不可能参与编号的条目清掉旧编号」
+ *   numberDisplayed(groups)  → 在**真正要发给 popup 的数组**上编 ①②③
+ * 前者必须做，否则一个条目这轮被判成 icon、下轮又变回 image，会留着上一轮的旧
+ * mark，列表里出现两条 ③。
+ *
+ * @param {Map<string, Array>} groups 分组键 → 该组的条目（数组内顺序即编号顺序）
+ */
+function numberDisplayed(groups) {
+  for (const list of groups.values()) {
+    // 组里只有一张不加序号，免得满屏都是 ①
+    for (let i = 0; i < list.length; i++) {
+      list[i].idx = list.length > 1 ? i + 1 : 0;
+      list[i].mark = list.length > 1 ? markOf(i + 1) : "";
+    }
+  }
+}
+
 function renumberImages(rec) {
   // 小红书详情页（2026-10-18 第七轮）：正文配图/视频常常既没有 mid（不是 Telegram
   // 消息）也没有 title（页面没给标题），会被下面「无 mid 无 title 跳过」的规则
@@ -876,12 +906,71 @@ function renumberImages(rec) {
       if (oa !== ob) return oa - ob;
       return (a.t || 0) - (b.t || 0);
     });
-    // 组里只有一张不加序号，免得满屏都是 ①
-    for (let i = 0; i < list.length; i++) {
-      list[i].idx = list.length > 1 ? i + 1 : 0;
-      list[i].mark = list.length > 1 ? markOf(i + 1) : "";
-    }
   }
+  // 只记分组结果，**不写 idx/mark** —— 真正发出去的序号由 numberShown 在
+  // icon 过滤 + 去重之后统一编（否则被剔掉的条目会占掉序号，见 numberShown 注释）。
+  renumberImages.lastGroups = groups;
+}
+
+/**
+ * 在「真正要显示的条目」上编号。
+ *
+ * 与 renumberImages 共用同一套分组规则（标题优先），区别只有两个：
+ *   1. 只处理传进来的这批条目（已经过 icon 过滤 + 去重），所以序号一定连续；
+ *   2. 编号顺序用「标题分组 + 组内 DOM 顺序」，与 popup 的排序判据一致，
+ *      用户看到的 ①②③ 就是从上到下。
+ *
+ * 注意：**必须原地改对象**，因为 popup 拿到的就是这些对象。
+ * 传进来的数组是 shown 的浅拷贝副本也没关系 —— 元素是同一批引用。
+ *
+ * @param {Array} items 即将发给 popup 的条目
+ * @param {string} tabUrl 当前标签页地址（决定是不是小红书详情页）
+ */
+function numberShown(items, tabUrl) {
+  if (!Array.isArray(items) || !items.length) return items;
+  const xhsDetail = isXhsDetailUrl(tabUrl || "");
+  const groups = new Map();
+  for (const it of items) {
+    if (!NUMBERED_KINDS.has(it.k)) continue;
+    if (xhsDetail) {
+      // 详情页整帖共用一个序号池；MSE 录制条目（u 是 "m1"）绝不参与
+      if (/^m\d+$/.test(it.u || "")) continue;
+      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      if (!real) continue;
+    } else if (isXhsHostUrl(tabUrl || "") && (it.title || "").trim()) {
+      // 小红书首页信息流：每张封面属于不同帖子，标题各不相同，不编号（用户 m06550）
+      continue;
+    } else if (!it.mid && !(it.title || "").trim()) {
+      // 既没 mid 也没标题：不属于「同一条内容里的多张」，不编号
+      continue;
+    }
+    const titleKey = (it.title || "").trim();
+    const gk = xhsDetail
+      ? "xhs"
+      : titleKey
+        ? "t:" + titleKey
+        : it.k + "|" + (it.mid ? "m:" + it.mid : "") + "|" + (it.ref || "");
+    if (!groups.has(gk)) groups.set(gk, []);
+    groups.get(gk).push(it);
+  }
+  for (const list of groups.values()) {
+    list.sort((a, b) => {
+      const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+      const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+      if (oa !== ob) return oa - ob;
+      return (a.t || 0) - (b.t || 0);
+    });
+  }
+  numberDisplayed(groups);
+
+  // 没进任何组的条目（audio/doc/other/seg，或被上面的规则跳过）必须显式清空，
+  // 否则会留着 renumberImages 上一轮算出的旧 mark。
+  const numbered = new Set();
+  for (const list of groups.values()) for (const it of list) numbered.add(it);
+  for (const it of items) {
+    if (!numbered.has(it)) { it.idx = 0; it.mark = ""; }
+  }
+  return items;
 }
 
 // ---------------------------------------------------------------- 小红书
@@ -1016,6 +1105,43 @@ function preferXhsNoteList(items) {
     if (it.k === "video" || it.k === "audio") return true;
     return false;
   });
+}
+
+/**
+ * 焦点收窄：只保留「当前正在看的那条内容」里的条目。
+ *
+ * 用户 m13863 真机反馈（Telegram）：「一个消息包含多个图片或者视频，当我点开其中
+ * 任意一个时，列表只会出现该标题下的所有内容而不包含其他消息里的」。小红书和 B 站
+ * 靠 URL 里的 noteId / bvid 天然知道自己「在看哪一条」，Telegram 的 URL 是频道地址、
+ * 点开任何一条都不变，只能在页面里靠查看器 DOM 反查消息 id（见 inject-main 的
+ * tgFocus）。这里只负责「拿到焦点之后怎么筛」，不关心焦点怎么来的。
+ *
+ * 两种失败姿势都要避免：
+ *   · 焦点 id 在本页一条都没匹配上 → 宁可显示全量，也不能给用户一个空列表
+ *     （典型成因：焦点取自查看器，而那条消息的媒体被体积线/图标判定筛掉了）。
+ *   · 没给焦点（null / 空对象）→ 原样返回，不影响任何既有站点。
+ *
+ * @param {Array} items 已过滤过的可见条目
+ * @param {{kind?:string,id?:string,mid?:string}|null} focus 焦点；kind 缺省视为 mid
+ * @returns {Array} 收窄后的条目（可能原样返回同一个数组）
+ */
+function applyFocusFilter(items, focus) {
+  if (!Array.isArray(items) || !items.length) return items;
+  if (!focus || typeof focus !== "object") return items;
+  const kind = focus.kind || "mid";
+  const id = String(focus.id != null ? focus.id : (focus.mid != null ? focus.mid : "")).trim();
+  if (!id) return items;
+  // 焦点种类必须是条目上真实存在的字段，否则「Telegram 的 mid 8928」会误配
+  // 「小红书 noteId 8928」（两套 id 空间互不相干）。
+  if (kind === "mid") {
+    const hit = items.filter((it) => String(it.mid || "") === id);
+    return hit.length ? hit : items;
+  }
+  if (kind === "note") {
+    const hit = items.filter((it) => String(it.noteId || "") === id);
+    return hit.length ? hit : items;
+  }
+  return items;
 }
 
 /**
@@ -1466,9 +1592,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const shown = isXhsDetailUrl(tabUrl)
           ? preferXhsNoteList(dedupeXhsNoteImages(visible))
           : dedupeImagesByIdentity(visible);
+        // 焦点收窄（用户 m13863）：页面在「查看器/灯箱」打开时上报当前焦点内容，
+        // 这里只留那条内容的条目。**放在去重之后**：去重可能合掉条目，
+        // 先收窄再合会让「命中条数」判断失真。
+        const focused = applyFocusFilter(shown, rec ? rec.focus : null);
+        // 编号必须在**所有滤网之后**做（用户 m13975：序号超出内容数量、和内容对不上）。
+        // 先编号再过滤的话，被剔掉的 icon / 被去重合并的缩略图照样占掉一个号，
+        // 于是 6 条内容出现 ⑨、真图从 ③ 直接跳到 ⑥。
+        numberShown(focused, tabUrl);
         const counts = {};
-        for (const it of shown) counts[it.k] = (counts[it.k] || 0) + 1;
-        sendResponse({ ok: true, items: shown, counts, tabUrl, order: KIND_ORDER, diag: rec ? rec.diag || null : null });
+        for (const it of focused) counts[it.k] = (counts[it.k] || 0) + 1;
+        sendResponse({
+          ok: true, items: focused, counts, tabUrl, order: KIND_ORDER,
+          diag: rec ? rec.diag || null : null,
+          // popup 用 focus 决定要不要显示「只看当前消息」提示条；null = 没收窄。
+          focus: focused.length !== shown.length ? (rec ? rec.focus : null) : null,
+        });
+        break;
+      }
+      case "ms:page-forget-focus": {
+        // popup 的「显示全部」：清掉这个标签页的焦点，列表回到全量。
+        // 与页面上报的 cmd:"focus" 共用同一份状态，所以解除了之后，
+        // 页面下一次 reportFocus() 只在 id 变化时才会再上报 —— 用户点「显示全部」
+        // 后如果还停在同一个查看器里，列表会保持全量（这是期望行为）。
+        const rec = state.get(msg.tabId);
+        if (rec) delete rec.focus;
+        sendResponse({ ok: true });
         break;
       }
       case "sniff:clear": {
@@ -1505,6 +1654,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (gen != null) cur.gen = gen;
           }
           sendResponse({ ok: true });
+          break;
+        }
+        if (p.cmd === "focus") {
+          // 焦点上报（用户 m13863）：页面在查看器/灯箱打开时告诉后台「现在在看哪一条」，
+          // 关掉时发 id:"" 表示解除。只存在 tab 记录上，不落 storage —— 它是瞬时的
+          // 界面状态，浏览器/扩展重启后本来就该回到「显示全量」。
+          const cur = ensureTab(tid);
+          const fid = String(p.id || "").trim();
+          if (fid) {
+            cur.focus = { kind: String(p.kind || "mid"), id: fid };
+          } else {
+            delete cur.focus;
+          }
+          // 焦点是「看哪条」的界面状态，不是条目变动，**不要**标 dirty 触发持久化。
+          sendResponse({ ok: true, focus: cur.focus || null });
           break;
         }
         if (p.cmd === "found" || p.cmd === "progress") {

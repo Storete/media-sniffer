@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-022](#d-022) | 2026-10-20 | 焦点收窄 + 编号对不上内容 | 编号挪到所有滤网之后；新增 focus() 钩子，Telegram 查看器只显示那条 |
 | [d-021](#d-021) | 2026-10-20 | Telegram 同标题不聚拢 / 编号断裂 / blob 不能预览 | 分组键从「消息 id」改成「标题」，排序判据同步；预览门槛放开 blob |
 | [d-020](#d-020) | 2026-10-20 | 只读审查报告落地：tabId=0 / 素材漏判 / SPA 迟到消息 | 先补 24 项红测再修，抓取诊断上浮到 popup |
 | [d-019](#d-019) | 2026-10-19 | A2：B 站图片只留当前视频封面 | state 取封面 + isImageOnly 过滤，测试桩 FakeURL 教训 |
@@ -37,6 +38,137 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-022"></a>
+## #d-022 · 2026-10-20 · 焦点收窄（只看当前打开的那一条）+ 编号对不上内容
+
+> 用户 m13863 原话：「像这种一个消息包含多个图片或者视频，当我点开其中任意一个时，
+> 列表只会出现该标题下的所有内容而不包含其他消息里的，这个功能实现了吗」
+>
+> 用户 m13975 原话：「上次改动，同标题的编号没有聚在一起，而且序号和内容对不上，
+> 甚至超出了内容数量。一并改了」
+
+### 一、两个问题其实是同一个
+
+「编号对不上内容」不是分组键写错了（d-021 刚修过），而是**编号的时机错了**。
+
+#### 现象
+
+- 6 条内容里出现 ⑨；
+- 真图从 ③ 直接跳到 ⑥；
+- 序号总数超过列表条数。
+
+#### 根因（代码事实）
+
+`extension/background.js` 的 `renumberImages(rec)` 在 `sniff:get` 开头对**整份
+`rec.items`** 编号，然后才轮到后面两道滤网：
+
+```js
+const visible = items.filter((it) => it.k !== "icon");   // 第一道：去图标
+const shown = dedupeXhsNoteImages(...) / dedupeImagesByIdentity(...);  // 第二道：去重
+```
+
+被这两道剔掉的条目**序号照样发出去了** —— 编号池里躺着 9 个成员，用户只看到 6 个，
+于是出现 ⑨、跳号、对不上。
+
+#### 解决
+
+把「编不编、编第几号」这件事挪到**所有滤网之后**：
+
+1. `renumberImages(rec)` 只做分组计算，**不再写 `idx/mark`**（保留 `lastGroups` 备用）；
+2. 新增 `numberDisplayed(groups)` / `numberShown(items, tabUrl)`，在**最终要显示的数组**上编号；
+3. `sniff:get` 里的顺序改成
+   `renumberImages → visible → shown → applyFocusFilter → numberShown`，
+   并在注释里写死「编号必须在所有滤网之后做」；
+4. **没进任何组的条目显式 `it.idx = 0; it.mark = ""`** —— 否则会留着上一轮的旧 mark
+   （条目对象是复用的，这点很容易漏）。
+
+### 二、焦点收窄：让 Telegram 也能「只看这条」
+
+#### 为什么小红书和 B 站不需要额外做
+
+两站的详情页 URL 里就带着 id（noteId / bvid），页面扫描天然只报当前那一帖。
+`extension/inject-main.js` 的 `owns` 钩子已经把这个范围锁死了（d-010 / d-019）。
+
+Telegram 不一样：地址永远是频道地址（`/a/#-100…`），点开任何一条消息都不变地址，
+所以必须去 DOM 里反查「现在打开的是哪条」。
+
+#### 做法：统一 `focus()` 钩子
+
+沿用 d-014 的站点注册表，加第九个钩子：
+
+| 站点 | `focus()` 返回 |
+|---|---|
+| 小红书 | `""`（URL 层已收窄） |
+| B 站 | `""`（URL 层已收窄） |
+| Telegram | `tgFocus()`：查看器容器上的 `data-message-id`，拿不到就上溯 ≤22 层找 |
+
+链路：
+
+```
+inject-main.js  scanMedia() 开头 → reportFocus()
+                  ↓ 变化才发
+                post({cmd:"focus", kind:"mid", id})
+                  ↓
+background.js   ms:page 的 p.cmd === "focus" 分支 → cur.focus = {kind, id}
+                  ↓ 只放内存，不落 storage（瞬时的界面状态）
+sniff:get       applyFocusFilter(shown, rec.focus)  → 命中为空则原样返回（防误清空）
+                  ↓
+popup.js        res.focus 非空 → 显示 #focusBar 提示条 + 「显示全部」
+```
+
+#### 反向操作也要有出口
+
+`#focusExit` 发 `ms:page-forget-focus`，background 里 `delete rec.focus`。
+必须给这个出口，否则用户会以为「别的图片丢了」。
+
+### 三、踩过的坑
+
+1. **测试断言 `name: "xxx"[\s\S]{0,600}?focus:` 的窗口**：focus 一开始写在站点对象
+   末尾，距 `name:` 有 1441（小红书）/ 2175（B 站）字符，超出窗口 → 测试红。
+   改成紧跟 `match` 之后即绿。**这也说明钩子顺序有语义：先 match，再 focus。**
+2. **`numberShown` 的 docblock 被 `edit` 吃掉开头**：留下孤立的 ` * 与 renumberImages 共用…`，
+   `node --check` 直接报错。补回后通过。
+3. **测试全部要改调用点**：`renumberImages` 不再写 mark，`test/background.test.js` 里
+   12 处 `renumberImages(recN)` 与 `test/group_key.test.js` 的 `runRenum` 都必须改成走
+   `numberShown` —— 因为测试要验的是「用户看到的序号」。
+
+### 四、教训
+
+- **「算法对了」不等于「输出对了」**：分组键从 d-021 起就是对的，错在它在错误的时机被调用。
+  遇到「数字对不上」，先把数据通路的**顺序**画出来，再怀疑算法。
+- **复用对象要显式清字段**：`it` 是复用对象，这一轮没分组就必须主动把上一轮的 `mark` 清掉。
+- **给用户看得见的收窄，就必须给看得见的恢复**。
+
+### 五、涉及文件
+
+- `extension/background.js`：`renumberImages` 瘦身、新增 `numberDisplayed` / `numberShown` /
+  `applyFocusFilter`、`sniff:get` 顺序调整与 `focus` 响应字段、`ms:page` 的 `focus` 分支、
+  新增 `ms:page-forget-focus`。
+- `extension/inject-main.js`：新增 `tgFocus()` / `reportFocus()`、三个站点对象的 `focus()`
+  （小红书、B 站放 `match` 之后）、Telegram 站点对象。
+- `extension/popup.js` / `popup.html` / `popup.css`：`focusInfo` 状态、`renderFocusBar()`、
+  `exitFocus()`、`#focusBar` / `#focusText` / `#focusExit` 与其样式。
+- `test/focus_scope.test.js`（新增，17 项）、`test/background.test.js`、`test/group_key.test.js`。
+- `extension/manifest.json`：1.3.16 → 1.3.17。
+
+### 六、测试
+
+| 套件 | 项数 |
+|---|---|
+| background（含 review / group_key / focus_scope） | 205 |
+| detect | 30 |
+| main-hook | 183 |
+| pattern_sync | 4 |
+| popup_wiring | 21 |
+| range_parallel | 14 |
+| site_registry | 39 |
+| **JS 合计** | **496** |
+| Python | 8 / 8 PASS |
+
+状态：**自动化测试通过**（未真机）。真机验证需要重载扩展 + 刷新 Telegram 页面。
 
 ---
 
