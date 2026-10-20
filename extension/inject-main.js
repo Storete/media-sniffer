@@ -1517,21 +1517,27 @@
     // 所以这里给封面统一 +1 的偏移（视频侧扫到后用 ord 0 占位）。
     // 不用 type 判断也行，但纯图文帖里 imageList[0] 就是第一张正文图，
     // 加了偏移会出现「①」空号，所以必须按 type 区分。
-    const coverOffset = xhsNoteType() === "video" ? 1 : 0;
+    const isVideoNote = xhsNoteType() === "video";
+    const coverOffset = isVideoNote ? 1 : 0;
     for (let i = 0; i < noteImgs.length; i++) {
       const im = noteImgs[i];
       const src = im.url;
       const ord = i + coverOffset;
+      // 视频帖这一条是「视频封面」，不是用户要保存的图片。打上 xhs-cover 让
+      // background 能识别出来：默认站点不收，只有白名单（本行）才留
+      // —— 用户 m15108「默认不获取视频封面作为一张图片，有需要再特殊处理」。
+      // 图文帖仍是正文图，保持 xhs-note，不能误伤。
+      const hint = isVideoNote ? "xhs-cover" : "xhs-note";
       const prev = imgCtx.get(src);
       const w = im.w || 0, h = im.h || 0;
       // 只在内容真的变了才上报，避免每 1.2s 重复 post 一条相同载荷
       if (prev && prev.ord === ord && prev.title === title && prev.w === w && prev.h === h
-        && prev.hint === "xhs-note") continue;
-      imgCtx.set(src, { mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false });
+        && prev.hint === hint) continue;
+      imgCtx.set(src, { mid: "", title, ord, w, h, hint, inChrome: false });
       if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
       post({
         cmd: "found", source: "imgctx", key: src, mime: "image/*", size: 0,
-        mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false,
+        mid: "", title, ord, w, h, hint, inChrome: false,
       });
     }
   }

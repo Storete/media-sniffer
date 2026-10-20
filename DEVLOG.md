@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-024](#d-024) | 2026-10-20 | 视频封面默认不当图片收 | 做成一张站点白名单表；小红书封面单独打 xhs-cover 才分得开 |
 | [d-023](#d-023) | 2026-10-20 | 真机复测：编号跨消息错位 + 焦点上报永久失效 | ord 语义是「消息内」的，加 mid 层；焦点补发；同组编号压过 kind |
 | [d-022](#d-022) | 2026-10-20 | 焦点收窄 + 编号对不上内容 | 编号挪到所有滤网之后；新增 focus() 钩子，Telegram 查看器只显示那条 |
 | [d-021](#d-021) | 2026-10-20 | Telegram 同标题不聚拢 / 编号断裂 / blob 不能预览 | 分组键从「消息 id」改成「标题」，排序判据同步；预览门槛放开 blob |
@@ -39,6 +40,113 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-024"></a>
+## #d-024 · 2026-10-20 · 视频封面默认不当图片收（改成一张站点白名单表）
+
+> 用户 m15108 原话：「改为默认情况下，不会获取视频封面作为一张图片，有需要再做
+> 特殊处理，代码里留有改动的余地。目前来看只获取 B 站、小红书视频封面当作一张图片」
+
+### 一、问题：封面确实是 image，但有两条不同的出路
+
+先在代码里确认了「封面被当图片」的两个位置，都是**有意写的**、不是漏判：
+
+| 位置 | 代码 | 为什么当初这么写 |
+|---|---|---|
+| 小红书视频帖 | `scanXhsNoteImages()` 读 `imageList`（视频帖只有一条 = 封面），`mime: "image/*"` | 封面占 ②、视频占 ①，用户能拿到视频预览图 |
+| B 站视频页 | `onScanImages` 直接 `post({mime:"image/*", hint:"bili-cover"})` | A2 需求：「B 站图片只取所点开视频的封面」 |
+
+所以不能简单删掉任何一处，得先有「默认 vs 例外」的层次。
+
+### 二、方案：白名单表 + 一个判据函数
+
+新增（放在图标判定区，这样测试能把它单独抽出来跑）：
+
+```js
+const VIDEO_COVER_SITES = ["bilibili.com", "xiaohongshu.com"];
+
+function coverAllowed(host) {
+  const h = "." + String(host || "").trim().toLowerCase().replace(/^\.+/, "") + ".";
+  if (h === "..") return false;
+  return VIDEO_COVER_SITES.some((site) => h.endsWith("." + site.toLowerCase() + "."));
+}
+```
+
+**左右都补 `.` 再 `endsWith`** 是关键：不这样的话 `fakebilibili.com` 和
+`bilibili.com.evil.net` 都会命中。子域（`www.` / `m.` / `space.`）自动跟随。
+
+「留有改动余地」就落在这张表上：加站点往数组里塞一个域名，去站点删一个，
+数组清空 = 全网都不收封面。
+
+### 三、过滤落点为什么不在 record()
+
+第一版想把判据塞进 `record()`，但那里拿到的 `d.tabUrl` 是请求发起时的地址；
+小红书是 SPA，从信息流点进帖子**不触发 main_frame**，`rec.url` 还停在上一页。
+`sniff:get` 里有一段专门为此做的修正（`chrome.tabs.get` 拿真实地址），
+所以过滤必须放到 `visible` 那一步：
+
+```js
+const curHost = hostOfUrl(tabUrl);
+const coverOK = coverAllowed(curHost);
+const visible = items.filter((it) => it.k !== "icon"
+  && !(!coverOK && String(it.hint || "").indexOf("cover") >= 0));
+```
+
+用 `indexOf("cover")` 而不是逐个枚举 hint：以后再加 `xxx-cover` 不用回来改这里。
+
+### 四、踩到的真问题：hint 分不开封面和正文图
+
+小红书视频帖的封面原来打的也是 `hint: "xhs-note"`——和正文图**一模一样**。
+只靠 hint 根本区分不出来，要么误删正文图，要么放过封面。
+
+改法：`scanXhsNoteImages()` 里按 `xhsNoteType() === "video"` 分开：
+
+```js
+const isVideoNote = xhsNoteType() === "video";
+const hint = isVideoNote ? "xhs-cover" : "xhs-note";
+```
+
+图文帖的正文图仍然是 `xhs-note`，不受影响。
+
+### 五、连带要改的三处（不改就会静默退化）
+
+`xhs-cover` 是新 hint，凡是「按 hint 认直读条目」的地方都要跟上，否则视频帖会被
+判成「没直读过」而退回全量噪声：
+
+1. `renumberImages` 的 `const real = ...`（决定要不要编号）
+2. `numberShown` 的同名判据
+3. `preferXhsNoteList` 的 `direct` 筛选 —— 这条最隐蔽，它一漏，
+   `preferXhsNoteList` 就认为「页面没报过」，把整份 `items` 原样返回。
+
+### 六、真机验证
+
+| 验证项 | 结果 |
+|---|---|
+| 后台真的换上新代码 | `chrome.runtime.getManifest().version === "1.3.20"` |
+| 白名单内容 | `["bilibili.com","xiaohongshu.com"]` |
+| 三站判定 | `xhs=true bili=true other=false` |
+| 过滤模拟（`example.com`） | `kept = ["xhs-note","none"]` ← 两条 cover 被滤 |
+| 过滤模拟（`xiaohongshu.com`） | `kept = ["bili-cover","xhs-cover","xhs-note","none"]` ← 全留 |
+| 图文帖不误伤（真实页面 6ad49c1c） | `counts={image:1}`，正文图正常 |
+
+### 七、教训
+
+1. **「默认」要写成一张能一眼看完的表**，而不是散在 if 里的若干特例。
+   用户要的就是「以后好改」，那变量名和注释就得承担这个职责。
+2. **同一个 hint 值不能同时表示两件事。** `xhs-note` 既当「正文图」又当「封面」，
+   一旦要区别对待就无解；先拆 hint 再谈过滤。
+3. **新增一个 hint 值，要回头搜它所有使用点。** 本次漏改 `preferXhsNoteList`
+   不会报错、测试也可能照绿，只是静默退回噪声——这类「不报错的退化」最难查。
+
+### 八、涉及文件
+
+- `extension/background.js` — `VIDEO_COVER_SITES` / `coverAllowed` / `hostOfUrl`；
+  `sniff:get` 的 `visible` 过滤；`renumberImages`、`numberShown`、`preferXhsNoteList` 三处 hint 判据
+- `extension/inject-main.js` — `scanXhsNoteImages()` 按 `note.type` 打 `xhs-cover`
+- `test/background.test.js` — `[COVER]` 7 项；顺带把纯逻辑切片终点从 `indexOf("---- 监听")`
+  改成「监听之前最后一次分节线」，否则切不到小红书规则块
 
 ---
 

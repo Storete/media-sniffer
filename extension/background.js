@@ -584,6 +584,42 @@ function recordPageMedia(tabId, pageUrl, p) {
 // 的是 DOM 上下文（imgctx 报上来的有消息归属 = 用户内容；webRequest-only 的
 // 小图没有 = 页面装饰），以及非 Telegram 站的 CDN 缩略图 URL 特征。
 const ICON_MAX = 96;
+
+// ---------------------------------------------------------------- 视频封面白名单
+// 用户 m15108：「默认情况下，不会获取视频封面作为一张图片，有需要再做特殊处理，
+// 代码里留有改动的余地。目前来看只获取 B 站、小红书视频封面当作一张图片」。
+//
+// 所以**默认行为是不收**：任何站点抓到的「视频封面」都不当图片展示。只有
+// VIDEO_COVER_SITES 里列出的站点才保留。以后要加/去站点，**只改这一张表**：
+//   · 加站点 → 往数组里加一个域名（写成主域即可，子域自动跟随）
+//   · 去掉站点 → 从数组里删掉；数组清空 = 全网都不收封面（回到最严格的默认）
+//
+// 判定顺序（coversForSite）：URL 上带封面 hint → 一律按 hint 走，不再看域名。
+// 之后由页面侧/background 按站点决定要不要收，见 inject-main 的 xhs/bili 分支。
+const VIDEO_COVER_SITES = ["bilibili.com", "xiaohongshu.com"];
+
+/**
+ * 这个站点允不允许把视频封面当图片收下来。
+ * 匹配规则：与白名单某一项**完全相等**，或以 `.那一项` 结尾（子域跟随）；
+ * 左右都补 `.` 再比，避免 `fakebilibili.com` / `bilibili.com.evil.net` 误命中。
+ * @param {string} host 宿主名，可带端口大小写不一
+ * @returns {boolean}
+ */
+function coverAllowed(host) {
+  const h = "." + String(host || "").trim().toLowerCase().replace(/^\.+/, "") + ".";
+  if (h === "..") return false;
+  return VIDEO_COVER_SITES.some((site) => h.endsWith("." + site.toLowerCase() + "."));
+}
+
+/** 从完整 URL 取宿主名；取不到返回 ""（解析失败时按「非白名单」处理，宁可少收） */
+function hostOfUrl(u) {
+  try {
+    return new URL(String(u || "")).hostname;
+  } catch (e) {
+    return "";
+  }
+}
+
 const THUMB_HINT = /\/file\/|thumb|avatar|emoji|\/icons?\/|img-apple-64|\/assets\//i;
 // B 站等站的图片 CDN 域名特征（只用于加严，不用于豁免 —— Telegram 的教训）
 const CDN_HINT = /hdslb\.com|alicdn\.com|bdstatic\.com|gtimg\.cn|byteimg\.com|360buyimg\.com/i;
@@ -862,7 +898,7 @@ function renumberImages(rec) {
     // MSE 条目拿到 (26)，用户看到的「①」根本对不上。
     if (xhsDetail) {
       if (/^m\d+$/.test(it.u || "")) continue;
-      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      const real = it.hint === "xhs-note" || it.hint === "xhs-cover" || (it.title || "").trim();
       if (!real) continue;
     }
     // ref 也进分组键：Telegram 相册里「视频 + 图片」横排时，两个 <video> 的
@@ -962,7 +998,7 @@ function numberShown(items, tabUrl) {
     if (xhsDetail) {
       // 详情页整帖共用一个序号池；MSE 录制条目（u 是 "m1"）绝不参与
       if (/^m\d+$/.test(it.u || "")) continue;
-      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      const real = it.hint === "xhs-note" || it.hint === "xhs-cover" || (it.title || "").trim();
       if (!real) continue;
     } else if (isXhsHostUrl(tabUrl || "") && (it.title || "").trim()) {
       // 小红书首页信息流：每张封面属于不同帖子，标题各不相同，不编号（用户 m06550）
@@ -1118,11 +1154,17 @@ function dedupeXhsNoteImages(items) {
  * 原样返回 —— 宁可多几条噪声，也不能让列表整个空掉。
  */
 function preferXhsNoteList(items) {
-  const direct = items.filter((it) => String(it.hint || "") === "xhs-note");
+  // 两种直读 hint：图文帖的正文图 xhs-note、视频帖的封面 xhs-cover（本轮新增）。
+  // 封面也算「页面直读」，否则视频帖会被判成「没直读过」而退回全量噪声。
+  const isDirect = (it) => {
+    const h = String(it.hint || "");
+    return h === "xhs-note" || h === "xhs-cover";
+  };
+  const direct = items.filter(isDirect);
   if (!direct.length) return items;
   return items.filter((it) => {
     // 直读条目本身
-    if (String(it.hint || "") === "xhs-note") return true;
+    if (isDirect(it)) return true;
     // 视频/音频不受影响：它们本来就该由 webRequest + 页面 hook 抓
     if (it.k === "video" || it.k === "audio") return true;
     return false;
@@ -1606,7 +1648,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 用户要求「图标彻底不要」：图标（emoji/头像/UI 素材/贴纸占位等站方自带小图）
         // 不进 popup，直接从返回列表里过滤掉。判定仍在 state 里做（保证图片栏干净），
         // 只是不再发给 popup 显示。
-        const visible = items.filter((it) => it.k !== "icon");
+        //
+        // 视频封面（hint=bili-cover / xhs-cover）同理：默认不当图片收，
+        // 只在 VIDEO_COVER_SITES 白名单里的站点保留（用户 m15108）。放在这里
+        // 而不是 record() 里，是因为 tabUrl 可能是 SPA 修正过的地址，只有这里才准。
+        const curHost = hostOfUrl(tabUrl);
+        const coverOK = coverAllowed(curHost);
+        const visible = items.filter((it) => it.k !== "icon"
+          && !(!coverOK && String(it.hint || "").indexOf("cover") >= 0));
         // 小红书详情页：同一张图被页面用不同尺寸/裁切后缀引用多次（封面最容易中招），
         // 按「内容身份」只留体量最大的一条，避免列表里一张图出现两次。
         // 再叠一层「页面直读优先」：imageList 已经给出完整清单时，webRequest 抓到的

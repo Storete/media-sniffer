@@ -214,15 +214,50 @@ if (fnSrc) {
 console.log("\n[3] 图片 / 图标 / 序号（纯逻辑抽出来单跑）");
 // 这三块逻辑只依赖条目对象，不碰 chrome API，抽出来在干净的 ctx 里跑最稳
 const pureCtx = vm.createContext({ console, Map, Set, String, Number, Math, JSON, URL, RegExp });
+// 切片包含「图标判定区 → 序号 → 小红书规则」三段纯逻辑：
+// 起点是 const ICON_MAX（顺带把紧跟其后的 VIDEO_COVER_SITES / coverAllowed 包进来），
+// 终点是小红书规则块的收尾注释 —— 这是「监听」注释之前最后一次出现的分节线，
+// 不能用 indexOf("---- 监听")：那样会漏掉小红书那段，dedupeXhsNoteImages 就找不到。
 const rulesStart = bgCode.indexOf("const ICON_MAX");
-const rulesEnd = bgCode.indexOf("// ---------------------------------------------------------------- 监听", rulesStart);
+const listenMark = bgCode.indexOf("// ---------------------------------------------------------------- 监听", rulesStart);
+const rulesEnd = bgCode.lastIndexOf("// ----------------------------------------------------------------", listenMark > 0 ? listenMark : bgCode.length);
 vm.runInContext(bgCode.slice(rulesStart, rulesEnd), pureCtx, { filename: "img-rules" });
 // const 声明在 vm 里不进沙箱 global，用一个表达式把它们导出来
 const rules = vm.runInContext(
-  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE })", pureCtx, { filename: "img-rules-export" });
-const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE } = rules;
+  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES })", pureCtx, { filename: "img-rules-export" });
+const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES } = rules;
 
 check("ICON_MAX 是 96", ICON_MAX === 96, ICON_MAX);
+
+// ---------------------------------------------------------------- 视频封面白名单
+// 用户 m15108：「默认情况下不会获取视频封面作为一张图片，有需要再做特殊处理」，
+// 但同时点名「目前来看只获取 B 站、小红书视频封面当作一张图片」。
+// 于是做成「默认不收、白名单站点才收」，白名单只有一张表，加站点只改那里。
+check("[COVER] 白名单默认只含 B 站和小红书",
+  VIDEO_COVER_SITES.length === 2
+  && VIDEO_COVER_SITES.includes("bilibili.com")
+  && VIDEO_COVER_SITES.includes("xiaohongshu.com"),
+  VIDEO_COVER_SITES);
+check("[COVER] 小红书视频帖封面允许（用户点名要）",
+  coverAllowed("xiaohongshu.com") === true, coverAllowed("xiaohongshu.com"));
+check("[COVER] B 站视频页封面允许（用户点名要）",
+  coverAllowed("bilibili.com") === true, coverAllowed("bilibili.com"));
+check("[COVER] 其它站点默认不收封面",
+  coverAllowed("example.com") === false && coverAllowed("") === false,
+  [coverAllowed("example.com"), coverAllowed("")]);
+check("[COVER] 子域名跟随主域（www./m./space.）",
+  coverAllowed("www.bilibili.com") === true
+  && coverAllowed("m.bilibili.com") === true
+  && coverAllowed("www.xiaohongshu.com") === true,
+  [coverAllowed("www.bilibili.com"), coverAllowed("m.bilibili.com")]);
+check("[COVER] 相似但不相同的域不算（防 biliapi.net 之类误命中）",
+  coverAllowed("fakebilibili.com") === false
+  && coverAllowed("bilibili.com.evil.net") === false
+  && coverAllowed("notxiaohongshu.com") === false,
+  [coverAllowed("fakebilibili.com"), coverAllowed("bilibili.com.evil.net")]);
+check("[COVER] 大小写和首尾空格容错",
+  coverAllowed("WWW.Bilibili.COM") === true && coverAllowed(" xiaohongshu.com ") === true,
+  [coverAllowed("WWW.Bilibili.COM"), coverAllowed(" xiaohongshu.com ")]);
 check("序号表从 ① 开始", CIRCLE[0] === "①" && CIRCLE[1] === "②" && CIRCLE[2] === "③");
 check("markOf(1) = ①", markOf(1) === "①");
 check("markOf(21) 退回括号数字", markOf(21) === "(21)", markOf(21));
