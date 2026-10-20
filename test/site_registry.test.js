@@ -144,6 +144,24 @@ const xhsPush = (SRC.match(/SITES\.push\(\{\s*\n\s*name:\s*"xiaohongshu"[\s\S]*?
 check("注册了 xiaohongshu 站点对象", xhsPush.length > 0);
 check("xiaohongshu 实现了 contentId", /contentId\s*:/.test(xhsPush));
 
+console.log("\n[TGC] Telegram 视频封面不当图片（默认策略 m15108）");
+
+// 用户 m15279：「telegram 没有按照默认策略吗，为什么还把封面当作图片」。
+// 真机证据（2026-10-20，频道 ONE PIECE）：
+//   · 消息内封面：<div class="media-inner"> 里同时挂 <video class="full-media">
+//     和 <img class="thumbnail …"> —— img 是视频封面（加载占位，起播后不移除）。
+//   · 左栏列表预览：.media-preview 里 <img class="media-preview--image"> + <i class="icon icon-play">。
+//   · 真实照片：<img class="media">，无 video 兄弟。
+// telegram 不在 VIDEO_COVER_SITES，所以必须在站点对象里拦（isDecorImg 钩子）。
+const TG_AT = SRC.indexOf('name: "telegram"');
+const TG_END = TG_AT >= 0 ? SRC.indexOf("\n  });", TG_AT) : -1;
+const tgPush = TG_AT >= 0 && TG_END > TG_AT ? SRC.slice(TG_AT, TG_END) : "";
+
+check("telegram 站点注册项能解析到", tgPush.length > 0, TG_AT);
+check("telegram 有 isDecorImg 钩子", /isDecorImg\s*:/.test(tgPush), tgPush.slice(0, 120));
+check("封面判据看的是 video 兄弟节点", /querySelector\(["']video["']\)/.test(tgPush));
+check("列表预览看的是 icon-play", /icon-play/.test(tgPush));
+
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

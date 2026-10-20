@@ -3036,6 +3036,28 @@
     name: "telegram",
     match: () => /(^|\.)telegram\.(org|me|dog)$/i.test(location.hostname || ""),
     focus: () => tgFocus(),
+
+    // 视频封面不是照片（用户 m15279「telegram 没有按照默认策略吗，为什么还把封面
+    // 当作图片」）。TG 把封面塞在两个地方，都只能从 DOM 结构认，URL 和尺寸完全
+    // 和真照片一样（实测 320×180 / 179×320），没有别的信号：
+    //   ① 消息内：<div class="media-inner"> 里同时挂 <video class="full-media">
+    //      和 <img class="thumbnail …">——img 是加载期占位，视频起播后也不移除。
+    //   ② 左栏列表预览：.media-preview 里 <img class="media-preview--image">
+    //      配 <i class="icon icon-play">，代表「这条是视频」。
+    // 反过来，真照片的容器是 <img class="media">，**没有** video 兄弟节点，
+    // 所以判据收得很窄：只看「同一个父容器里有没有 <video>」。
+    // 注意不能上溯太深——相册的 .Album 容器里视频和照片是混在一起的，
+    // 上溯到 Album 会把整组照片一起误杀。
+    isDecorImg: (el) => {
+      try {
+        const p = el && el.parentElement;
+        if (!p || !p.querySelector) return false;
+        if (p.querySelector("video")) return true;          // ① 消息内封面
+        const wrap = el.closest && el.closest(".media-preview");
+        if (wrap && wrap.querySelector(".icon-play")) return true;  // ② 列表预览
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
   });
 
   function guessExtFromType(ct) {
