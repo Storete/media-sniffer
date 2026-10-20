@@ -480,11 +480,15 @@ function visibleItems() {
   };
 
   return list.slice().sort((a, b) => {
+    // 同一组里编了 ①②③ 的条目，**序号就是阅读顺序**，必须压过 kind 排序。
+    // 顺序很关键：后台按 mid → ord 编好号后，若先按 kind 分块（所有 video
+    // 提到所有 image 前面），用户看到的就是 ②④⑥… 在前、①③⑤… 在后
+    // —— 真机 m14306「序号和内容对不上」的另一半原因就在这里。
     if (sameGroup(a, b) && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
     if (ka !== kb) return ka - kb;
-    // 同一组里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
-    // 否则默认按大小排，序号会乱掉看不出顺序。
+    // 不同组之间才按 kind 分块；同组但没编号（如未登录的 Telegram 会话）再退回
+    // 按大小、时间排。
     //
     // 「是不是同一组」这个判断改过两次，两版都是错的，记下来：
     //   v1 只看 mid —— 小红书的正文图没有消息号（mid 为空），编号是 background

@@ -900,12 +900,9 @@ function renumberImages(rec) {
   }
 
   for (const list of groups.values()) {
-    list.sort((a, b) => {
-      const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
-      const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
-      if (oa !== ob) return oa - ob;
-      return (a.t || 0) - (b.t || 0);
-    });
+    // 两处（renumberImages / numberShown）原本各写一份一模一样的 sort，
+    // 改一处漏一处迟早出事，统一走 compareWithinGroup（见 DEVLOG d-023）。
+    list.sort(compareWithinGroup);
   }
   // 只记分组结果，**不写 idx/mark** —— 真正发出去的序号由 numberShown 在
   // icon 过滤 + 去重之后统一编（否则被剔掉的条目会占掉序号，见 numberShown 注释）。
