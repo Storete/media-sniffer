@@ -25,6 +25,13 @@
 
   <nav id="chips" class="chips"></nav>
 
+  <!-- 焦点提示条：页面在查看器里打开某条消息时，列表只显示那条的媒体。
+       必须给一个显眼的出口，否则用户会以为「别的图片丢了」。 -->
+  <div id="focusBar" class="focus-bar hidden">
+    <span id="focusText">只看当前打开的那一条</span>
+    <button id="focusExit" class="btn-txt tint-blue">显示全部</button>
+  </div>
+
   <main id="list" class="list">
     <div class="empty">正在读取…</div>
   </main>

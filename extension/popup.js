@@ -43,6 +43,7 @@ let filter = "all";    // 当前选中的分类 chip
 let counts = {};       // background 给的各 kind 计数（B 站上会被 shownItems 重算覆盖）
 let hostOk = null;     // 本地下载器状态：null=还没结果 / true=可用 / false=不可用
 let lastDiag = null;   // background 给的抓取诊断（{seen, drop:{原因:次数}, sample:{原因:[url]}}）
+let focusInfo = null;  // 列表被「当前打开的那一条」收窄时，background 回传 {kind,id}；否则 null
 let selecting = false; // 批量选择模式
 const picked = new Set(); // 已选条目的 key（就是 it.u）
 let blockedHosts = []; // 用户屏蔽的站点（hostname）
@@ -211,6 +212,7 @@ async function load() {
   allItems = res.items || [];
   counts = res.counts || {};
   lastDiag = res.diag || null;
+  focusInfo = res.focus || null;
   if (res.tabUrl && res.tabUrl !== tabUrl) {
     tabUrl = res.tabUrl;
     $("#site").textContent = tabUrl;
@@ -223,6 +225,7 @@ async function load() {
   for (const k of [...picked]) if (!alive.has(k)) picked.delete(k);
 
   renderChips();
+  renderFocusBar();
   if (siteBlocked()) renderBlocked();
   else renderList();
   updateBatchBar();
@@ -380,8 +383,31 @@ async function saveSelected(btn) {
 // ---------------------------------------------------------------- 渲染
 
 /**
- * 顶部分类 chip。
+ * 焦点提示条：列表被「当前打开的那一条」收窄时显示，并给一个「显示全部」的出口。
  *
+ * 为什么要显式提示：Telegram 里点开某个相册/图片查看器后，列表只剩那条消息的
+ * 媒体（这是用户要的行为）；但如果不告诉他，他会以为「别的图片没抓到」。
+ */
+function renderFocusBar() {
+  const bar = $("#focusBar");
+  if (!bar) return;
+  if (!focusInfo) { bar.classList.add("hidden"); return; }
+  const n = shownItems().length;
+  $("#focusText").textContent = n
+    ? "只看当前打开的那一条（" + n + " 项）"
+    : "只看当前打开的那一条";
+  bar.classList.remove("hidden");
+}
+
+/** 「显示全部」：清掉 background 里的焦点，重取列表 */
+async function exitFocus() {
+  if (tabId == null) return;
+  await chrome.runtime.sendMessage({ type: "ms:page-forget-focus", tabId });
+  await load();
+}
+
+/**
+ * 分类 chip。
  * 两处刻意的处理：
  *   · 视频/音频两个 chip 数量为 0 也照显示 —— 它们是主功能，藏起来会让人以为
  *     扩展只会抓图片；其它分类（doc/font/other/seg）为 0 才跳过。
@@ -1183,6 +1209,8 @@ $("#clear").addEventListener("click", async () => {  if (tabId == null) return;
   renderChips();
   renderList();
 });
+
+$("#focusExit").addEventListener("click", exitFocus);
 
 $("#concurrency").addEventListener("change", (e) => {
   let v = Number(e.target.value) || 16;

@@ -38,7 +38,7 @@ module.exports = function runGroupTests(check) {
   }
 
   const parts = [];
-  for (const fn of ["isXhsDetailUrl", "isXhsHostUrl", "markOf", "renumberImages"]) {
+  for (const fn of ["isXhsDetailUrl", "isXhsHostUrl", "markOf", "renumberImages", "numberDisplayed", "numberShown"]) {
     const body = extractFn(bgCode, fn);
     if (!body) { console.log("  ! 抽不到函数 " + fn); return; }
     parts.push(body);
@@ -66,10 +66,10 @@ module.exports = function runGroupTests(check) {
   }
 
   function runRenum(items, url) {
-    const rec = { url: url || "https://web.telegram.org/a/", items: new Map() };
-    items.forEach((it, i) => rec.items.set("k" + i, it));
-    ctx.renumberImages(rec);
-    return [...rec.items.values()];
+    // 编号已挪到 numberShown（在 icon 过滤 + 去重之后编），renumberImages 只负责
+    // 记忆分组。测试要验「用户看到的序号」，所以这里调 numberShown。
+    ctx.numberShown(items, url || "https://web.telegram.org/a/");
+    return items;
   }
 
   // 同一标题、不同消息 id、不同 ref —— 用户抱怨的正是这种

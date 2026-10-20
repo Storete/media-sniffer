@@ -1159,6 +1159,10 @@
     name: "xiaohongshu",
     match: () => isXhsHost(),
 
+    // focus() 当前焦点：小红书返回 "" —— 详情页 URL 已经锁死在这一帖上
+    // （owns 只报本帖），不需要额外的查看器焦点。
+    focus: () => "",
+
     // 当前帖子 id：post() 靠它给 blob/MSE 条目补内容归属，background 的
     // 「分片让位」只对同一个 noteId 生效（d-018）。首页/发现页返回 ""。
     contentId: () => xhsCurrentNoteId(),
@@ -1204,11 +1208,76 @@
     },
   });
 
+  /**
+   * Telegram 的「焦点」：用户点开某条消息的相册/图片查看器时，返回那条消息的 id。
+   *
+   * 为什么 Telegram 需要这个，而小红书不需要：小红书的详情页 URL 里就带着 noteId，
+   * 页面扫描天然只报本帖；Telegram 的地址是频道地址（`/a/#-100…`），点开任意一条
+   * 消息都不会变，所以只能在 DOM 里反查「现在打开的是哪条」。
+   *
+   * 判据（按可靠度排序）：
+   *   1. 查看器容器里的 `data-message-id` —— WebK/WebA 的 MediaViewer 都会给
+   *      slide 标上来源消息；
+   *   2. 从当前可见的查看器 `<img>`/`<video>` 往上找 `data-message-id`
+   *      （查看器把消息容器整个搬进浮层时，id 还在祖先上）。
+   * 两条都拿不到就返回 ""，也就是「不设焦点、显示全量」——
+   * 宁可多显示，也不能因为猜错把列表清空。
+   */
+  function tgFocus() {
+    try {
+      // 只在 Telegram 主界面里找，避免第三方嵌入页面误判
+      if (!/(^|\.)telegram\.(org|me|dog)$/i.test(location.hostname || "")) return "";
+      const viewerSel = ".MediaViewer, .MediaViewerSlide, [class*='MediaViewer'], [class*='is-for-video']";
+      const viewers = document.querySelectorAll(viewerSel);
+      for (const v of viewers) {
+        // ① 容器自己带消息号
+        const own = v.getAttribute && v.getAttribute("data-message-id");
+        if (own) return String(own).trim();
+        // ② 容器里的媒体元素往上找
+        const media = v.querySelector ? v.querySelector("img, video") : null;
+        if (media) {
+          let n = media, depth = 0;
+          while (n && n.nodeType === 1 && depth < 22) {
+            const id = n.getAttribute && n.getAttribute("data-message-id");
+            if (id) return String(id).trim();
+            n = n.parentElement;
+            depth++;
+          }
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  /**
+   * 焦点变化时向后台上报一次（没变化就不发，避免每 600ms 刷一条消息）。
+   *
+   * 难点是「通用层要认识站点」——但按 A0 模块化，通用层不认识任何站点，
+   * 所以这一层只做「问一遍 activeSite().focus()」：
+   *   · 小红书返回 ""（URL 已收窄，不需要）
+   *   · Telegram 由下面 push 进去的对象返回 tgFocus()
+   * 拿不到 focus 钩子的站点一律视为「没有焦点」。
+   */
+  let lastFocus = "";
+  function reportFocus() {
+    try {
+      const site = activeSite();
+      let id = "";
+      if (site && site.focus) {
+        try { id = String(site.focus() || ""); } catch (e) { id = ""; }
+      }
+      if (id === lastFocus) return;
+      lastFocus = id;
+      post({ cmd: "focus", kind: id ? "mid" : "", id });
+    } catch (e) { /* 忽略 */ }
+  }
+
   function scanMedia() {
     try {
       // 后台标签页不扫：600ms 一轮的全文档查询在隐藏页上纯属浪费电量，
       // 用户切回来时下一轮（≤600ms）就会补齐。
       if (document.hidden) return;
+      reportFocus();   // 焦点是「看哪条」，跟扫描同频检查（内部已按变化去重）
       const els = document.querySelectorAll("video, audio");
       for (const el of els) {
         let src = "";
@@ -2800,6 +2869,10 @@
     name: "bilibili",
     match: () => isBiliHost(),
 
+    // focus() 当前焦点：B 站有视频页 URL（/video/BV…），页面扫描本来就只报
+    // 当前视频，不需要额外的查看器焦点。显式返回 "" 表示「本站在 URL 层已收窄」。
+    focus: () => "",
+
     // 有 __playinfo__ 的 DASH 清单才接管；没有（比如首页/动态页）就老实走通用 Range 下载
     canFeedDownload: (ctx) => !!(biliPlayinfo() && (ctx && ctx.bili !== "off")),
 
@@ -2862,6 +2935,32 @@
       if (!cover.url) return true;         // 拿不到封面就不过滤（宁可多抓）
       return biliIsCoverSrc(src, cover.url);
     },
+  });
+
+  // ---- Telegram 站点对象（用户 m13863：点开某条消息的查看器时收窄列表）----
+  //
+  // Telegram 和其他站点的根本区别：它没有「详情页 URL」。你打开一个频道
+  // （`web.telegram.org/a/#-1002024022449`）后点开任意一条消息的相册，
+  // 地址栏纹丝不动，所以「当前在看哪一条」只能从 DOM 里读（见 tgFocus）。
+  //
+  // 只实现 focus，不接管图片/视频扫描：Telegram 的媒体靠 webRequest + DOM 扫描
+  // 已经抓得很准，多余的钩子反而会把「贴纸/头像」这类既有判定搅乱。
+  //
+  // 钩子清单（通用层只认这几个名字，不认识具体站点）：
+  //   match()            是否属于本站
+  //   focus()            当前焦点（查看器打开时返回内容 id，否则 ""）
+  //   isDecorImg()       是否装饰图（头像/图标）
+  //   isImageOnly()      只允许 <img> 上的某张图
+  //   isDecorVideo()     是否装饰视频（贴纸/占位）
+  //   owns()             这条内容是否属于「当前正在看的东西」
+  //   title()            标题
+  //   videoSrc()         把 blob: 换成真实地址
+  //   feedImages()       直读清单
+  //   onScanImages()     接管整轮图片扫描
+  SITES.push({
+    name: "telegram",
+    match: () => /(^|\.)telegram\.(org|me|dog)$/i.test(location.hostname || ""),
+    focus: () => tgFocus(),
   });
 
   function guessExtFromType(ct) {

@@ -219,8 +219,8 @@ const rulesEnd = bgCode.indexOf("// --------------------------------------------
 vm.runInContext(bgCode.slice(rulesStart, rulesEnd), pureCtx, { filename: "img-rules" });
 // const 声明在 vm 里不进沙箱 global，用一个表达式把它们导出来
 const rules = vm.runInContext(
-  "({ looksLikeIcon, renumberImages, markOf, ICON_MAX, CIRCLE })", pureCtx, { filename: "img-rules-export" });
-const { looksLikeIcon, renumberImages, markOf, ICON_MAX, CIRCLE } = rules;
+  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE })", pureCtx, { filename: "img-rules-export" });
+const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE } = rules;
 
 check("ICON_MAX 是 96", ICON_MAX === 96, ICON_MAX);
 check("序号表从 ① 开始", CIRCLE[0] === "①" && CIRCLE[1] === "②" && CIRCLE[2] === "③");
@@ -325,13 +325,20 @@ function mkRec(items, url) {
   return { items: new Map(items.map((it) => [it.u, it])), url: url || "" };
 }
 
+// 编号已从 renumberImages 挪到 numberShown（只给「最终显示的条目」编号，见其注释）。
+// 这些用例验的都是「用户看到的序号」，所以统一走 numberShown。
+function numberRec(rec) {
+  numberShown([...rec.items.values()], rec.url || "");
+  return rec;
+}
+
 // 相册 3 张图，DOM 顺序被打乱（c=2, a=0, b=1），编号必须按 ord
 const rec1 = mkRec([
   { u: "a", k: "image", mid: "8925", ord: 0, t: 1 },
   { u: "b", k: "image", mid: "8925", ord: 1, t: 2 },
   { u: "c", k: "image", mid: "8925", ord: 2, t: 3 },
 ]);
-renumberImages(rec1);
+numberRec(rec1);
 check("三张图按 ord 编 ①②③",
   rec1.items.get("a").mark === "①" && rec1.items.get("b").mark === "②" && rec1.items.get("c").mark === "③",
   [...rec1.items.values()].map((x) => [x.u, x.mark]));
@@ -343,14 +350,14 @@ const rec2 = mkRec([
   { u: "x", k: "image", mid: "8928", ord: 0, t: 3 },
   { u: "y", k: "image", mid: "8928", ord: 1, t: 4 },
 ]);
-renumberImages(rec2);
+numberRec(rec2);
 check("不同消息各自从 ① 开始",
   rec2.items.get("a").mark === "①" && rec2.items.get("x").mark === "①",
   [...rec2.items.values()].map((x) => [x.mid, x.u, x.mark]));
 
 // 只有一张的组不加序号
 const rec3 = mkRec([{ u: "solo", k: "image", mid: "1", ord: 0, t: 1 }]);
-renumberImages(rec3);
+numberRec(rec3);
 check("组里只有一张不加序号", rec3.items.get("solo").mark === "", rec3.items.get("solo").mark);
 
 // 视频也编号，而且和图片分开排
@@ -360,7 +367,7 @@ const rec4 = mkRec([
   { u: "v1", k: "video", mid: "9", ord: 0, t: 3 },
   { u: "v2", k: "video", mid: "9", ord: 1, t: 4 },
 ]);
-renumberImages(rec4);
+numberRec(rec4);
 check("图片和视频各自从 ① 起",
   rec4.items.get("i1").mark === "①" && rec4.items.get("v1").mark === "①",
   [...rec4.items.values()].map((x) => [x.k, x.u, x.mark]));
@@ -370,7 +377,7 @@ const rec5 = mkRec([
   { u: "late", k: "image", mid: "7", ord: -1, t: 200 },
   { u: "early", k: "image", mid: "7", ord: -1, t: 100 },
 ]);
-renumberImages(rec5);
+numberRec(rec5);
 check("没有 DOM 顺序时按抓到先后排",
   rec5.items.get("early").mark === "①" && rec5.items.get("late").mark === "②",
   [...rec5.items.values()].map((x) => [x.u, x.mark]));
@@ -381,7 +388,7 @@ const rec6 = mkRec([
   { u: "p2", k: "image", title: "同一篇", ord: 1, t: 2 },
   { u: "q1", k: "image", title: "别的", ord: 0, t: 3 },
 ]);
-renumberImages(rec6);
+numberRec(rec6);
 check("无 mid 时按标题分组编号",
   rec6.items.get("p1").mark === "①" && rec6.items.get("p2").mark === "②" && rec6.items.get("q1").mark === "",
   [...rec6.items.values()].map((x) => [x.title, x.mark]));
@@ -393,7 +400,7 @@ const rec7 = mkRec([
   { u: "g1", k: "image", mid: "1", ord: 2, t: 3 },
   { u: "g2", k: "image", mid: "1", ord: 3, t: 4 },
 ]);
-renumberImages(rec7);
+numberRec(rec7);
 check("图标和音频不占图片的序号",
   rec7.items.get("g1").mark === "①" && !rec7.items.get("ic").mark && !rec7.items.get("au").mark,
   [...rec7.items.values()].map((x) => [x.k, x.mark]));
@@ -405,7 +412,7 @@ const rec8 = mkRec([
   { u: "d3", k: "image", title: "", ord: 2, t: 3 },
   { u: "d4", k: "image", title: "   ", ord: 3, t: 4 },
 ]);
-renumberImages(rec8);
+numberRec(rec8);
 check("无 mid 无 title 的图不编号",
   !rec8.items.get("d1").mark && !rec8.items.get("d2").mark
     && !rec8.items.get("d3").mark && !rec8.items.get("d4").mark,
@@ -558,7 +565,7 @@ const recX = mkRec([
   { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k02bbb!x", k: "image", ord: 0, t: 1, hint: "xhs-note" },
   { u: "https://sns-webpic-qc.xhscdn.com/a/notes_pre_post/1040g3k03ccc!x", k: "image", ord: 1, t: 2, hint: "xhs-note" },
 ], XHS_DETAIL);
-renumberImages(recX);
+numberRec(recX);
 const xMarks = [...recX.items.values()].map((x) => [x.u.slice(-12), x.ord, x.mark]);
 check("小红书详情页的图会编号（不再因为没 mid/title 被跳过）",
   xMarks.every((x) => x[2] !== ""), xMarks);
@@ -604,7 +611,7 @@ const recXV = mkRec([
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gimg1!x", k: "image", ord: 1, t: 1, hint: "xhs-note" },
   { u: "https://sns-video-hw.xhscdn.com/stream/abc.mp4", k: "video", ord: 0, t: 3, title: "帖标题" },
 ], XHS_DETAIL);
-renumberImages(recXV);
+numberRec(recXV);
 check("视频帖里视频拿 ①、封面拿 ②（共用一个序号池）",
   recXV.items.get("https://sns-video-hw.xhscdn.com/stream/abc.mp4").mark === "①"
   && recXV.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gimg1!x").mark === "②",
@@ -618,7 +625,7 @@ const recNoise = mkRec([
   { u: "m1", k: "video", title: "" },
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040greal!x", k: "image", ord: 0, hint: "xhs-note" },
 ], XHS_DETAIL);
-renumberImages(recNoise);
+numberRec(recNoise);
 check("小红书噪声条目（雪碧图/无标题缩略图/MSE）不参与编号",
   !recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/svg-sprite.6.57.6.svg#me").mark
   && !recNoise.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gnoi!nc_n_webp_mw_1").mark
@@ -633,7 +640,7 @@ const recHome = mkRec([
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeed1!x", k: "image", ord: 0, t: 1 },
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeed2!x", k: "image", ord: 1, t: 2 },
 ], "https://www.xiaohongshu.com/explore");
-renumberImages(recHome);
+numberRec(recHome);
 check("首页（非详情页）不误编号",
   [...recHome.items.values()].every((x) => !x.mark),
   [...recHome.items.values()].map((x) => x.mark));
@@ -646,7 +653,7 @@ const recHomeTitled = mkRec([
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeedB!x", k: "image", ord: 1, t: 2, title: "好像 Maybe Tomorrow" },
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gfeedC!x", k: "image", ord: 2, t: 3, title: "存一个血糖爆炸的食物秋秋没烦恼" },
 ], "https://www.xiaohongshu.com/explore");
-renumberImages(recHomeTitled);
+numberRec(recHomeTitled);
 check("A1 首页信息流封面有标题也不编号（标题不同就不该有序号）",
   [...recHomeTitled.items.values()].every((x) => !x.mark && !x.idx),
   [...recHomeTitled.items.values()].map((x) => [x.title.slice(0, 6), x.mark]));
@@ -656,7 +663,7 @@ const recDetailStill = mkRec([
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gdetA!x", k: "image", ord: 0, t: 1, title: "帖子标题", hint: "xhs-note" },
   { u: "https://sns-webpic-qc.xhscdn.com/a/1040gdetB!x", k: "image", ord: 1, t: 2, title: "帖子标题", hint: "xhs-note" },
 ], XHS_DETAIL);
-renumberImages(recDetailStill);
+numberRec(recDetailStill);
 check("A1 详情页不受影响，仍然按 ord 编号 ①②",
   recDetailStill.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gdetA!x").mark === "①"
   && recDetailStill.items.get("https://sns-webpic-qc.xhscdn.com/a/1040gdetB!x").mark === "②",
@@ -667,7 +674,7 @@ const recTgAlbum = mkRec([
   { u: "https://cdn.telegram.org/a.jpg", k: "image", mid: "42", ref: "album", t: 1 },
   { u: "https://cdn.telegram.org/b.jpg", k: "image", mid: "42", ref: "album", t: 2 },
 ], "https://web.telegram.org/a/");
-renumberImages(recTgAlbum);
+numberRec(recTgAlbum);
 check("A1 非小红书站点照常编号（没被误伤）",
   recTgAlbum.items.get("https://cdn.telegram.org/a.jpg").mark === "①"
   && recTgAlbum.items.get("https://cdn.telegram.org/b.jpg").mark === "②",
@@ -857,6 +864,9 @@ require("./review.test.js")(check);
 
 // ---- 用户 m13684 追加：[G1] 按标题分组、[G2] 小红书不被误伤、[G3] blob 预览
 require("./group_key.test.js")(check);
+
+// ---- 用户 m13863 追加：[F1] 焦点过滤、[F2] focus() 钩子、[F3] popup 提示条
+require("./focus_scope.test.js")(check);
 
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
