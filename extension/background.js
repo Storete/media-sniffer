@@ -913,6 +913,36 @@ function renumberImages(rec) {
 }
 
 /**
+ * 组内排序：**先按消息分组（mid 升序），消息内部再按 ord**。
+ *
+ * 为什么不能只比 ord（2026-10-20 真机事故，用户 m14306「序号和内容对不上」）：
+ * Telegram 同一标题下常常散在**多条消息**里，而 `ord` 是「消息内的第几个」，
+ * 每条消息都从 0 重新开始。真机数据「编号：#CC0385」：
+ *
+ *   mid=7497 → 1 张图 ord=0
+ *   mid=7498 → 5 图 + 7 视频，ord=0..9（其中一条 ref=viewer 的 ord 也是 0）
+ *   mid=7508 → 1 张图 ord=0
+ *
+ * 旧代码只比 ord，三个 0 并列后只能退到 `t`（抓取时间）。抓取时间是异步到达的，
+ * 等于随机，于是列表里出现 ①⑥②③④⑤ 这种「跳号 + 对不上内容」。
+ *
+ * mid 是字符串型的消息编号，序号在同频道里单调递增，所以按**数值**升序就是
+ * 「消息在聊天里的先后」。拿不到 mid（普通网站、小红书的正文图）时退回纯 ord。
+ */
+function compareWithinGroup(a, b) {
+  const ma = Number(a.mid), mb = Number(b.mid);
+  const aHasMid = (a.mid != null && a.mid !== "" && Number.isFinite(ma));
+  const bHasMid = (b.mid != null && b.mid !== "" && Number.isFinite(mb));
+  if (aHasMid && bHasMid && ma !== mb) return ma - mb;
+  // 有 mid 的排在没有 mid 的前面：同标题下「真实消息」比「猜出来的图」可信
+  if (aHasMid !== bHasMid) return aHasMid ? -1 : 1;
+  const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+  const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+  if (oa !== ob) return oa - ob;
+  return (a.t || 0) - (b.t || 0);
+}
+
+/**
  * 在「真正要显示的条目」上编号。
  *
  * 与 renumberImages 共用同一套分组规则（标题优先），区别只有两个：
@@ -954,12 +984,7 @@ function numberShown(items, tabUrl) {
     groups.get(gk).push(it);
   }
   for (const list of groups.values()) {
-    list.sort((a, b) => {
-      const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
-      const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
-      if (oa !== ob) return oa - ob;
-      return (a.t || 0) - (b.t || 0);
-    });
+    list.sort(compareWithinGroup);
   }
   numberDisplayed(groups);
 

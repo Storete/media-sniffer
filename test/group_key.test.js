@@ -38,7 +38,7 @@ module.exports = function runGroupTests(check) {
   }
 
   const parts = [];
-  for (const fn of ["isXhsDetailUrl", "isXhsHostUrl", "markOf", "renumberImages", "numberDisplayed", "numberShown"]) {
+  for (const fn of ["isXhsDetailUrl", "isXhsHostUrl", "markOf", "compareWithinGroup", "renumberImages", "numberDisplayed", "numberShown"]) {
     const body = extractFn(bgCode, fn);
     if (!body) { console.log("  ! 抽不到函数 " + fn); return; }
     parts.push(body);
@@ -109,6 +109,71 @@ module.exports = function runGroupTests(check) {
     const kinds = out.map((x) => x.k).join(",");
     check("[G1] 上面这组的 kind 确实是 video,image,video,image 交错的",
       kinds === "video,image,video,image", kinds);
+  }
+
+  // ---------------------------------------------------------------- [G1b] 跨消息的 ord 不能互相干扰
+  //
+  // 真机数据（2026-10-20 Telegram「ONE PIECE / General」频道，用户 m14493 报「编号对不上内容」）：
+  // 同一个标题「编号：#CC0385」下有 **三条消息**（mid 7497 / 7498 / 7508），
+  // 每条消息内部的 ord 都**从 0 重新开始**：
+  //   7497: 1 张图  ord=0
+  //   7498: 5 张图 + 7 条视频，ord=0..9，其中还有一条 ref=viewer 的 ord=0
+  //   7508: 1 张图  ord=0
+  // 旧排序只比 ord，于是三个 ord=0 并列，再退到 t（抓取时间）——
+  // 抓取时间是异步到达的，等于随机，用户看到的就是「序号和内容对不上」。
+  //
+  // 正确语义：**先按消息分组（mid 升序），消息内部再按 ord**。
+  {
+    const T = "编号： #CC0385";
+    const out = runRenum([
+      // 故意把乱序塞进来，模拟真实抓到的顺序
+      tgItem({ title: T, mid: "7508", k: "image", ord: 0, u: "img-7508-0" }),
+      tgItem({ title: T, mid: "7498", k: "video", ord: 4, u: "vid-7498-4" }),
+      tgItem({ title: T, mid: "7497", k: "image", ord: 0, u: "img-7497-0" }),
+      tgItem({ title: T, mid: "7498", k: "image", ord: 0, u: "img-7498-0" }),
+      tgItem({ title: T, mid: "7498", k: "video", ord: 0, ref: "viewer", u: "vid-7498-viewer" }),
+      tgItem({ title: T, mid: "7498", k: "image", ord: 2, u: "img-7498-2" }),
+    ]);
+    // numberShown 只原地写 idx/mark，不重排数组（重排是 popup 的事）。
+    // 所以要验证「用户看到的顺序」，得按 idx 排一遍再断言。
+    //
+    // 期望顺序（mid 升序 → 同 mid 内 ord 升序 → 同 ord 内 t 升序）：
+    //   7497/img-7497-0 (ord0)
+    //   7498/img-7498-0 (ord0, t 更早) → 7498/vid-7498-viewer (ord0, t 更晚) → 7498/img-7498-2 (ord2) → 7498/vid-7498-4 (ord4)
+    //   7508/img-7508-0 (ord0)
+    // 注意 viewer 那条的 ord 也是 0，和 img-7498-0 并列，靠 t 决出先后 —— 这是
+    // 目前唯一可用的平局规则（viewer 与 album 的 ord 各自从 0 数，无法互相对齐）。
+    const sorted = out.filter((x) => x.mark).slice().sort((a, b) => a.idx - b.idx);
+    const order = sorted.map((x) => x.u).join(",");
+    check("[G1b] 跨消息按 mid 升序、消息内按 ord（期望 7497 → 7498 → 7508）",
+      order === "img-7497-0,img-7498-0,vid-7498-viewer,img-7498-2,vid-7498-4,img-7508-0", order);
+    const marks = sorted.map((x) => x.mark).join("");
+    check("[G1b] 六个条目编号必须连续 ①②③④⑤⑥（真机曾出现跳号/重复）",
+      marks === "①②③④⑤⑥", marks);
+  }
+
+  // viewer 那条的 ord 也是 0，绝不能因为「ord 更小」就抢到 7498 的第一位
+  {
+    const T = "X";
+    const out = runRenum([
+      tgItem({ title: T, mid: "100", k: "image", ord: 3, u: "a3" }),
+      tgItem({ title: T, mid: "100", k: "image", ord: 4, ref: "viewer", u: "v4" }),
+      tgItem({ title: T, mid: "100", k: "image", ord: 5, u: "a5" }),
+    ]);
+    const order = out.filter((x) => x.mark).map((x) => x.u).join(",");
+    check("[G1b] 同一 mid 内 viewer 与 album 的 ord 互不干扰（按 ord 排：a3,v4,a5）",
+      order === "a3,v4,a5", order);
+  }
+
+  // 无 mid 的条目（普通网站）不能被这条规则误伤：仍然只按 ord
+  {
+    const out = runRenum([
+      tgItem({ title: "无 mid 标题", mid: "", k: "image", ord: 1, u: "b1" }),
+      tgItem({ title: "无 mid 标题", mid: "", k: "image", ord: 0, u: "b0" }),
+    ]);
+    const sorted = out.slice().sort((a, b) => (a.idx || 0) - (b.idx || 0));
+    const order = sorted.map((x) => x.u).join(",");
+    check("[G1b] 无 mid 时仍按 ord 排（b0,b1）", order === "b0,b1", order);
   }
 
   // 无标题条目仍不参与编号（防止空标题把全页图并成一组）
@@ -209,9 +274,31 @@ module.exports = function runGroupTests(check) {
       check("[G4] 同标题跨 mid 时按序号排（期望 ①②⑪）", got === "①②⑪", got);
     }
 
-    // 小红书详情页：没标题也没 mid，共用一个池子
+    // 用户 m14306 真机（问题①的最后一环）：同标题下视频和图片共用一个序号池，
+    // 但排序的第一行原来是 `if (ka !== kb) return ka - kb;`，把所有 video 提到
+    // 所有 image 前面，于是列表变成「②④⑥…（video）在前，①③⑤…（image）在后」，
+    // 用户看到的就是「序号和内容对不上」。同组已编号时 idx 必须压过 kind。
     {
       const got = sctx.sortItems([
+        mk({ k: "video", title: "编号： #CC0385", mid: "7498", idx: 2, mark: "②", s: 5000 }),
+        mk({ k: "image", title: "编号： #CC0385", mid: "7498", idx: 1, mark: "①", s: 900 }),
+        mk({ k: "video", title: "编号： #CC0385", mid: "7498", idx: 4, mark: "④", s: 4000 }),
+        mk({ k: "image", title: "编号： #CC0385", mid: "7498", idx: 3, mark: "③", s: 800 }),
+      ]).map((x) => x.mark).join("");
+      check("[G4] 同组编号压过 kind（期望 ①②③④，而不是 video 全在前）", got === "①②③④", got);
+    }
+
+    // 不同组（标题不同）仍然按 kind 分块 —— 这条规则不能丢
+    {
+      const got = sctx.sortItems([
+        mk({ k: "image", title: "甲", mid: "1", idx: 1, mark: "①", s: 100 }),
+        mk({ k: "video", title: "乙", mid: "2", idx: 1, mark: "①", s: 100 }),
+      ]).map((x) => x.k).join(",");
+      check("[G4] 不同组之间仍按 kind 排（video 在前）", got === "video,image", got);
+    }
+
+    // 小红书详情页：没标题也没 mid，共用一个池子
+    {      const got = sctx.sortItems([
         mk({ title: "", mid: "", idx: 3, mark: "③" }),
         mk({ title: "", mid: "", idx: 1, mark: "①" }),
         mk({ title: "", mid: "", idx: 2, mark: "②" }),

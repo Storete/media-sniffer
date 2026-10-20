@@ -107,6 +107,27 @@ module.exports = function runFocusTests(check) {
     !/name:\s*"bilibili"/.test(mainCode) || /name:\s*"bilibili"[\s\S]{0,600}?focus:/.test(mainCode),
     "B 站对象里没有 focus");
 
+  // 方案 B：查看器 DOM 没有消息标识，只能拿媒体地址回聊天里反查。
+  // 真机实测（2026-10-20）`#MediaViewer` 上溯链全无 data-message-id，
+  // 所以 tgFocus 必须有一条「比对 src」的兜底路径，否则永远返回 ""。
+  check("[F2] 有 tgFocusByMedia（按媒体地址反查消息 id）",
+    /function tgFocusByMedia\s*\(/.test(mainCode), "未找到 tgFocusByMedia");
+  check("[F2] tgFocusByMedia 比对 currentSrc/src（blob 与 progressive 都能对上）",
+    /currentSrc/.test(mainCode) &&
+    /\[data-message-id\]\s+img,\s*\[data-message-id\]\s+video/.test(mainCode),
+    "没在 [data-message-id] 的 img/video 里比对 src");
+  check("[F2] tgFocus 末尾会兜底到 tgFocusByMedia",
+    /return tgFocusByMedia\(\)/.test(mainCode), "tgFocus 没有兜底调用");
+  check("[F2] 只取 MediaViewerSlide--active（避免拿到邻张）",
+    /MediaViewerSlide--active/.test(mainCode), "没用 --active 过滤当前页");
+
+  // 一次上报丢掉就永久失效 —— 真机踩到过：查看器打开瞬间 SW 还没就绪，
+  // 消息丢了，但 lastFocus 已置位，之后永远不再发。必须能周期性补发。
+  check("[F2] reportFocus 有周期性补发（FOCUS_RESEND_MS）",
+    /FOCUS_RESEND_MS/.test(mainCode), "没有补发间隔常量");
+  check("[F2] reportFocus 在值未变化时也会按间隔重发",
+    /now - lastFocusAt < FOCUS_RESEND_MS/.test(mainCode), "未按间隔补发");
+
   // ---------------------------------------------------------------- [F3] popup 侧
 
   console.log("\n[F3] popup：列表按焦点收窄，且给用户一个明显提示");

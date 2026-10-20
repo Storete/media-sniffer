@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-023](#d-023) | 2026-10-20 | 真机复测：编号跨消息错位 + 焦点上报永久失效 | ord 语义是「消息内」的，加 mid 层；焦点补发；同组编号压过 kind |
 | [d-022](#d-022) | 2026-10-20 | 焦点收窄 + 编号对不上内容 | 编号挪到所有滤网之后；新增 focus() 钩子，Telegram 查看器只显示那条 |
 | [d-021](#d-021) | 2026-10-20 | Telegram 同标题不聚拢 / 编号断裂 / blob 不能预览 | 分组键从「消息 id」改成「标题」，排序判据同步；预览门槛放开 blob |
 | [d-020](#d-020) | 2026-10-20 | 只读审查报告落地：tabId=0 / 素材漏判 / SPA 迟到消息 | 先补 24 项红测再修，抓取诊断上浮到 popup |
@@ -38,6 +39,167 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-023"></a>
+## #d-023 · 2026-10-20 · 真机复测：编号跨消息错位 + 查看器焦点上报一次丢掉永久失效
+
+> 用户 m14306 原话：「两个问题依旧存在，为什么不在真机上验证？」
+> 用户 m14493 原话：「两个都按上述方案改，等修」
+>
+> 这一条是**给 d-022 打补丁**：d-022 的自动化测试全绿、也提交了，但两件事在真机上
+> 依旧复现。教训见文末「教训 1」——只做到「自动化测试通过」就说完成，是要返工的。
+
+### 一、问题①「编号对不上内容」的真正根因：跨消息的 ord 互相干扰
+
+真机 dump（频道 ONE PIECE / General，标题「编号：#CC0385」）拿到的事实：
+
+| mid | 条目 | 关键字段 |
+|---|---|---|
+| 7497 | 1 张图 | `ord=0` |
+| 7498 | 5 图 + 7 视频 | `ord=0..9`；其中 1 条 `ref:"viewer"` 的 `ord` **也是 0** |
+| 7508 | 1 张图 | `ord=0` |
+
+`ord` 的语义是「**消息内部**的第几个」，每条消息都从 0 重新开始。而分组键对
+「有标题」的条目用 `"t:" + title`（跨消息合组，这是 d-021 按用户要求改的），
+于是三条消息的 `ord=0` 全撞在一起。组内排序原来只比 `ord`：
+
+```js
+const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+if (oa !== ob) return oa - ob;
+return (a.t || 0) - (b.t || 0);   // 平局只能退到抓取时间 = 随机
+```
+
+平局退到 `t`（异步到达的抓取时间），等于随机 → 真机看到 `①⑥②③④⑤` 这种跳号。
+
+**修法**：抽出 `compareWithinGroup(a, b)`，加一层 **mid 数值升序**：
+
+```js
+function compareWithinGroup(a, b) {
+  const ma = Number(a.mid), mb = Number(b.mid);
+  const aHasMid = (a.mid != null && a.mid !== "" && Number.isFinite(ma));
+  const bHasMid = (b.mid != null && b.mid !== "" && Number.isFinite(mb));
+  if (aHasMid && bHasMid && ma !== mb) return ma - mb;
+  if (aHasMid !== bHasMid) return aHasMid ? -1 : 1;
+  const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+  const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+  if (oa !== ob) return oa - ob;
+  return (a.t || 0) - (b.t || 0);
+}
+```
+
+`renumberImages` 与 `numberShown` 两处**原本各写了一份一模一样的 sort**，这次合并成一个函数，
+以后不会再改歪一处漏一处。无 mid 的条目（普通网站、小红书正文图）退回纯 ord，不受影响。
+
+### 二、问题①的最后一环：popup 先按 kind 切，把序号顺序打烂了
+
+background 已经按「mid 升序 → 组内 ord」编好 ①~⑳，但 popup 的 `visibleItems()` 第一行是：
+
+```js
+const order = ["video", "audio", "doc", "image", "font", "other", "seg"];
+if (ka !== kb) return ka - kb;    // ← 所有 video 提到所有 image 前面
+```
+
+真机实测拿到的 20 条是 `②④⑥⑧…（video 在前）+ ①③⑤⑦…（image 在后）`——
+典型的「编号和内容对不上」。**序号本来就是阅读顺序，kind 只能当兜底**，不能反过来压过它。
+
+修法：把「同组判定」提成 `sameGroup(a, b)`，同组且都编号时 **idx 直接压过 kind**：
+
+```js
+if (sameGroup(a, b) && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
+const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
+if (ka !== kb) return ka - kb;
+```
+
+不同组之间仍然按 kind 分块（这条规则保留，测试锁了）。
+
+### 三、问题②「只看当前打开的那一条」：查看器 DOM 根本没有消息标识
+
+真机实测（Telegram Web A 版），`#MediaViewer` 打开后的上溯链：
+
+```
+.MediaViewerSlide--active → .MediaViewerSlides → DIALOG#MediaViewer
+  → div.opacity-transition → div.Transition → BODY
+```
+
+**全链没有任何 `data-message-id` / `data-peer-id` / `data-media-id`**；
+`.message.highlighted` / `.selected` 也是空的（TG 的「跳转到该消息」用滚动定位，不加类）。
+所以 d-022 里那两条「容器自己带消息号」「媒体元素往上找」在真机上**必然返回空**。
+
+唯一还能对上的是**媒体地址本身**：查看器里的
+`<video src="https://web.telegram.org/a/progressive/document4999508637404...">`
+与聊天里那条消息里的同一个地址（`blob:` 地址在同一页面里也是同一个字符串）。
+
+新增 `tgFocusByMedia()`（方案 B）：
+
+1. `document.querySelectorAll(".MediaViewerSlide--active")` 取**当前展示那一页**
+   （所有 slide 都渲染了，不挑 `--active` 会拿到邻张）；
+2. 取它的 `img/video` 的 `currentSrc || src`；
+3. 去 `[data-message-id] img, [data-message-id] video` 里找同地址的元素；
+4. 上溯 ≤22 层取 `data-message-id`。
+
+拿不到就返回 `""`（不收窄，显示全量）——**宁可多显示，也不猜一个错的**。
+
+### 四、问题②的隐蔽缺陷：一次上报丢掉 = 永久失效
+
+`reportFocus()` 原来只在**值变化**时发：
+
+```js
+if (id === lastFocus) return;
+lastFocus = id;
+post({ cmd: "focus", kind: id ? "mid" : "", id });
+```
+
+真机踩到的现象：查看器刚打开那一瞬间 `post` 发出去了，但 service worker 正在启动
+（或 tab 记录还没建），后台没收到；可 `lastFocus` 已经被设成 `"7498"`，
+之后每一轮都「没变化」直接 return —— **用户看到「明明打开了查看器，列表还是全量」，
+而且无论怎么等都不会自己好**。
+
+修法：加 `FOCUS_RESEND_MS = 5000`，没变化也每 5 秒补发一次，让后台最终一致。
+补发只是一条几十字节的消息，代价可以忽略。修完真机立刻从 186 条收窄到 20 条。
+
+### 五、真机验证结果（这是本轮唯一算数的证据）
+
+```
+{"tabId":54120535,"focus":{"kind":"mid","id":"7498"},
+ "total":20,"counts":{"video":10,"image":10}}
+```
+
+popup 实际渲染出的 20 行（`#list` 的 innerText）：
+
+```
+▣① ▣③ ▶② ▶④ ▣⑤ ▶⑥ ▣⑦ ▶⑧ ▣⑨ ▶⑩ ▣⑪ ▶⑫ ▣⑬ ▶⑭ ▣⑮ ▶⑯ ▣⑰ ▶⑱ ▣⑲ ▶⑳
+```
+
+按 idx 排后连续 ①→⑳ 无跳号，图片/视频按真实阅读顺序交错，全部是「消息 7498」。
+
+### 六、测试
+
+- `test/group_key.test.js` 新增 `[G1b]` 4 项（跨 mid 升序、编号连续、viewer/album 互不干扰、无 mid 仍按 ord）；
+- `[G4]` 新增 2 项（同组编号压过 kind、不同组仍按 kind）；
+- `test/focus_scope.test.js` 新增 6 项（tgFocusByMedia 存在、比对 currentSrc、tgFocus 兜底调用、只取 --active、FOCUS_RESEND_MS、按间隔补发）。
+- 结果：JS **504 → 517 项**全过（background 217 / detect 30 / main-hook 183 / pattern_sync 4 / popup_wiring 21 / range_parallel 14 / site_registry 39），Python **8/8**。
+
+### 七、教训
+
+1. **「自动化测试通过」不等于「做完了」。** d-022 全绿就提交，真机一测两个问题都在。
+   凡是用户能在界面上看见的行为，都必须真机点过再交（AGENTS.md 第 4 节七级状态表）。
+2. **测试断言写错了会假装通过。** 本轮 `[G1b]` 第一版按**数组原始顺序**取 mark，
+   而 `numberShown` 只原地写 `idx/mark`、不重排数组（重排是 popup 的事），
+   于是「编号连续」这条假绿、顺序那条真红。改成「按 idx 排一遍再断言」才对。
+3. **真机数据比推理可靠。** 「三个 ord=0 并列」是 dump 出来的事实，不是猜的；
+   也正因为 dump，才发现 viewer 那条和 album 的 ord 各自从 0 数、根本没法互相对齐。
+4. **一个「只在变化时发」的同步机制，必须有自愈路径。** 否则任何一次丢包都会变成永久故障。
+
+### 八、涉及文件
+
+- `extension/background.js` — 新增 `compareWithinGroup()`，`renumberImages` / `numberShown` 共用
+- `extension/inject-main.js` — 新增 `tgMediaKey()` / `tgFocusByMedia()`，`reportFocus()` 加周期性补发
+- `extension/popup.js` — `visibleItems()` 的「同组编号压过 kind」
+- `test/group_key.test.js` — `[G1b]` 4 项 + `[G4]` 2 项
+- `test/focus_scope.test.js` — `[F2]` 6 项
 
 ---
 

@@ -456,7 +456,31 @@ function visibleItems() {
   else list = list.filter((it) => it.k === filter);
 
   const order = ["video", "audio", "doc", "image", "font", "other", "seg"];
+
+  // 先判断「两条是不是同一编号组」。判据对齐 background 的分组键（见 renumberImages）：
+  //   ① 两个都有标题且标题相同  → 同组（background 的 gk = "t:" + title）
+  //   ② 都没标题但 mid 相同      → 同组
+  // 同组且都编了号时，**序号必须压过 kind**。
+  //
+  // 为什么（2026-10-20 真机，问题①的最后一环）：
+  // Telegram 同一标题下视频和图片共用一个序号池（①~⑳），background 按
+  // 「mid 升序 → 组内 ord」编好。但这里原来第一行就是 `if (ka !== kb) return ka - kb;`，
+  // 把所有 video 提到所有 image 前面，于是拿到的顺序是
+  //   ②④⑥⑧…（video）在前，①③⑤⑦…（image）在后
+  // —— 用户看到「序号和内容对不上、跳号」。序号本来就是「阅读顺序」，
+  // kind 只是「同序号时的兜底排序」，不能反过来压过它。
+  const sameGroup = (a, b) => {
+    const ta = (a.title || "").trim(), tb = (b.title || "").trim();
+    if (ta && tb && ta === tb) return true;
+    if (!ta && !tb) {
+      const ma = a.mid || "", mb = b.mid || "";
+      return ma !== "" && ma === mb;
+    }
+    return false;
+  };
+
   return list.slice().sort((a, b) => {
+    if (sameGroup(a, b) && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
     if (ka !== kb) return ka - kb;
     // 同一组里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
@@ -470,10 +494,6 @@ function visibleItems() {
     //      而同标题的媒体常横跨好几条消息（同一个标题发了好几组图），mid 各不相同，
     //      于是同组成员被拆散开，用户在列表里看到「⑪ 在最上面、下面才是 ①②③」
     //      —— 用户 m13684 就是拿这张图来问的。
-    //
-    // 现在的判据直接对齐 background 的分组键：**两个都有标题且标题相同**就是同组
-    // （这正是 background 现在的 gk = "t:" + title）；都没标题时退回比 mid。
-    // 小红书详情页所有条目共用一个标题或都没标题，两种情形都能落到同一组。
     const ta = (a.title || "").trim(), tb = (b.title || "").trim();
     if (ta && tb && ta === tb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ma = a.mid || "", mb = b.mid || "";

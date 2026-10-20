@@ -1223,6 +1223,59 @@
    * 两条都拿不到就返回 ""，也就是「不设焦点、显示全量」——
    * 宁可多显示，也不能因为猜错把列表清空。
    */
+  /**
+   * 取一个媒体元素的「可比对标识」：优先 currentSrc（blob 或 progressive 都算），
+   * 其次 src 属性。两者都空时返回 ""。
+   */
+  function tgMediaKey(el) {
+    if (!el) return "";
+    const s = el.currentSrc || el.src || el.getAttribute("src") || "";
+    return String(s).trim();
+  }
+
+  /**
+   * 从「查看器里正在看的那张/那条」反查它属于哪条消息（问题②，方案 B）。
+   *
+   * 为什么需要反查（2026-10-20 真机实测）：Telegram 的 `#MediaViewer` 打开后，
+   * DOM 里**没有任何消息标识**——`.MediaViewerSlide` 只有 class/style，
+   * 上溯链 `MediaViewerSlide--active → MediaViewerSlides → DIALOG#MediaViewer
+   * → .opacity-transition → .Transition → BODY` 全无 `data-message-id`，
+   * `.message.highlighted/.selected` 也是空的（TG 的点击跳转用滚动定位，不加类）。
+   * 唯一还能对上的是**媒体地址本身**：查看器里的 `<video src=".../document4999…">`
+   * 与聊天里那条消息里的同一个地址。
+   *
+   * 所以做法是：拿查看器里激活那张的 src，去聊天里找 src 相同的媒体元素，
+   * 再往上找它所属的 `[data-message-id]`。blob: 地址在同一页面里是同一个字符串
+   * （TG 用的是同一个 objectURL），所以比对能命中。
+   *
+   * 找不到返回 ""，绝不猜一个——猜错会让列表显示错误的内容，
+   * 比「不收窄」更糟（用户会以为抓漏了）。
+   */
+  function tgFocusByMedia() {
+    try {
+      // 只认「当前可见的那一页」。MediaViewer 里所有 slide 都渲染了，
+      // 必须用 --active 挑出真正展示的那张，否则会拿到邻张。
+      const slides = document.querySelectorAll(".MediaViewerSlide--active, .MediaViewer .MediaViewerSlide--active");
+      const viewer = slides.length ? slides[slides.length - 1] : document.querySelector(".MediaViewerSlide");
+      const vMedia = viewer ? viewer.querySelector("img, video") : null;
+      const vKey = tgMediaKey(vMedia);
+      if (!vKey) return "";
+      // 在聊天消息里找同地址的媒体元素
+      const all = document.querySelectorAll("[data-message-id] img, [data-message-id] video");
+      for (const m of all) {
+        if (tgMediaKey(m) !== vKey) continue;
+        let n = m, depth = 0;
+        while (n && n.nodeType === 1 && depth < 22) {
+          const id = n.getAttribute && n.getAttribute("data-message-id");
+          if (id) return String(id).trim();
+          n = n.parentElement;
+          depth++;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
   function tgFocus() {
     try {
       // 只在 Telegram 主界面里找，避免第三方嵌入页面误判
@@ -1230,7 +1283,7 @@
       const viewerSel = ".MediaViewer, .MediaViewerSlide, [class*='MediaViewer'], [class*='is-for-video']";
       const viewers = document.querySelectorAll(viewerSel);
       for (const v of viewers) {
-        // ① 容器自己带消息号
+        // ① 容器自己带消息号（目前实测没有，留着以防 TG 改版加回来）
         const own = v.getAttribute && v.getAttribute("data-message-id");
         if (own) return String(own).trim();
         // ② 容器里的媒体元素往上找
@@ -1245,29 +1298,45 @@
           }
         }
       }
+      // ③ 兜底（方案 B）：拿查看器里激活那张的媒体地址，回聊天里反查
+      return tgFocusByMedia();
     } catch (e) { /* 忽略 */ }
     return "";
   }
 
   /**
-   * 焦点变化时向后台上报一次（没变化就不发，避免每 600ms 刷一条消息）。
+   * 焦点变化时向后台上报（没变化就不发，避免每 600ms 刷一条消息）。
    *
    * 难点是「通用层要认识站点」——但按 A0 模块化，通用层不认识任何站点，
    * 所以这一层只做「问一遍 activeSite().focus()」：
    *   · 小红书返回 ""（URL 已收窄，不需要）
    *   · Telegram 由下面 push 进去的对象返回 tgFocus()
    * 拿不到 focus 钩子的站点一律视为「没有焦点」。
+   *
+   * 为什么还要「隔一段时间强制重发」（2026-10-20 真机踩到）：
+   * 只按变化发有个致命副作用——**一次上报丢掉就永久失效**。
+   * 实测现象：查看器刚打开那一瞬间，`post` 发出去了，但 content script 转发时
+   * service worker 正在启动（或 tab 记录还没建），后台没收到；可 `lastFocus`
+   * 已经被设成 "7498"，之后每一轮都判定「没变化」直接 return，
+   * 于是用户看到「明明打开了查看器，列表还是全量」。
+   * 现在改成：值有变化立即发；没变化也每 FOCUS_RESEND_MS 补发一次，
+   * 让后台最终一致。补发只是一条几十字节的消息，代价可以忽略。
    */
+  const FOCUS_RESEND_MS = 5000;
   let lastFocus = "";
-  function reportFocus() {
+  let lastFocusAt = 0;
+  function reportFocus(force) {
     try {
       const site = activeSite();
       let id = "";
       if (site && site.focus) {
         try { id = String(site.focus() || ""); } catch (e) { id = ""; }
       }
-      if (id === lastFocus) return;
+      const now = Date.now();
+      const changed = id !== lastFocus;
+      if (!changed && !force && now - lastFocusAt < FOCUS_RESEND_MS) return;
       lastFocus = id;
+      lastFocusAt = now;
       post({ cmd: "focus", kind: id ? "mid" : "", id });
     } catch (e) { /* 忽略 */ }
   }
