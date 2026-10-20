@@ -152,8 +152,26 @@ function noteError(where, detail) {
   } catch (e) { /* 忽略 */ }
 }
 
-async function flushAll() {
-  const payload = {};
+// ---------------------------------------------------------------- 抓取诊断计数
+//
+// 背景：51cg1.com 这类站点「视频列表为空」，而 popup 什么都看不出来 —— 到底是
+// webRequest 没触发、被类型判定丢进「其他」、还是被最小体量门槛挡掉，全靠猜。
+// 这里按 tab 记一份「每个请求走到哪一步」的计数，popup 的排障区 / host.log 都能读。
+// 只保留计数和最近几条被丢弃的样本，不存 URL 全量（避免撑爆 storage）。
+const DIAG_MAX_SAMPLES = 5;
+function diagBump(tabId, key, url) {
+  try {
+    const rec = ensureTab(tabId);
+    if (!rec.diag) rec.diag = { seen: 0, drop: {}, sample: {} };
+    rec.diag.seen += 1;
+    rec.diag.drop[key] = (rec.diag.drop[key] || 0) + 1;
+    if (!rec.diag.sample[key]) rec.diag.sample[key] = [];
+    const arr = rec.diag.sample[key];
+    if (arr.length < DIAG_MAX_SAMPLES) arr.push(String(url || "").slice(0, 160));
+  } catch (e) { /* 诊断永远不能影响主流程 */ }
+}
+
+async function flushAll() {  const payload = {};
   for (const [tabId, rec] of state) {
     if (!rec.dirty) continue;
     rec.dirty = false;
@@ -234,8 +252,17 @@ function it_legacyHits(it) {
   return Number(it.h) || 0;
 }
 
-function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
-  if (!/^https?:/i.test(d.url)) return;
+// 标签页 id 合法性：Chrome 的 tabId 是「从 0 开始的整数」，0 是合法标签页。
+// 早期写成 `!d.tabId`，把 tabId=0 当假值丢了 —— 跨站诊断（51cg1.com 视频列表为空）
+// 时发现这正是「首发标签页永远抓不到东西」的原因之一。`-1` 才表示「不属于任何标签页」
+// （service worker / 扩展自身请求）。floating 值（1.5）同样不可信，按无效丢弃。
+function isValidTabId(t) {
+  return Number.isInteger(t) && t >= 0;
+}
+
+function record(d) {
+  if (!d || !isValidTabId(d.tabId)) { if (d && d.url) diagBump(d.tabId, "bad-tabid", d.url); return; }
+  if (!/^https?:/i.test(d.url)) { diagBump(d.tabId, "bad-scheme", d.url); return; }
   if (d.type === "main_frame") {
     const rec = ensureTab(d.tabId);
     rec.url = d.url;
@@ -258,7 +285,10 @@ function record(d) {  if (!d || !d.tabId || d.tabId < 0) return;
 
   // 最小体量门槛（见 MIN_MEDIA_BYTES 注释）：明确小于门槛的完整响应丢弃。
   // 206 分段响应跳过门槛（content-length 只是分段长度，真体量靠后续 existed 分支补）。
-  if (d.statusCode !== 206 && size > 0 && size < (MIN_MEDIA_BYTES[kind] || 0)) return;
+  if (d.statusCode !== 206 && size > 0 && size < (MIN_MEDIA_BYTES[kind] || 0)) {
+    diagBump(d.tabId, "too-small:" + kind, d.url);
+    return;
+  }
 
   const now = Date.now();
   const existed = rec.items.get(d.url);
@@ -396,6 +426,11 @@ function recordPageMedia(tabId, pageUrl, p) {
   if (!key) return;
   const isHttp = /^https?:/i.test(key);
   const rec = ensureTab(tabId);
+  // 导航代次闸：页面侧每次 SPA 导航都会自增 gen，本记录也记下导航当时的代次。
+  // 代次比当前小的消息 = 上一个页面的残留（扫描循环的延迟回调、还在路上的 fetch），
+  // 一律丢弃 —— 否则「切了视频，上一页的封面还挂在列表里」，用户看到的就是两个视频的图混在一起。
+  // 不带 gen 的消息（旧版页面脚本）放行，避免升级扩展后老页面什么都抓不到。
+  if (Number.isInteger(p.gen) && Number.isInteger(rec.gen) && p.gen < rec.gen) return;
   if (!rec.url && pageUrl) rec.url = pageUrl;
 
   // http 媒体 URL 直接用 URL 作 key，与 webRequest 抓到的那条合并；
@@ -617,6 +652,44 @@ function isPageTitle(title, rec) {
   return false;
 }
 
+/**
+ * 站点 UI 素材的「结构信号」——比体量可信得多。
+ *
+ * 为什么需要它：裸条目（只有 webRequest、没有 DOM 尺寸）里，体量是唯一的强弱排序依据，
+ * 但站点素材并不小。B 站实测 i0.hdslb.com 的 47KB avif 压缩图、29KB 的 svg-next PNG
+ * 都是站方 UI 素材（播放器按钮、分区角标），却和真封面同样超过 24KB 线，
+ * 于是体积规则把它们放行、域名规则永远轮不到。
+ *
+ * 两条互补的信号（都很窄，宁可漏判也不误杀用户图片）：
+ *   1. CDN 的「图片处理后缀」段 + 站点样式/脚本目录：`bfs/svg-next/`、
+ *      `bfs/archive/<hash>.jpg@.avif` 这类站方压过的图标。真封面几乎都落在
+ *      `bfs/archive|bfs/face|bfs/new_dyn` 且**不带** `@.avif/@.webp` 之类的变换后缀。
+ *   2. 明确的素材目录关键词：sprite / favicon / placeholder / logo / icon。
+ *
+ * 注意：这里只看 URL，不看体积也不看域名 —— 域名一刀切会把真封面一起砍掉
+ * （封面和 UI 素材在同一个 CDN 上），所以判据必须落在**路径形状**上。
+ */
+const SITE_ASSET_PATH = /(?:^|\/)(?:svg-next|sprite[s]?|favicon|placeholder|loading|spinner|logo|icons?)\//i;
+const IMG_TRANSFORM_TAIL = /@\.(?:avif|webp|png|jpg|jpeg)(?:\?|$)/i;
+
+function isSiteUiAsset(u) {
+  const s = String(u || "");
+  if (!s) return false;
+  if (SITE_ASSET_PATH.test(s)) return true;
+  // 「带 @ 变换后缀」本身不足以定案（抖音/微博的封面也用 @ 后缀），
+  // 必须叠一条：路径里出现 svg-next/archive 这类站方静态资源目录。
+  if (IMG_TRANSFORM_TAIL.test(s) && /\/(?:svg-next|archive)\/[^/]+\.(?:png|jpg|jpeg|webp|svg|gif)@\./i.test(s)) {
+    // 真封面（bfs/archive/<长 hash>.jpg）**不带** @ 后缀，这条组合本身就只会命中
+    // 带变换后缀的图。再叠一条：文件名是纯 hash（无意义名字）或明显图标名。
+    // 这样既抓住 fac5c6d5ce…jpg@.avif（站方压缩素材），又不会误杀
+    // 5242750857.jpg@.webp 这种带语义的封面（B 站老封面也有 @.webp 形态）。
+    return /(?:^|\/)(?:nbr|icon|logo|sprite|ico|badge)[^/]*@\./i.test(s)
+      || /\/svg-next\//i.test(s)
+      || /\/[0-9a-f]{24,}\.(?:png|jpg|jpeg|webp|gif)@\./i.test(s);
+  }
+  return false;
+}
+
 function looksLikeIcon(it, rec) {
   const w = it.w | 0;
   const h = it.h | 0;
@@ -638,6 +711,10 @@ function looksLikeIcon(it, rec) {
   //    才是这张图真正的身份。参考的 Playwright 脚本也是这么做的：BAD 命中直接丢。
   const hint = String(it.hint || "");
   if (hint && DECOR_HINT.test(hint)) return true;
+  // 站点明确声明的「这是内容」（当前封面、帖子配图）：hint 里的 `-cover` / `-note`
+  // 这类正向标记，说明页面已经告诉我们是正文图，不再用尺寸猜。
+  // B 站封面实测常是 100×100 的小尺寸（站方压缩过），靠尺寸判会误杀。
+  if (/^bili-cover$/.test(hint)) return false;
   // 在页头 / 页脚 / 侧栏里 → 站点外壳，装饰
   if (it.ic) return true;
 
@@ -685,6 +762,13 @@ function looksLikeIcon(it, rec) {
   // 也匹配 XHS_ASSET_PATH 的类型段，先判类型段会把它当成正文图放行。
   if (XHS_COMMENT_IMG.test(u)) return true;
   if (/xhscdn\.com\//i.test(u) && !XHS_ASSET_PATH.test(u)) return true;
+  // 站点 UI 素材的「弱信号」必须排在体积线之前。
+  // 2026-10-20 审查（B 站列表混入 UI 素材）：i0.hdslb.com 的
+  //   bfs/archive/xxx.jpg@.avif（47KB）、bfs/svg-next/xxx.png（29KB）
+  // 这类「不是封面也不是用户图」的站点素材，体积常常超过 24KB，
+  // 而原来的 `if (s > 24KB) return false` 写在 CDN 特征之前 —— 47KB 直接放行，
+  // CDN_HINT 那行永远轮不到。现在把「站点素材目录 / 处理后缀」的判断提到前面。
+  if (isSiteUiAsset(u)) return true;
   if (s && s > 24 * 1024) return false;          // 大于 24KB 的先当真图
   if (THUMB_HINT.test(u)) return true;
   if (/\.(svg|ico)(\?|$)/i.test(u)) return true; // svg/ico 基本都是图标
@@ -1060,8 +1144,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === "loading" && info.url) {
-    // 页面开始导航：清掉上一个页面的记录
-    state.set(tabId, { url: info.url, items: new Map(), dirty: false });
+    // 页面开始导航：清掉上一个页面的记录。
+    // gen 置 0：整页刷新后页面侧的代次计数器从 0 重新开始，这里必须同步归零，
+    // 否则新页面（gen=0/1）的上报会被旧记录里的大代次拦掉，表现是「刷新后什么都抓不到」。
+    state.set(tabId, { url: info.url, items: new Map(), dirty: false, gen: 0 });
     chrome.action.setBadgeText({ tabId, text: "" });
     chrome.storage.session.remove("tab:" + tabId).catch(() => {});
   }
@@ -1361,7 +1447,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           : dedupeImagesByIdentity(visible);
         const counts = {};
         for (const it of shown) counts[it.k] = (counts[it.k] || 0) + 1;
-        sendResponse({ ok: true, items: shown, counts, tabUrl, order: KIND_ORDER });
+        sendResponse({ ok: true, items: shown, counts, tabUrl, order: KIND_ORDER, diag: rec ? rec.diag || null : null });
         break;
       }
       case "sniff:clear": {
@@ -1386,12 +1472,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (p.cmd === "nav") {
           const nextUrl = String(p.url || "");
           const cur = state.get(tid);
+          // 页面侧代次（inject-main.js 的 watchSpaNav 每次导航 +1）。老版本页面脚本不带，
+          // 传 undefined 时不记代次，recordPageMedia 那边也就不会拦（向后兼容）。
+          const gen = Number.isInteger(p.gen) ? p.gen : undefined;
           if (nextUrl && (!cur || pathOfUrl(cur.url) !== pathOfUrl(nextUrl))) {
-            state.set(tid, { url: nextUrl, items: new Map(), dirty: false });
+            state.set(tid, { url: nextUrl, items: new Map(), dirty: false, gen });
             try { chrome.action.setBadgeText({ tabId: tid, text: "" }); } catch (e) { /* 忽略 */ }
             try { chrome.storage.session.remove("tab:" + tid); } catch (e) { /* 忽略 */ }
           } else if (cur && nextUrl) {
             cur.url = nextUrl;
+            if (gen != null) cur.gen = gen;
           }
           sendResponse({ ok: true });
           break;

@@ -433,10 +433,11 @@ onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不�
 | A2 | B 站图片只取所点开视频的封面 | **已完成（1.3.13）**：`biliCoverImage()` 从 `__INITIAL_STATE__` 取封面（候选 videoData.pic → epInfo.cover → mediaInfo.cover 等），站点钩子 `onScanImages` 发 `hint:"bili-cover"` 条目并接管扫描、`isImageOnly` 拦下视频页其余 img（`biliIsCoverSrc` 去 `@尺寸段` 比对）。详见 [d-019](DEVLOG.md#d-019) | 已完成 |
 | A3 | Telegram 视频和图片下载全部失效 | **静态排查结论（2026-10-19）**：扩展侧链路（页面→content→background→宿主→按 id 回配）代码自洽；宿主日志的「stdin closed ×4 连发」= MV3 SW 挂起断端口（无害）、「outdir 越界 D:\软件应用\DSH」= 迁移前过期设置值（宿主回退默认目录，无害）；jobs 目录里当晚 B 站 merge 任务全部 done，**没有任何 Telegram 页面直传任务到达宿主** → 断点在页面侧。需真机确认：扩展已指向新路径后打开 Telegram 聊天页看 popup（空列表 = 注入脚本失效；有列表保存失败 = 桥接/换址问题） | 待真机复现 |
 | A4 | 「本次记录」改名为「下载记录」 | **已完成（1.3.14）**：按钮文案、面板标题、相关注释；空列表提示保留「本次会话还没有下载记录」（语义准确） | 已完成 |
-| B1 | B 站图片仍混入 UI 素材 + 切视频后旧封面残留 | 用户 2026-10-19 真机截图：视频页「图片」分类混入 `i0.hdslb.com` 的 avif/png UI 素材（47KB/29KB）；SPA 切到下一个视频后列表出现「上一视频封面 + 两张当前视频封面 + 图标」。排查起点：① 旧封面条目留在 background state 里没人清（`biliIsCoverSrc` 只管放行，不管清理）——SPA 路由变化时应清掉旧 `hint:"bili-cover"` 条目或按 bvid 分组只留当前；② UI 素材走 webRequest `record()` 路径，`looksLikeIcon()` 对 `hdslb.com` 的 avif/png+@尺寸后缀无判定，需补判定归 icon 或丢弃 | 待办 |
+| B1 | B 站图片仍混入 UI 素材 + 切视频后旧封面残留 | **已完成（1.3.15）**：① UI 素材——根因不是缺规则而是**规则顺序错**，`looksLikeIcon` 末尾的 `s > 24KB → return false` 排在 `CDN_HINT` 之前，47KB 素材在第一行就被放行；新增 `isSiteUiAsset(u)` 把「站点素材形状」提到体积线之前，判据落在**路径形状**（`svg-next/`、`sprite/`、`favicon/` 目录；`xxx.jpg@.avif` 变换后缀 + 纯 hash 文件名）而不是域名——封面和素材在同一个 `hdslb.com` 上，域名一刀切会误杀真封面。另加 `hint === "bili-cover"` 正向豁免，防 100×100 小封面被尺寸启发式误杀。② 切视频残留——导航重建**本来就存在**，真正的洞是**迟到消息**：页面 A 的延迟扫描回调在导航到 B 之后才上报，污染刚清空的新记录。加导航代次 `gen`：`watchSpaNav` 每次导航 +1 随 `nav` 发出，`post()` 给 `found/progress` 补 `gen`，`recordPageMedia` 入口丢弃 `p.gen < rec.gen`；`tabs.onUpdated` 整页刷新时 `gen` 归 0（页面侧计数器同理从 0 重来）。③ 顺带：`record()` 的 `!d.tabId` 把 **tabId=0** 当假值丢弃（Chrome 标签页 id 从 0 开始），改为 `isValidTabId(t)` = `Number.isInteger(t) && t >= 0`；新增 `diagBump()` 在每条丢弃路径打点，popup 空列表时显示「收到 N 个请求、丢弃原因」。详见 [d-020](DEVLOG.md#d-020) | **已完成** |
 | B2 | 测试标准规范 + 多模型分工（架构师/开发/测试） | 用户 2026-10-19 提出：制定测试标准规范，评估能否分几个模型/角色——一个架构师、一个开发、一个测试。**明天第一件事**：先讨论方案（角色职责边界、工作流编排、测试标准怎么定、用什么工具串联），讨论出方案再动手 | 待讨论 |
+| B3 | 51cg1.com 视频列表为空（仅有审查证据，无本机复现） | 审查文档第 7 章记录的现象。按用户要求**这个站先不管**，只做通用加固：`tabId=0` 误丢已修（可能正是首发标签页抓不到的原因），并在 `record()` 每条丢弃路径加了 `diagBump` 计数；下次遇到同类站点，popup 空列表会直接显示「收到 N 个请求，已丢弃：体积过小 x 条 / …」 | 通用加固完成 |
 
-**顺序：A1 ✅ → A0b ✅ → A2 ✅ → A4 ✅ → A3（待真机）→ 明天：B2（先讨论）→ B1。**
+**顺序：A1 ✅ → A0b ✅ → A2 ✅ → A4 ✅ → B1 ✅ → A3（待真机）→ 明天：B2（先讨论）。**
 
 
 

@@ -84,6 +84,13 @@
         const nid = siteContentId();
         if (nid) d.noteId = nid;
       }
+      // 导航代次：SPA 切页后旧页面可能还有一次延迟上报在路上，带上代次让 background
+      // 能认出「这是上一页的残留」并丢掉（见 watchSpaNav 里 gen 的说明）。
+      // nav 消息自己已经带了自增后的新代次，这里不覆盖。
+      if (d.cmd !== "nav" && d.gen == null) {
+        const g = (typeof window.__msNavGen === "function") ? window.__msNavGen() : 0;
+        if (g) d.gen = g;
+      }
       window.postMessage(d, "*");
     } catch (e) { /* 忽略 */ }
   };
@@ -3552,6 +3559,12 @@
   // 上一个页面的条目、rec.xhsVid 都留在 tab 记录里。真实表现是「换了个视频抓不到」
   // （xhsVid 那道闸把新页面的 MSE/blob 条目全拦掉）和「列表混着上一页的图」。
   (function watchSpaNav() {
+    // 导航代次：每发生一次 SPA 导航就 +1，随每条上报带给 background。
+    // background 那边的 tab 记录也随之记下当前代次；收到「代次落后」的 found/progress
+    // 一律丢弃 —— 这就是「切了视频，上一页的封面/图还混在列表里」的根因：
+    // 页面 A 的扫描循环可能还挂着一次 setTimeout，导航到 B 之后它把 A 的图发上来，
+    // background 刚清空的新记录就被 A 的残留污染了。
+    let gen = 0;
     let lastPath = "";
     try { lastPath = location.pathname + location.search; } catch (e) { /* 忽略 */ }
     const fire = () => {
@@ -3559,7 +3572,8 @@
       try { cur = location.pathname + location.search; } catch (e) { return; }
       if (cur === lastPath) return;
       lastPath = cur;
-      try { post({ cmd: "nav", url: String(location.href || "") }); } catch (e) { /* 忽略 */ }
+      gen += 1;   // 必须在 post 之前自增：导航消息本身要带上新代次
+      try { post({ cmd: "nav", url: String(location.href || ""), gen }); } catch (e) { /* 忽略 */ }
     };
     for (const name of ["pushState", "replaceState"]) {
       try {
@@ -3574,6 +3588,8 @@
     }
     try { window.addEventListener("popstate", () => setTimeout(fire, 0)); } catch (e) { /* 忽略 */ }
     try { window.addEventListener("hashchange", () => setTimeout(fire, 0)); } catch (e) { /* 忽略 */ }
+    // 供其它上报点读取当前代次（post 统一在下面这个包装里补 gen）
+    window.__msNavGen = () => gen;
   })();
 
   window.__msIsXhsHost = isXhsHost;         // 小红书排查入口

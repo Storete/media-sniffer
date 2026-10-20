@@ -367,4 +367,16 @@ footer {
 
 /* 空态里的操作按钮 */
 .empty-actions { display: flex; gap: 8px; justify-content: center; margin-top: 14px; }
+/* 抓取诊断（空列表时显示「收到 N 个请求、丢弃原因」），灰色小字，不抢主提示 */
+.empty .diag {
+  margin-top: 14px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.6;
+  word-break: break-all;
+}
 .empty.blocked b { color: var(--text); }

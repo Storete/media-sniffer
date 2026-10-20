@@ -851,6 +851,10 @@ if (!rpmSrc) {
   check("⑦ 真实地址缺 noteId 时 xhsVidNote 清空", rec.xhsVidNote === "", rec.xhsVidNote);
 }
 
+// ---- 审查文档（readonly-review-and-fix-plan）追加的回归组
+// [R1] tabId=0、[R2] 素材分类体积线、[R3] 导航代次、[R4] 普通导航清空
+require("./review.test.js")(check);
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

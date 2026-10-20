@@ -42,6 +42,7 @@ let allItems = [];     // 从 background 拿到的全量条目（未经任何过
 let filter = "all";    // 当前选中的分类 chip
 let counts = {};       // background 给的各 kind 计数（B 站上会被 shownItems 重算覆盖）
 let hostOk = null;     // 本地下载器状态：null=还没结果 / true=可用 / false=不可用
+let lastDiag = null;   // background 给的抓取诊断（{seen, drop:{原因:次数}, sample:{原因:[url]}}）
 let selecting = false; // 批量选择模式
 const picked = new Set(); // 已选条目的 key（就是 it.u）
 let blockedHosts = []; // 用户屏蔽的站点（hostname）
@@ -209,6 +210,7 @@ async function load() {
   }
   allItems = res.items || [];
   counts = res.counts || {};
+  lastDiag = res.diag || null;
   if (res.tabUrl && res.tabUrl !== tabUrl) {
     tabUrl = res.tabUrl;
     $("#site").textContent = tabUrl;
@@ -478,6 +480,14 @@ function renderList() {
       actions.append(scan);
       d.append(actions);
     }
+    // 诊断：用户报「某站视频列表为空」时，这一行能直接告诉我们是哪一步丢的。
+    // 只在「确实收到过请求、但全被丢掉」时显示，避免给正常空页加噪声。
+    const dg = diagText(lastDiag);
+    if (dg) {
+      const box2 = el("div", "diag");
+      box2.textContent = dg;
+      d.append(box2);
+    }
     box.append(d);
     return;
   }
@@ -485,6 +495,29 @@ function renderList() {
   for (const it of items) {
     box.append(renderItem(it));
   }
+}
+
+/**
+ * 把 background 的抓取诊断翻成一句人话。
+ * 返回空串 = 没什么可说的（没收到请求，或全部正常入库）。
+ */
+function diagText(diag) {
+  if (!diag || !diag.seen) return "";
+  const drop = diag.drop || {};
+  const parts = [];
+  const NAME = {
+    "bad-tabid": "标签页 id 无效",
+    "bad-scheme": "非 http(s) 链接",
+  };
+  for (const [k, n] of Object.entries(drop)) {
+    if (k.startsWith("too-small:")) {
+      parts.push(k.slice(10) + " 体积过小 " + n + " 条");
+    } else {
+      parts.push((NAME[k] || k) + " " + n + " 条");
+    }
+  }
+  if (!parts.length) return "";
+  return "本次共收到 " + diag.seen + " 个请求，已丢弃：" + parts.join("、") + "。";
 }
 
 /**
