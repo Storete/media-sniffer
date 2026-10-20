@@ -93,6 +93,24 @@ module.exports = function runGroupTests(check) {
     check("[G1] 不同标题不合并（组内只有一张 → 不编号）", marks.join("") === "", marks.join("|"));
   }
 
+  // 同标题下「视频 + 图片」共用一个序号池（用户 m13827 确认过的语义）。
+  // 这条是**故意**的，不是碰巧：拆分会让同一标题下出现两个 ①，
+  // 用户分不清谁先谁后（第十轮小红书就是这么改回来的）。
+  {
+    const out = runRenum([
+      tgItem({ title: "同一标题", mid: "100", k: "video", ord: 0 }),
+      tgItem({ title: "同一标题", mid: "100", k: "image", ord: 1 }),
+      tgItem({ title: "同一标题", mid: "101", k: "video", ord: 2 }),
+      tgItem({ title: "同一标题", mid: "101", k: "image", ord: 3 }),
+    ]);
+    const marks = out.map((x) => x.mark || "");
+    check("[G1] 同标题下视频+图片共用一个序号池（期望 ①②③④，不是两个①）",
+      marks.join("") === "①②③④", marks.join("|"));
+    const kinds = out.map((x) => x.k).join(",");
+    check("[G1] 上面这组的 kind 确实是 video,image,video,image 交错的",
+      kinds === "video,image,video,image", kinds);
+  }
+
   // 无标题条目仍不参与编号（防止空标题把全页图并成一组）
   {
     const out = runRenum([

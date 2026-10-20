@@ -28,9 +28,9 @@ jobs:
         run: node test/main-hook.test.js
 
       # background 末尾会 require ./review.test.js（R1~R4 共 27 项）和
-      # ./group_key.test.js（G1~G4 共 15 项），所以这里的数字包含两批回归。
+      # ./group_key.test.js（G1~G4 共 17 项），所以这里的数字包含两批回归。
       # 这两个文件都不能单独跑，直接跑会打印一行说明后退出。
-      - name: background（189 项，含 review 27 + group_key 15）
+      - name: background（191 项，含 review 27 + group_key 17）
         run: node test/background.test.js
 
       - name: range_parallel（14 项）
