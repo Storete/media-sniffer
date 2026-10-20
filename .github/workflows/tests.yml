@@ -22,10 +22,14 @@ jobs:
           node-version: ${{ matrix.node }}
 
       # 纯 Node 脚本（vm 沙箱 + 假宿主），不需要 npm install
-      - name: main-hook（160 项）
+      # 名称里的项数只是参考，真实数字以脚本自己打印的「通过 N 项」为准；
+      # 改了测试记得同步，否则 CI 面板会骗人。
+      - name: main-hook（183 项）
         run: node test/main-hook.test.js
 
-      - name: background（135 项）
+      # background 末尾会 require ./review.test.js（R1~R4 共 27 项），所以这里的数字
+      # 包含审查报告那批回归。review.test.js 不能单独跑，跑它会打印一行说明后退出。
+      - name: background（174 项）
         run: node test/background.test.js
 
       - name: range_parallel（14 项）
@@ -41,7 +45,7 @@ jobs:
         run: node test/popup_wiring.test.js
 
       # 架构约束：通用层不许出现站点专属判断（防模块化回退成 if 汤）
-      - name: site_registry（14 项）
+      - name: site_registry（38 项）
         run: node test/site_registry.test.js
 
       - name: 语法检查

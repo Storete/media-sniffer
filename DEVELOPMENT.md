@@ -190,20 +190,55 @@ MV3 的 service worker 随时会被回收（30 秒无事件）。下载必须独
 
 ```bash
 # JS（Node 18+，不需要 npm install）
-node test/main-hook.test.js        # inject-main.js，120 项
-node test/background.test.js       # background.js，88 项
+node test/main-hook.test.js        # inject-main.js 页面注入层，183 项
+node test/background.test.js       # background.js 服务层，174 项（含 review.test.js 的 27 项）
+node test/detect.test.js           # detect.js 通用媒体判定，30 项
 node test/range_parallel.test.js   # Range 并发下载，14 项
+node test/pattern_sync.test.js     # 前后端正则/常量同步，4 项
+node test/popup_wiring.test.js     # popup DOM 接线，21 项
+node test/site_registry.test.js    # 架构约束：通用层不许出现站点判断，38 项
 
 # Python（不需要 pytest）
-python test/run_all.py
+python test/run_all.py             # 8 套，缺 ffmpeg 的两套自动 SKIP
 ```
 
-三个 JS 套件都靠 **vm 沙箱 + 假宿主**跑，不启动浏览器。新增 hook 逻辑时优先看
+`test/review.test.js` **不单独跑**：它导出 `runReviewTests(check)`，由
+`background.test.js` 末尾 `require` 进来共用同一套 `check()` 计数器。
+单独执行它会打印一行说明后正常退出（避免 CI 把它当成空套件判失败）。
+
+所有 JS 套件都靠 **vm 沙箱 + 假宿主**跑，不启动浏览器。新增 hook 逻辑时优先看
 `test/main-hook.test.js` 里现成的假 document / 假宿主怎么搭的。
 
-CI（`.github/workflows/tests.yml`）在每次 push / PR 自动跑：JS 三套 × Node 18/20/22，
+CI（`.github/workflows/tests.yml`）在每次 push / PR 自动跑：JS 七套 × Node 18/20/22，
 Python 套件在 Ubuntu（3.9 / 3.12）和 Windows（3.12）上跑。没装 ffmpeg 的环境里
 `host_merge` / `bili_stream` 自动 SKIP 而不是 FAIL。
+
+### 5.1 回归清单（改完必看）
+
+按「改了什么」查该跑哪几项，全绿才算过。
+
+| 改动的区域 | 必须跑的测试 | 额外验证 |
+|---|---|---|
+| `looksLikeIcon` / 图片图标判定 / `isSiteUiAsset` | `background.test.js` 的 `[3]` `[R2]` | 拿真机截图里的 URL 加一条断言 |
+| `record()` / `classify()` / 体量门槛 / tabId | `background.test.js` 的 `[R1]` + `detect.test.js` | —— |
+| `recordPageMedia` / 导航代次 / SPA 生命周期 | `background.test.js` 的 `[R3]` `[R4]` `[11]` | 真机切视频看旧封面是否残留 |
+| 小红书去重 / imageList 直读 / noteId 闸 | `background.test.js` 的 `[4]`~`[4d]` + `main-hook` 的 `[5v]`~`[5z]` | 真机打开一篇多图帖 |
+| 站点专属扫描逻辑（B 站封面 / 小红书配图） | `site_registry.test.js` 全部 | 通用层出现站点 if 会直接红 |
+| Range 下载 / 分块并发 / B 站 m4s | `range_parallel.test.js` | 真机下一条 B 站视频 |
+| 页面 → 宿主桥接 / 动作白名单 | `host_validation_test.py` | 重装宿主后真机保存一次 |
+| popup 按钮 / 列表渲染 / 下载记录 | `popup_wiring.test.js` | 真机打开弹窗点一遍 |
+| 宿主分块落盘 / ffmpeg 合并 | `run_all.py` 全跑 | 真机下完用播放器确认能播 |
+
+### 5.2 汇报用词（不许含糊）
+
+| 你做到的 | 只能说 |
+|---|---|
+| 只跑了 `node --check` | **静态检查通过** |
+| 单元测试全绿 | **自动化测试通过**（并说明未真机） |
+| 真机点过 | **浏览器实测通过** |
+| 用户确认 | **验收通过** |
+
+把「静态检查通过」说成「测试通过」是明确的失实汇报。完整规范见 `AGENTS.md` 第 4 节。
 
 ---
 
@@ -434,7 +469,7 @@ onScanImages()     // 清单类站点一次性上报，返回 true = 本轮不�
 | A3 | Telegram 视频和图片下载全部失效 | **静态排查结论（2026-10-19）**：扩展侧链路（页面→content→background→宿主→按 id 回配）代码自洽；宿主日志的「stdin closed ×4 连发」= MV3 SW 挂起断端口（无害）、「outdir 越界 D:\软件应用\DSH」= 迁移前过期设置值（宿主回退默认目录，无害）；jobs 目录里当晚 B 站 merge 任务全部 done，**没有任何 Telegram 页面直传任务到达宿主** → 断点在页面侧。需真机确认：扩展已指向新路径后打开 Telegram 聊天页看 popup（空列表 = 注入脚本失效；有列表保存失败 = 桥接/换址问题） | 待真机复现 |
 | A4 | 「本次记录」改名为「下载记录」 | **已完成（1.3.14）**：按钮文案、面板标题、相关注释；空列表提示保留「本次会话还没有下载记录」（语义准确） | 已完成 |
 | B1 | B 站图片仍混入 UI 素材 + 切视频后旧封面残留 | **已完成（1.3.15）**：① UI 素材——根因不是缺规则而是**规则顺序错**，`looksLikeIcon` 末尾的 `s > 24KB → return false` 排在 `CDN_HINT` 之前，47KB 素材在第一行就被放行；新增 `isSiteUiAsset(u)` 把「站点素材形状」提到体积线之前，判据落在**路径形状**（`svg-next/`、`sprite/`、`favicon/` 目录；`xxx.jpg@.avif` 变换后缀 + 纯 hash 文件名）而不是域名——封面和素材在同一个 `hdslb.com` 上，域名一刀切会误杀真封面。另加 `hint === "bili-cover"` 正向豁免，防 100×100 小封面被尺寸启发式误杀。② 切视频残留——导航重建**本来就存在**，真正的洞是**迟到消息**：页面 A 的延迟扫描回调在导航到 B 之后才上报，污染刚清空的新记录。加导航代次 `gen`：`watchSpaNav` 每次导航 +1 随 `nav` 发出，`post()` 给 `found/progress` 补 `gen`，`recordPageMedia` 入口丢弃 `p.gen < rec.gen`；`tabs.onUpdated` 整页刷新时 `gen` 归 0（页面侧计数器同理从 0 重来）。③ 顺带：`record()` 的 `!d.tabId` 把 **tabId=0** 当假值丢弃（Chrome 标签页 id 从 0 开始），改为 `isValidTabId(t)` = `Number.isInteger(t) && t >= 0`；新增 `diagBump()` 在每条丢弃路径打点，popup 空列表时显示「收到 N 个请求、丢弃原因」。详见 [d-020](DEVLOG.md#d-020) | **已完成** |
-| B2 | 测试标准规范 + 多模型分工（架构师/开发/测试） | 用户 2026-10-19 提出：制定测试标准规范，评估能否分几个模型/角色——一个架构师、一个开发、一个测试。**明天第一件事**：先讨论方案（角色职责边界、工作流编排、测试标准怎么定、用什么工具串联），讨论出方案再动手 | 待讨论 |
+| B2 | 测试标准规范 + 多模型分工（架构师/开发/测试） | **测试标准已落地**：新建根目录 `AGENTS.md`（一任务一目标 / 五阶段流程 / 测试状态七级 / 失败反馈模板 / 生效条件 / 提交自查清单），本章新增 5.1 回归清单与 5.2 汇报用词。**多角色分工仍待讨论**（`AGENTS.md` 第 8 节留了位置） | 规范已完成，分工待讨论 |
 | B3 | 51cg1.com 视频列表为空（仅有审查证据，无本机复现） | 审查文档第 7 章记录的现象。按用户要求**这个站先不管**，只做通用加固：`tabId=0` 误丢已修（可能正是首发标签页抓不到的原因），并在 `record()` 每条丢弃路径加了 `diagBump` 计数；下次遇到同类站点，popup 空列表会直接显示「收到 N 个请求，已丢弃：体积过小 x 条 / …」 | 通用加固完成 |
 
 **顺序：A1 ✅ → A0b ✅ → A2 ✅ → A4 ✅ → B1 ✅ → A3（待真机）→ 明天：B2（先讨论）。**
