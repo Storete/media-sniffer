@@ -16,6 +16,7 @@
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-020](#d-020) | 2026-10-20 | 只读审查报告落地：tabId=0 / 素材漏判 / SPA 迟到消息 | 先补 24 项红测再修，抓取诊断上浮到 popup |
 | [d-019](#d-019) | 2026-10-19 | A2：B 站图片只留当前视频封面 | state 取封面 + isImageOnly 过滤，测试桩 FakeURL 教训 |
 | [d-018](#d-018) | 2026-10-19 | 复查 1.3.11：noteId 闸从未生效 | blob/MSE 上报统一补 noteId 让闸可达，另修 4 处提示链路 |
 | [d-017](#d-017) | 2026-10-19 | 「一个功能好了另一个就失效」的机制追问 | 拆掉 4 处下载层站点泄漏 + 修 2 个 tab 级共享状态 |
@@ -35,6 +36,80 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-020"></a>
+## #d-020 · 2026-10-20 · 只读审查报告的三个高危项：tabId=0 / 素材漏判 / SPA 迟到消息
+
+**问题**
+
+用户给了一份第三方只读审查报告（`media-sniffer-readonly-review-and-fix-plan.md`，基准 `1736426`），其中三条和跨站兼容性相关：
+
+1. `record()` 的 `if (!d || !d.tabId || d.tabId < 0) return;` 会把 **tabId=0** 当假值丢掉 —— Chrome 的标签页 id 从 0 开始，0 是合法值。
+2. B 站列表里混进 `bfs/archive/xxx.jpg@.avif`（47KB）、`bfs/svg-next/xxx.png`（29KB）这类站方 UI 素材。
+3. 切视频后上一页的封面残留在列表里。
+
+**排查**
+
+先按报告给的定位逐条读代码，得到的结论：
+
+1. 属实。`!d.tabId` 对 `0` 是假值，直接 return。
+2. 根因不是「缺规则」，是**规则顺序错了**：`looksLikeIcon` 末尾是
+
+   ```js
+   if (s && s > 24 * 1024) return false;   // 大于 24KB 的先当真图
+   if (THUMB_HINT.test(u)) return true;
+   if (/\.(svg|ico)(\?|$)/i.test(u)) return true;
+   if (CDN_HINT.test(u)) return true;      // ← 永远轮不到
+   ```
+
+   47KB 的素材在第一行就放行了，后面所有 URL 特征全部作废。
+3. `watchSpaNav`（`inject-main.js`）和 `p.cmd === "nav"` 的重建逻辑**都已经存在**，导航时 `state` 也确实被清空了。真正的洞是**清空之后**：页面 A 还挂着一个 `setTimeout` 的扫描回调，导航到 B 之后它把 A 的图发上来，background 刚建的新记录就被污染了。报告说「SPA 生命周期没处理」不准确，准确的说法是「**迟到消息没有代次可以拒绝**」。
+
+**解决方案**
+
+先写测试，看着它们红，再改代码（`test/review.test.js`，通过 `background.test.js` 末尾 `require` 接入同一套 `check()`）：
+
+- `[R1]` 6 项：tabId 为 `0` / `-1` / 缺失 / `42` / `1.5` / `"0"`。
+- `[R2]` 11 项：两条真机素材必须判装饰、**同 CDN 的真封面不能被误杀**、尺寸 95/96/97 边界、体积 24576/24577 边界、`hint=bili-cover` 保留。
+- `[R3]` 5 项：A→B 切换后 A 的迟到 `gen` 必须被拒、不带 `gen` 兼容放行、重复上报幂等。
+- `[R4]` 2 项：整页导航后旧条目清空。
+
+改代码：
+
+1. 抽出 `isValidTabId(t)` = `Number.isInteger(t) && t >= 0`，`record()` 改用它。
+2. 新增 `isSiteUiAsset(u)`，把「站点素材形状」的判断**提到体积线之前**。判据落在路径形状上而不是域名上 —— 封面和 UI 素材在同一个 `hdslb.com` 上，域名一刀切会把真封面一起砍掉：
+   - `/(?:^|\/)(?:svg-next|sprite[s]?|favicon|placeholder|loading|spinner|logo|icons?)\//i` 直接命中；
+   - `xxxx.jpg@.avif` 这类**带变换后缀**且位于 `svg-next|archive` 目录、文件名是纯 24 位以上 hash 的，判素材。
+   - 真封面 `5242750857.jpg@.webp` 名字带语义，不会被最后一条命中（测试 `[R2]` 专门守着）。
+3. `looksLikeIcon` 里加正向豁免：`hint === "bili-cover"` 直接 `return false`，不让后面的尺寸启发式把 100×100 的小封面误杀。
+4. 导航代次：`inject-main.js` 的 `watchSpaNav` 维护 `gen`，每次 `pushState/replaceState/popstate/hashchange` 变化时 `gen += 1` 并随 `nav` 消息发出；`post()` 统一给 `found/progress` 补 `gen`（`window.__msNavGen()`）。
+   - background 在 `nav` 重建记录时记下 `gen`，`recordPageMedia` 入口 `if (p.gen < rec.gen) return;`。
+   - `tabs.onUpdated` 的 `loading` 重建把 `gen` 置 **0**：整页刷新后页面侧计数器从 0 重来，不同步归零会让新页面（gen=0/1）的上报被旧的大代次拦掉，表现是「刷新后什么都抓不到」。
+5. 抓取诊断：`diagBump(tabId, 原因, url)` 按 tab 记 `{seen, drop:{原因:次数}, sample:{原因:[url×5]}}`，在 `record()` 的每条丢弃路径打点（`bad-tabid` / `bad-scheme` / `too-small:<kind>`），`sniff:get` 把 `diag` 带回 popup；popup 空列表时渲染一行「本次共收到 N 个请求，已丢弃：…」。这是给「51cg1.com 视频列表为空」这类问题准备的**通用**排查口（该站点本身按用户要求不单独处理）。
+
+**试过但失败的**
+
+- 第一版 `isSiteUiAsset` 要求文件名同时匹配 `nbr|icon|logo|sprite|ico|badge`，结果 47KB 那条（文件名是纯 hash `fac5c6d5ce…`）不匹配，测试仍红。加「纯 hash + 变换后缀」这一支才通。
+- 测试桩里 `headerValue` 一开始写成 `() => ""`，`too-small` 的诊断断言全红 —— 体量门槛测试必须真读 `content-length`，改成从 headers 数组里找。
+- `review.test.js` 被 `run_all` 风格的循环单独跑时输出空行被当成失败，加 `require.main === module` 早退说明。
+
+**教训**
+
+1. **规则顺序就是规则本身**。`s > 24KB` 写在 `CDN_HINT` 前面，等于把后者删掉了。补测试时要专门断言「后置规则在前置规则放行时确实轮不到」。
+2. **站点素材的判据要落在路径形状上，不能落在域名上**。同一个 CDN 上既有 UI 素材也有真封面，域名一刀切必然误杀。
+3. **「已经清空了」不等于「不会脏」**。清空只解决存量，迟到的异步回调会制造增量；跨页面共享的容器必须带一个**代次/纪元**，让旧上下文的消息可以被识别并丢弃。
+4. **代次要两头对齐**。SPA 内切页时页面侧自增、background 跟随；整页刷新时页面侧归零、background 也必须归零，否则刷新后全丢。
+5. **诊断要打在丢弃点，不是出口**。「列表为空」有无数种原因，只有在每一个 `return` 前记一笔，用户看到的那一行才有信息量。
+
+**涉及文件**
+
+- `extension/background.js`（`isValidTabId` / `isSiteUiAsset` / `looksLikeIcon` / `record` / `diagBump` / `recordPageMedia` 代次闸 / `sniff:get` 带 diag / `nav` 与 `tabs.onUpdated` 记 gen）
+- `extension/inject-main.js`（`watchSpaNav` 的 `gen`、`post()` 补 `gen`、`window.__msNavGen`）
+- `extension/popup.js` / `extension/popup.css`（空列表诊断行 + `.diag` 样式）
+- `test/review.test.js`（新增 24 项）、`test/background.test.js`（末尾接入）
+- `DEVLOG.md` / `DEVELOPMENT.md` / `extension/manifest.json`（1.3.15）
 
 ---
 
