@@ -855,6 +855,9 @@ if (!rpmSrc) {
 // [R1] tabId=0、[R2] 素材分类体积线、[R3] 导航代次、[R4] 普通导航清空
 require("./review.test.js")(check);
 
+// ---- 用户 m13684 追加：[G1] 按标题分组、[G2] 小红书不被误伤、[G3] blob 预览
+require("./group_key.test.js")(check);
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);
