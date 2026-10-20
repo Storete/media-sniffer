@@ -436,12 +436,22 @@ function visibleItems() {
     // 同一组里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
     // 否则默认按大小排，序号会乱掉看不出顺序。
     //
-    // 判据不能只看 mid：小红书的正文图没有消息号（mid 为空），编号是
-    // background 按「整帖一组」编的（见 renumberImages 的 xhsDetail 分支），
-    // 只认 mid 会让这些图退回按大小排，列表里出现 ②⑦①⑥③④⑤ 这种乱序。
-    // 两条都编过号、且同属一组（mid 相同，或两个都没 mid）就按 idx 排。
+    // 「是不是同一组」这个判断改过两次，两版都是错的，记下来：
+    //   v1 只看 mid —— 小红书的正文图没有消息号（mid 为空），编号是 background
+    //      按「整帖一组」编的，只认 mid 会让它们退回按大小排，列表出现 ②⑦①⑥③④⑤。
+    //   v2 改成 mid 相同（或两个都没 mid）—— 修好了小红书，但 Telegram 又炸：
+    //      background 早已改成**按标题分组**（见 renumberImages 的 titleKey），
+    //      而同标题的媒体常横跨好几条消息（同一个标题发了好几组图），mid 各不相同，
+    //      于是同组成员被拆散开，用户在列表里看到「⑪ 在最上面、下面才是 ①②③」
+    //      —— 用户 m13684 就是拿这张图来问的。
+    //
+    // 现在的判据直接对齐 background 的分组键：**两个都有标题且标题相同**就是同组
+    // （这正是 background 现在的 gk = "t:" + title）；都没标题时退回比 mid。
+    // 小红书详情页所有条目共用一个标题或都没标题，两种情形都能落到同一组。
+    const ta = (a.title || "").trim(), tb = (b.title || "").trim();
+    if (ta && tb && ta === tb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ma = a.mid || "", mb = b.mid || "";
-    if (ma === mb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
+    if (!ta && !tb && ma === mb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     if ((b.s || 0) !== (a.s || 0)) return (b.s || 0) - (a.s || 0);
     return (b.t || 0) - (a.t || 0);
   });
@@ -529,6 +539,29 @@ function diagText(diag) {
  *     把它当网页爬然后报 302。
  *   · webRequest 抓到的直链 → 复制 / 打开 / 预览 / 下载（走本地下载器）。
  */
+/**
+ * 这条媒体能不能用 popup 里的 <img>/<video> 直接预览。
+ *
+ * 历史：最初只放行 `http(s):`，理由是「blob:/MSE 只在本页主世界有效，扩展页
+ * 加载不了」。这个判断对 **MSE 分片条目（u 是 "m1"/"m2"）** 成立，但对
+ * **blob: 地址** 并不成立——Telegram 的 `<img>` 和 `<video>` 的 src 就是
+ * `blob:https://web.telegram.org/…`，用户 m13684 的真机截图里那些图片
+ * 全都点不了「预览」，正是被这条一刀切挡掉的。
+ *
+ * 现在的判据只排除「确定预览不了」的两类：
+ *   · MSE 录制的合成条目（u 形如 m1/m2，不是真 URL）
+ *   · 非 image/video/audio 的类型（文档、字体等）
+ * 其余（http/https/blob/data）都放行，让浏览器自己决定能不能画出来；
+ * 画不出来时预览框会显示「预览加载失败」，比没有按钮更容易理解。
+ */
+function canPreviewSrc(it) {
+  if (!it) return false;
+  if (!["image", "video", "audio"].includes(it.k)) return false;
+  const u = String(it.u || "");
+  if (/^m\d+$/.test(u)) return false;          // MSE 合成条目
+  return /^(https?|blob|data):/i.test(u);
+}
+
 function renderItem(it) {
   const row = el("div", "item");
   const isPage = !!it.page;
@@ -601,18 +634,15 @@ function renderItem(it) {
   const ops = el("div", "ops");
 
   if (isPage) {
-    // 预览：只对「有直接 http(s) 地址的图片/视频」给。
-    // 页面捕获条目里，图片和视频绝大多数是实打实的 CDN 直链（小红书的
-    // sns-webpic / Telegram 的 /progressive/…），popup 直接 <img src>/<video src>
-    // 就能显示，不需要页面配合——用户反馈「带标题的每行只有一个按钮」正是缺这个。
+    // 预览：判据见 canPreviewSrc() 的注释（blob: 也放行，Telegram 靠它）。
     //
-    // 为什么不给 blob:/MSE：那两类地址只在本页主世界有效，扩展页加载不了；
-    // 点了必然报错，比没有按钮更让人困惑。
+    // 为什么不给 MSE（u 就是 "m1"/"m2"）：那是录制的合成条目，扩展页拼不出
+    // 完整文件，点了必然报错，比没有按钮更让人困惑。
     //
     // 按钮次序：预览在左、保存在右。用户 2026-10-18 要求对调——「保存」是
     // 主操作，放在最右贴近滚动条一侧更顺手，也和下面非页面分支的
     // 「复制 / 打开 / 预览 / 下载」保持「重操作在右」的一致节奏。
-    if (["image", "video", "audio"].includes(it.k) && /^https?:/i.test(it.u || "")) {
+    if (canPreviewSrc(it)) {
       const pv = el("button", "btn", "预览");
       pv.addEventListener("click", () => showPreview(it));
       ops.append(pv);
@@ -643,7 +673,7 @@ function renderItem(it) {
   open.addEventListener("click", () => chrome.tabs.create({ url: it.u }));
   ops.append(open);
 
-  if (["image", "video", "audio"].includes(it.k)) {
+  if (canPreviewSrc(it)) {
     const pv = el("button", "btn", "预览");
     pv.addEventListener("click", () => showPreview(it));
     ops.append(pv);
