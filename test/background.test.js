@@ -224,8 +224,8 @@ const rulesEnd = bgCode.lastIndexOf("// ----------------------------------------
 vm.runInContext(bgCode.slice(rulesStart, rulesEnd), pureCtx, { filename: "img-rules" });
 // const 声明在 vm 里不进沙箱 global，用一个表达式把它们导出来
 const rules = vm.runInContext(
-  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES })", pureCtx, { filename: "img-rules-export" });
-const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES } = rules;
+  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES, isHlsUrl })", pureCtx, { filename: "img-rules-export" });
+const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES, isHlsUrl } = rules;
 
 check("ICON_MAX 是 96", ICON_MAX === 96, ICON_MAX);
 
@@ -962,6 +962,92 @@ console.log("\n[TGORD] 同一条 Telegram 消息里的视频和图片共用一�
   check("[TGORD] 跨消息仍按 mid 升序",
     s3[0].mid === "8842" && s3[1].mid === "8848" && s3[1].ord === 0 && s3[2].ord === 1,
     JSON.stringify(s3.map((x) => x.mid + ":" + x.ord)));
+}
+
+console.log("\n[HLSU] isHlsUrl：认得出 m3u8 播放列表");
+
+// 用户 m16052：51cg1 / 4kvm「不起作用」。两个站都是 HLS，webRequest 抓到的
+// .m3u8 只是几 KB 的文本清单，以前和 mp4 一样显示成「视频 29KB」，
+// 用户点下载以为在下视频。这里先保证判定本身准确。
+check("[HLSU] 普通 m3u8 地址认得出来",
+  isHlsUrl("https://oss.douyinbit.com/m3u8/8ffa39d4da7087210f1292376e7b39f3.m3u8") === true);
+check("[HLSU] 带 query 的 m3u8（auth_key 那种）仍认得出来",
+  isHlsUrl("https://hls.weagdnz.cn/videos5/aaa/bbb.m3u8?auth_key=1792585246-6ad8ae1e3c113-0-a75597717e") === true);
+check("[HLSU] 大小写混写也认",
+  isHlsUrl("https://a.com/x.M3U8") === true);
+check("[HLSU] 普通 mp4 不是 HLS",
+  isHlsUrl("https://a.com/x.mp4") === false);
+check("[HLSU] ts 分片不是 HLS 清单",
+  isHlsUrl("https://a.com/x.ts") === false);
+// 站方常把播放列表挂在 ?url= 这类跳转后面，抓到的是跳转前的地址，
+// 判成 HLS 反而会误导用户。所以只认 pathname 后缀。
+check("[HLSU] query 里出现 .m3u8 不算（只认路径后缀）",
+  isHlsUrl("https://a.com/redirect?url=https://b.com/x.m3u8") === false);
+check("[HLSU] 空值 / 非法地址不抛错",
+  isHlsUrl("") === false && isHlsUrl(null) === false && isHlsUrl("not a url") === false);
+
+console.log("\n[HLSP] applyHlsPageTitle：把页面标题借给真 m3u8 条目");
+
+// 用户 m16052（4kvm）：页面侧只能读到 og:title，后台侧只能读到 m3u8 地址。
+// 两边各持一半，必须在出列表前合起来，否则用户看到一条光秃秃的
+//「HLS 流（视频）」——不知道是哪一集。
+{
+  const bgsrc = fs.readFileSync(BG, "utf8");
+  check("[HLSP] 有 applyHlsPageTitle 函数", /function applyHlsPageTitle\(/.test(bgsrc));
+  check("[HLSP] sniff:get 里调用了它", /applyHlsPageTitle\(focused/.test(bgsrc));
+
+  // 切出函数体在 vm 里跑（大括号配对，函数内有 for/if 嵌套）
+  const a = bgsrc.indexOf("function applyHlsPageTitle(");
+  let d = 0, e = a;
+  for (let i = bgsrc.indexOf("{", a); i < bgsrc.length; i++) {
+    if (bgsrc[i] === "{") d++;
+    else if (bgsrc[i] === "}") { d--; if (!d) { e = i + 1; break; } }
+  }
+  check("[HLSP] 函数体大括号配对成功", e > a);
+  const hctx = vm.createContext({ URL, RegExp, String, Set, Array, console });
+  vm.runInContext(bgsrc.slice(bgsrc.indexOf("function isHlsUrl("), e), hctx, { filename: "hls-page-title" });
+  const apply = vm.runInContext("applyHlsPageTitle", hctx);
+
+  // 真机形态：一条页面条目（location.href）+ 两条 webRequest 抓到的 m3u8
+  const items = [
+    { u: "https://www.4kvm.net/play/ch4l5b3mn", k: "video", hint: "hls", title: "挑情丑闻 - 第1集" },
+    { u: "https://oss.douyinbit.com/m3u8/abe76b0b.m3u8", k: "video", hint: "hls", title: "", s: 29007 },
+    { u: "https://myoss.douyinbit.top/m3u8/abe76b0b.m3u8", k: "video", hint: "hls", title: "", s: 0 },
+  ];
+  const changed = apply(items);
+  check("[HLSP] 有真 m3u8 时返回 true（列表被改过）", changed === true);
+  check("[HLSP] 页面条目被删掉（它的 URL 是网页，下下来是 HTML）",
+    items.filter((x) => x.u.indexOf(".net/play/") > 0).length === 0,
+    JSON.stringify(items.map((x) => x.u)));
+  check("[HLSP] m3u8 条目借到了页面标题",
+    items.length === 2 && items.every((x) => x.title === "挑情丑闻 - 第1集"),
+    JSON.stringify(items.map((x) => x.title)));
+
+  // 已经有标题的 m3u8 不该被覆盖（页面 <video> 挂了 messageId 那种更具体）
+  const keep = [
+    { u: "https://a.com/p", k: "video", hint: "hls", title: "页面大标题" },
+    { u: "https://a.com/x.m3u8", k: "video", hint: "hls", title: "更具体的小标题" },
+  ];
+  apply(keep);
+  check("[HLSP] 已有标题的 m3u8 不被覆盖",
+    keep.length === 1 && keep[0].title === "更具体的小标题", JSON.stringify(keep));
+
+  // 只有页面条目、m3u8 还没请求出来 —— 不能删，否则用户什么都看不到
+  const onlyPage = [{ u: "https://a.com/p", k: "video", hint: "hls", title: "标题" }];
+  check("[HLSP] 没有真 m3u8 时返回 false 且不动列表",
+    apply(onlyPage) === false && onlyPage.length === 1);
+
+  // 只有 m3u8、没有页面条目 —— 保持原样
+  const onlyHls = [{ u: "https://a.com/x.m3u8", k: "video", hint: "hls", title: "" }];
+  check("[HLSP] 没有页面条目时返回 false", apply(onlyHls) === false && onlyHls.length === 1);
+
+  // 普通 mp4 条目不能被当成 m3u8
+  const mixed = [
+    { u: "https://a.com/p", k: "video", hint: "hls", title: "T" },
+    { u: "https://a.com/x.mp4", k: "video", hint: "", title: "" },
+  ];
+  check("[HLSP] mp4 不算 m3u8（页面条目因此保留）",
+    apply(mixed) === false && mixed.length === 2);
 }
 
 console.log("\n==============================================");

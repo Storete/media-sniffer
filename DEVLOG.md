@@ -10,6 +10,117 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-029 · 2026-10-21 · Telegram 序号「对不上」（第三次修）——两套计数流
+
+**问题**：用户 m15907 附截图：「总数差不多，但是序号完全对不上，这个问题已经修过两次了」。
+截图里消息 8848 的 13 条按「①图 ②视频 ③图 ④视频」交替编号。
+
+**我最初的误判**：以为 8848 / 8847 是两条消息被同一标题合并了。
+用户 m15935 纠正：「它们其实来自两条不同的消息，并不是，是一个消息」。
+→ **教训：用户描述的「对不上」先要落到具体一条消息上看，别拿附近的数字猜。**
+
+**真机事实**：消息 8848 一条消息里有 7 个 `<video>` + 若干 `<img>`。
+
+**根因（两套各自从 0 起的计数流）**：
+- 视频走 `ordOfMedia(el)`（`extension/inject-main.js:288`）：
+  `const tag = el.tagName === "AUDIO" ? "audio" : "video";` 然后 `[...box.querySelectorAll(tag)]`
+  —— **只跟同族 video 比**，所以 7 个视频拿到 ord 0..6。
+- 图片走 `scanImages()` 的 `byMsg` 列表下标 —— **只跟图片比**，拿到 ord 0..3。
+- background 的 `compareWithinGroup`（`extension/background.js:1042`）先按 mid 升序、
+  同 mid 再比 ord。两边 ord 撞车（视频 ord=1 和图片 ord=1 同时存在）时只能退回抓取时间 `t`，
+  而 `t` 是异步到达时刻 → **随机**，于是显示成 ①图②视频③图④视频 循环错号。
+
+**修法**：`ordOfMedia` 开头加一句，让视频也走「整条消息统一序」：
+
+```js
+const unified = orderMediaInMessage(el);
+if (unified >= 0) return unified;
+```
+
+`orderMediaInMessage` 是 d-019 给图片写的：上溯找带 `data-message-id` 的祖先，
+对 `video,audio,img` 统一按「同一行按 left、否则按 top、再退 DOM 序」排，返回下标。
+
+**真机复验**：消息 8848 视频 ord 变成 `0,2,4,10,12,14,16`、图片 `6,8,9,18`，
+不再从 0 重复计数；页面侧 `__msOrderInMessage` 对 19 个媒体返回 0..18 连续。
+
+**教训**：
+1. **两套计数器迟早会撞。** 同一实体（一条消息）下的不同类型的条目，必须有**一个**统一序号源；
+   各算各的，只要有展示层把它们并排显示，就一定会出现「交错错号」。
+2. 排序里一旦有「时间」这种异步量当兜底，错号就是**随机的**，每次都长得不一样——
+   这恰恰是「修过两次还不对」的原因：每次都在修别的分支。
+
+**涉及文件**：`extension/inject-main.js`（`ordOfMedia`）、`test/background.test.js`（`[TGORD]`）。
+
+---
+
+## d-028 · 2026-10-21 · 51cg1 / 4kvm「插件不起作用」——HLS 播放列表不是视频
+
+**问题**：用户 m16052：「检查插件为什么对 https://51cg1.com/archives/279033/ 和
+https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分网站做铺垫」。
+
+**51cg1 排查**：
+- state 里该 tab **只有 2 条 other，`diag` 是 null** → `diagBump` 从未被调用，
+  说明 **webRequest 一次都没触发**。
+- 页面实测：`videos:0, iframes:0`，HTML 里 **0 个 `.mp4` / `.m3u8`**。
+- 但找到 `<div class="dplayer" data-config="{...}">`，属性里挂着完整配置：
+  `{"video":{"url":"https://hls.weagdnz.cn/videos5/….m3u8?auth_key=…","type":"hls"}}`。
+- 容器内部只有 `<div class="dplayer-loading">播放器加载中...</div>` ——
+  **DPlayer + hls.js 根本没初始化成功**，浏览器从没请求过那个 m3u8，
+  所以 webRequest 什么都看不到。地址明明摆在 DOM 上，却没人去读。
+- 顺手 curl 那个 m3u8：200、39399 字节、`#EXT-X-KEY:METHOD=AES-128,URI="…/crypt.key"`（加密 HLS）。
+
+**4kvm 排查**：
+- 首页 66 条（image 56 / other 10），图片来自 `gimg0.baidu.com` 图床。
+  **首页本来就没视频**，不算 bug。
+- 详情页 `/play/ch4l5b3mn` 抓到 2 条 m3u8（`oss.douyinbit.com` 和备用域 `myoss.douyinbit.top`），
+  两条都 `page:0`、**无标题**、`s:29007`（=播放列表文本大小）。
+- **结论：扩展确实抓到了，但用户点「下载」拿到的是 29KB 文本，不是视频** ——
+  主观上就是「不起作用」。
+
+**HLS 链路验证（native-host 早就支持）**：
+- `native-host/downloader.py` 的 `use_ytdlp` 判据里 `".m3u8" in low` → 真机跑 `downloader.py`
+  下那个 m3u8，产物 **971 MB / h264 1920×1080 + aac / 53 分钟**。**链路是通的。**
+- 但状态里 `status:"done"` 却又写着 `ERROR: Postprocessing: Error opening output files: Permission denied`
+  —— yt-dlp 退出码 0，ffmpeg 重封装 mp4 失败却被报成 done。**假成功比失败更坑**。
+
+**修法（四层）**：
+1. `background.js` 新增 `isHlsUrl(u)`：只看 `new URL(u).pathname` 是不是 `.m3u8`，
+   **不看 query**（站方 `?url=xxx.m3u8` 那种跳转链接抓到的是跳转前地址，判成 HLS 反而误导）。
+2. `sniff:get` 里给这些条目打 `hint="hls"` —— **只打标记不改 `k`**，
+   下载分派仍靠 `k=video` 走 yt-dlp。
+3. `popup.js`：名字显示成「标题 · HLS 流（视频）」，副行写明
+   「HLS 流 · 分片清单」「点下载自动拼成完整视频」——用户才知道那 29KB 不是坏文件。
+4. `inject-main.js` 新增 dplayer 站点：读 `.dplayer[data-config]` 里的 `video.url`
+   （退回 `video_h265.url`），用 `data-video_title` 当标题直接上报，绕开没起来的播放器。
+
+**真机（51cg1）**：state 从「2 条 other」变成 **193 条**，视频第一条带标题
+「推特约啪博主 FENDSON 付费新作 短发伪白虎美女体育生」、`hint:"dplayer"`。
+
+**真机（4kvm）又踩一坑**：m3u8 条目抓到但没有标题，用户在列表里看到一条光秃秃的
+「HLS 流（视频）」，不知道是哪一集。补 artplayer 站点：页面侧读 `og:title`
+报一条 `hint:"hls"` 的「页面标题条目」，background 用 `applyHlsPageTitle()`
+把标题**借**给同 tab 真正的 m3u8 条目、再把页面条目删掉（它的 URL 是网页，下下来是 HTML）。
+
+**第二个坑：标题被砍过头。** `sitePageTitle` 第一版写「任何 1~10 字的尾巴都当站点名砍掉」，
+`挑情丑闻 - 第1集 -4k影视` 被砍成 `挑情丑闻`。改成「尾巴带 `第N集/第N话/EPn/SnEn` 就不砍」。
+
+**真机最终（4kvm）**：3 条 video → 2 条，标题都是「挑情丑闻 - 第1集」。
+
+**教训**：
+1. **「抓到了」和「能下」是两件事。** m3u8 是文本清单，抓到它不等于抓到视频；
+   展示层必须说清楚「这是清单，点下载会拼成完整视频」，否则用户永远觉得坏了。
+2. **webRequest 看不到的东西，DOM 里可能明明白白摆着。** 播放器起不来 = 零请求，
+   但 `data-config` / `og:title` 照样在。两条发现通路要都试。
+3. **退出码 0 不代表成功。** yt-dlp 把 ffmpeg 的失败吞进 stderr 还返回 0，
+   必须自己扫 `ERROR:` 才算数。
+
+**涉及文件**：`extension/background.js`（`isHlsUrl` / `applyHlsPageTitle`）、
+`extension/popup.js`（`isHlsItem` / `displayName` / `hideRecorder`）、
+`extension/inject-main.js`（dplayer / artplayer 站点）、
+`native-host/downloader.py`（去掉 `--merge-output-format mp4`、扫 stderr 判失败）。
+
+---
+
 ## d-027 · 2026-10-21 · Telegram（以及所有 blob:）保存「全部失效」
 
 **问题**：用户报「Telegram 视频和图片下载全部失效」。

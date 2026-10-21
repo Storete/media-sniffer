@@ -441,6 +441,96 @@ console.log("\n[EXT] 扩展名按字节/Content-Type 判定，认不出来也不
     "still falls back to .mp4");
 }
 
+/**
+ * [DPL] DPlayer 站（51cg1 这类）：播放器没起来时从 data-config 取地址
+ *
+ * 用户 m16052 报「51cg1 不起作用」。查下来：站方用 DPlayer + hls.js，
+ * hls.js 一挂，播放器永远停在「播放器加载中...」，浏览器一次都没请求过
+ * .m3u8，webRequest 什么都看不见。但地址就摆在 data-config 里。
+ *
+ * 这里测的是纯解析逻辑（不碰 DOM）：给一段真实形态的 data-config，
+ * 能不能取出 video.url、以及退回 video_h265.url。
+ */
+function testDplayerConfig() {
+  console.log("\n[DPL] DPlayer data-config 解析");
+
+  const inj = fs.readFileSync(path.join(__dirname, "..", "extension", "inject-main.js"), "utf8");
+
+  check("[DPL] 有 dplayerConfigUrl 函数", /function dplayerConfigUrl\(\)/.test(inj));
+  check("[DPL] 注册了 dplayer 站点", /name: "dplayer"/.test(inj));
+  check("[DPL] 站点用 .dplayer[data-config] 当 match",
+    /match: \(\) => !!document\.querySelector\("\.dplayer\[data-config\], #dplayer\[data-config\]"\)/.test(inj));
+  check("[DPL] 有 onScanMedia 钩子（播放器没起来时接管扫描）",
+    /onScanMedia: \(\) => \{/.test(inj));
+  check("[DPL] scanMedia 会先问站点 onScanMedia",
+    /if \(scanSite && scanSite\.onScanMedia\)/.test(inj));
+
+  // 抽 dplayerConfigUrl 的函数体在 vm 里跑，喂真实形态的 data-config。
+  // 用大括号配对切（函数内有 try/catch，indexOf("}") 会截断）。
+  const start = inj.indexOf("function dplayerConfigUrl()");
+  check("[DPL] 能定位到函数体", start > 0);
+  if (start > 0) {
+    let i = inj.indexOf("{", start);
+    let depth = 0, end = -1;
+    for (let k = i; k < inj.length; k++) {
+      const ch = inj[k];
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { end = k + 1; break; } }
+    }
+    check("[DPL] 函数体大括号配对成功", end > i);
+    const body = inj.slice(start, end);
+
+    // 造一个最小 DOM 桩：只要 querySelectorAll 返回我们给的节点
+    function makeCtx(configText) {
+      const node = {
+        getAttribute(n) { return n === "data-config" ? configText : null; },
+      };
+      const ctx = vm.createContext({
+        document: { querySelectorAll: () => [node] },
+        JSON, String, RegExp, console,
+      });
+      vm.runInContext(body + "\nthis.__get = dplayerConfigUrl;", ctx, { filename: "dplayer-config" });
+      return ctx;
+    }
+
+    // 真实形态：站方把 https:// 转义成 https:\/\/ 再塞进属性里
+    const realCfg = JSON.stringify({
+      live: false,
+      video: {
+        url: "https://hls.weagdnz.cn/videos5/932dd69d68fa7fbd0aa85493623b492b/932dd69d68fa7fbd0aa85493623b492b.m3u8?auth_key=1792585246-6ad8ae1e3c113-0-a75597717e3632a5bef480549ceabbc5&v=3&time=0",
+        type: "hls",
+      },
+      video_h265: {
+        url: "https://hls.weagdnz.cn/m3m/d41c6e6e104f0fef482b5591c74bd169.m3u8?auth_key=1792585246-6ad8ae1e3c12a-0-8aa340b8548fd16c13782b9d38fb2450&v=3&time=0",
+        type: "hls",
+      },
+    });
+    const c1 = makeCtx(realCfg);
+    const u1 = vm.runInContext("this.__get()", c1);
+    check("[DPL] 取到主视频地址", /^https:\/\/hls\.weagdnz\.cn\/videos5\//.test(u1), u1);
+    check("[DPL] 主地址优先于 h265 备用", u1.indexOf("/videos5/") > 0, u1);
+
+    // 只有 h265 时退回它
+    const only265 = JSON.stringify({ video_h265: { url: "https://a.com/x.m3u8", type: "hls" } });
+    const c2 = makeCtx(only265);
+    const u2 = vm.runInContext("this.__get()", c2);
+    check("[DPL] 没有主地址时退回 video_h265", u2 === "https://a.com/x.m3u8", u2);
+
+    // 配置是坏 JSON 时不抛错、返回空串（页面上可能出现半渲染的属性）
+    const c3 = makeCtx("{not json");
+    const u3 = vm.runInContext("this.__get()", c3);
+    check("[DPL] 坏 JSON 返回空串而不是抛错", u3 === "", u3);
+
+    // 地址不是 http(s) 的一律不要（javascript: / data: 之类）
+    const bad = JSON.stringify({ video: { url: "javascript:alert(1)" } });
+    const c4 = makeCtx(bad);
+    const u4 = vm.runInContext("this.__get()", c4);
+    check("[DPL] 非 http(s) 地址被拒绝", u4 === "", u4);
+  }
+}
+
+testDplayerConfig();
+
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

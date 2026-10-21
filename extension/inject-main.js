@@ -1412,6 +1412,13 @@
       // 用户切回来时下一轮（≤600ms）就会补齐。
       if (document.hidden) return;
       reportFocus();   // 焦点是「看哪条」，跟扫描同频检查（内部已按变化去重）
+      // 站点接管整个媒体扫描（目前只有「播放器没起来的 DPlayer 站」用这个，
+      // 它们的地址在 DOM 属性里，页面上根本没有 <video> 可扫）。
+      // 返回 true 表示本轮已处理完，不再走通用逻辑。
+      const scanSite = activeSite();
+      if (scanSite && scanSite.onScanMedia) {
+        try { if (scanSite.onScanMedia()) return; } catch (e) { /* 站点钩子出错不影响通用逻辑 */ }
+      }
       const els = document.querySelectorAll("video, audio");
       for (const el of els) {
         let src = "";
@@ -3159,6 +3166,150 @@
       return false;
     },
   });
+
+  // ---- 51cg1 这类「播放器没起来」的站（用户 m16052）
+  //
+  // 现象：视频列表全空。查下来不是我们漏抓，是**浏览器一次都没请求过视频**。
+  // 这类站用 DPlayer + hls.js，如果 hls.js 加载失败/被拦，播放器会一直停在
+  // 「播放器加载中...」，从不发 .m3u8 请求，webRequest 自然什么都看不见。
+  //
+  // 但视频地址其实就摆在 DOM 上：`<div class="dplayer" data-config="{...}">`
+  // 里的 config.video.url 就是完整 HLS 地址（实测 hls.weagdnz.cn/...m3u8?auth_key=...）。
+  // 所以这里直接把它读出来上报，绕开播放器。
+  //
+  // 为什么不做成通用逻辑：这个 data-config 是 DPlayer 插件（usr/plugins/DPlayer）
+  // 的私有约定，不是通用播放器规范；别的站哪怕也用 DPlayer，属性名和结构也不一定一样。
+  /** 读 DPlayer 容器上的 data-config，取出 HLS/视频地址。找不到返回 ""。 */
+  function dplayerConfigUrl() {
+    try {
+      const nodes = document.querySelectorAll(".dplayer[data-config], #dplayer[data-config]");
+      for (const n of nodes) {
+        const raw = n.getAttribute("data-config") || "";
+        if (!raw) continue;
+        let cfg = null;
+        try { cfg = JSON.parse(raw); } catch (e) { continue; }
+        // video.url 是主地址；video_h265.url 是备用编码，优先主地址
+        const cand = [cfg && cfg.video && cfg.video.url, cfg && cfg.video_h265 && cfg.video_h265.url];
+        for (const u of cand) {
+          if (typeof u === "string" && /^https?:\/\//i.test(u)) return u;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  // 4kvm 这类站：artplayer + hls.js，播放器能起来，m3u8 由 webRequest 抓到了，
+  // 但**条目没有标题**（页面上没有 <video> 可挂 messageId，也没有 __INITIAL_STATE__）。
+  // 用户看到一条光秃秃的「HLS 流（视频）」，不知道这是哪一集。
+  //
+  // 标题来源按可靠度排：og:title（干净、站点自己填的）> <title>（常带「-4k影视」尾巴）。
+  // 判据用「页面上有 artplayer 容器」——这是 artplayer 的固定类名 `.art-video-player`，
+  // 是它对外承诺的公共样式钩子，不像 data-config 那样是站点私有约定。
+  /** 给「没有标题的 HLS 条目」找一个页面级标题。找不到返回 ""。 */
+  function sitePageTitle() {
+    try {
+      const og = document.querySelector('meta[property="og:title"], meta[name="og:title"]');
+      let t = (og && og.getAttribute("content")) || "";
+      if (!t) t = document.title || "";
+      t = String(t).replace(/\s+/g, " ").trim();
+      // 站点名尾巴：`挑情丑闻 - 第1集 -4k影视` -> `挑情丑闻 - 第1集`
+      // 只在「最后一段明显是站点名」时才砍：站点名通常没有「第N集/第N话/EPn」
+      // 这类集数标记，长度也短。早期写成「任何 1~10 字的尾巴都砍」，
+      // 结果把 `- 第1集` 一起砍掉了（真机 4kvm：标题变成光秃秃的「挑情丑闻」）。
+      const m = /\s*[-|_–—]\s*([^-|_–—]{1,12})\s*$/.exec(t);
+      if (m) {
+        const tail = m[1].trim();
+        const looksLikeEpisode = /^(第\s*[0-9一二三四五六七八九十百]+\s*[集话話期回部]|EP?\s*\d+|S\d+\s*E\d+)/i.test(tail);
+        const stripped = t.slice(0, m.index).trim();
+        if (!looksLikeEpisode && stripped.length >= 4) t = stripped;
+      }
+      return sanitize(t.slice(0, 90));
+    } catch (e) { return ""; }
+  }
+
+  SITES.push({
+    name: "artplayer",
+    // artplayer + hls.js 的站：播放器能起来，<video src> 是 blob:，
+    // 真正的 m3u8 只有 webRequest 看得见（扩展后台抓得到，但没标题）。
+    // 这里接管媒体扫描：把页面上"唯一那个播放器视频"用页面标题补一条带标题的、
+    // hint 标成 hls 的条目上报——后台会把同地址的 webRequest 条目合并到它上面，
+    // 用户就能看到「挑情丑闻 - 第1集 · HLS 流（视频）」而不是一条光秃秃的链接。
+    //
+    // 只补标题、不代理地址：m3u8 的真实 URL 依然由 webRequest 抓（页面侧拿不到
+    // hls.js 的内部 state，硬猜容易抓到广告位或预加载地址）。
+    match: () => !!document.querySelector(".art-video-player, artplayer, .artplayer"),
+    title: () => sitePageTitle(),
+    onScanMedia: () => {
+      // 页面上没有 <video> 时什么也不做，交回通用逻辑
+      const v = document.querySelector(".art-video-player video, artplayer video, .artplayer video");
+      if (!v) return false;
+      const t = sitePageTitle();
+      if (!t) return true;   // 有播放器但取不到标题 -> 不报，免得制造无标题噪声
+      // 每页只报一次（DOM 每 600ms 扫一轮）；标题变了要重报，让后台更新
+      if (artSeenTitle === t) return true;
+      artSeenTitle = t;
+      post({
+        cmd: "found", source: "httpmedia", key: location.href, size: 0,
+        mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+        title: t, mid: "", ord: 0, ref: "", hint: "hls",
+      });
+      return true;
+    },
+  });
+
+  let artSeenTitle = "";   // 上次上报过的 artplayer 页面标题
+
+  SITES.push({
+    name: "dplayer",
+    // 只在「用 DPlayer 且数据在 data-config 里」的页面接管。
+    // 判据放宽到整个 .dplayer 容器存在就注册，但下面 onScanImages 会再确认
+    // 真的读到了地址才上报 —— 读不到就走通用逻辑，不影响别的站。
+    match: () => !!document.querySelector(".dplayer[data-config], #dplayer[data-config]"),
+
+    focus: () => "",
+
+    // 玩家没起来时 DOM 里一个 <video> 都没有，通用 scanMedia 无事可做。
+    // 这里接管媒体扫描：直接把 data-config 里的地址当一条视频上报。
+    onScanMedia: () => {
+      const url = dplayerConfigUrl();
+      if (!url) return false;   // 读不到 -> 交回通用逻辑
+      // 标题优先用容器上的 data-video_title（站点把标题挂在属性里），
+      // 没有就退回页面 <title>
+      let title = "";
+      try {
+        const n = document.querySelector(".dplayer[data-video_title], #dplayer[data-video_title]");
+        title = (n && n.getAttribute("data-video_title")) || "";
+      } catch (e) { /* 忽略 */ }
+      if (!title) title = document.title || "";
+      title = sanitize(String(title).slice(0, 90));
+      // 同一地址每轮都会读到，靠 dplayerSeen 去重（地址里的 auth_key 会过期刷新，
+      // 所以还要按「去掉 query 的路径」再挡一层，避免同一个视频反复出现）。
+      const bare = url.split("?")[0];
+      if (dplayerSeen.has(bare)) {
+        // 地址刷新了（新的 auth_key）就把旧条目换成新地址，否则点下载会 403
+        const old = dplayerSeen.get(bare);
+        if (old !== url) {
+          dplayerSeen.set(bare, url);
+          post({
+            cmd: "found", source: "httpmedia", key: url, size: 0,
+            mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+            title, mid: "", ord: 0, ref: "", hint: "dplayer",
+          });
+        }
+        return true;
+      }
+      dplayerSeen.set(bare, url);
+      if (dplayerSeen.size > 20) dplayerSeen.delete(dplayerSeen.keys().next().value);
+      post({
+        cmd: "found", source: "httpmedia", key: url, size: 0,
+        mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+        title, mid: "", ord: 0, ref: "", hint: "dplayer",
+      });
+      return true;
+    },
+  });
+
+  const dplayerSeen = new Map();  // 去 query 的路径 -> 当前地址
 
   const IMG_MIME_EXT = {
     "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/pjpeg": ".jpg",

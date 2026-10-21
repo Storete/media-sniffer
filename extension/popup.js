@@ -132,9 +132,13 @@ function isRecorderItem(it) {
  *  B 站：播放器走 MSE，同时提供可完整下载的 DASH 流 → 隐掉录制条目。
  *  小红书（2026-10-18）：正文视频的 <video src> 同样是 blob:，而真实 mp4 地址
  *  已由页面侧从 __INITIAL_STATE__ 换成直链上报；录制条目留着只会和它并列成
- *  两条「页面视频（录制中）」，用户点了存下来是坏的。 */
+ *  两条「页面视频（录制中）」，用户点了存下来是坏的。
+ *  HLS 站（2026-10-21）：artplayer/hls.js 一边请求 m3u8 一边往 MSE 塞分片，
+ *  于是同一条视频在列表里出现三份（m3u8 清单、blob: 录制、m1/m2 分片）。
+ *  **必须先确认页面上真有 m3u8 才隐**——只认 blob/mN 的站（有 MSE 没有清单）
+ *  一旦也隐掉，用户就什么都看不到了。 */
 function hideRecorder() {
-  return isBiliSite() || isXhsDetailPage();
+  return isBiliSite() || isXhsDetailPage() || allItems.some(isHlsItem);
 }
 
 /**
@@ -654,7 +658,12 @@ function renderItem(it) {
   meta.append(name);
 
   const bits = [];
-  if (isPage) {
+  if (isHlsItem(it)) {
+    // m3u8 的大小是**播放列表文本**的大小（几 KB），不是视频大小。
+    // 不写清楚的话用户看到「视频 29 KB」会以为下到了个坏文件。
+    bits.push("HLS 流 · 分片清单");
+    bits.push("点下载自动拼成完整视频");
+  } else if (isPage) {
     if (it.mid) bits.push("消息 " + it.mid);
     else bits.push("页面捕获");
     if (!it.mid && hostOf(it.i)) bits.push(hostOf(it.i));
@@ -770,12 +779,31 @@ function pageTitle(it) {
  */
 function displayName(it, isPage) {
   let base;
+  if (isHlsItem(it)) {
+    // HLS 列表的文件名多半是「8ffa39d4da7087210f1292376e7b39f3.m3u8」这种哈希，
+    // 对用户毫无意义。统一叫「HLS 流（视频）」，真名在下载时按站点标题取。
+    base = (it.title ? shortTitle(it.title) + " · " : "") + "HLS 流（视频）";
+    if (it.mark) return it.mark + " " + base;
+    return base;
+  }
   if (isPage) base = pageTitle(it);
   else if (it.title) base = it.title;
   else base = it.f || it.u || "";
   base = shortTitle(base);
   if (it.mark) return it.mark + " " + base;
   return base;
+}
+
+/**
+ * 是不是 HLS 播放列表条目（background 在 sniff:get 里打的 hint="hls"）。
+ *
+ * 退回 URL 后缀再判一次：hint 是后加的，用户没重载扩展时老 state 里没有这个
+ * 字段，只靠 hint 会漏。
+ */
+function isHlsItem(it) {
+  if (!it) return false;
+  if (it.hint === "hls") return true;
+  return /\.m3u8$/i.test(String(it.u || "").split("?")[0]);
 }
 
 /**

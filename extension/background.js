@@ -646,6 +646,26 @@ function preferBiliCover(items, tabUrl) {
 }
 
 /** 从完整 URL 取宿主名；取不到返回 ""（解析失败时按「非白名单」处理，宁可少收） */
+/**
+ * 是不是 HLS 播放列表（.m3u8）。
+ *
+ * 为什么值得单独认：m3u8 是**文本清单**，里面一行一个 .ts / .m4s 分片地址，
+ * 真正占几百 MB 的是那些分片。把它和 mp4 一样显示成「视频 29 KB」有两个坏处：
+ * ①用户以为下到的就是视频，点下载得到一个几百行的文本；
+ * ②有的站（51cg1）播放器压根没初始化，浏览器一次都没请求过 .m3u8，
+ *  扩展只能从 DOM 的 data-config 里读到它 —— 那种条目更要有醒目的说明。
+ *
+ * 只按路径后缀判，不看 query：站方常把播放列表挂在 `?url=xxx.m3u8` 这类
+ * 跳转后面，那种我们抓到的本来就是跳转前的地址，判成 HLS 反而不对。
+ */
+function isHlsUrl(u) {
+  try {
+    return /\.m3u8$/i.test(new URL(String(u || "")).pathname);
+  } catch {
+    return false;
+  }
+}
+
 function hostOfUrl(u) {
   try {
     return new URL(String(u || "")).hostname;
@@ -653,6 +673,52 @@ function hostOfUrl(u) {
     return "";
   }
 }
+
+/**
+ * 把「页面标题条目」的标题借给同 tab 下真正的 m3u8 条目，并就地删掉页面条目。
+ *
+ * 背景（用户 m16052，4kvm）：artplayer + hls.js 的站，页面上 <video src> 是 blob:，
+ * 真实 m3u8 只有 webRequest 抓得到 —— 可它没有标题；页面侧能读到 og:title，
+ * 却读不到 hls.js 内部的 m3u8 地址。两边各持有一半信息，只能在这里合。
+ *
+ * 判定「页面标题条目」：hint === "hls" 但 URL 的 pathname 不是 .m3u8
+ * （页面侧上报的就是 location.href）。真 m3u8 条目：isHlsUrl 为真。
+ *
+ * 只在**同时存在真 m3u8 条目**时才借标题并删页面条目。若页面上只有那条
+ * 页面条目（m3u8 还没请求出来），就原样留着 —— 至少让用户看到标题。
+ *
+ * 返回 true 表示列表被改过（调用方据此决定是否 flush）。
+ */
+function applyHlsPageTitle(items) {
+  const pageItems = [];
+  const hlsItems = [];
+  for (const it of items) {
+    if (!it) continue;
+    if (isHlsUrl(it.u)) hlsItems.push(it);
+    else if (it.hint === "hls") pageItems.push(it);
+  }
+  if (!pageItems.length || !hlsItems.length) return false;
+  // 取最新的那条页面标题（SPA 切集时标题会变）
+  let title = "";
+  for (const p of pageItems) {
+    const t = (p.title || "").trim();
+    if (t) title = t;
+  }
+  if (title) {
+    const want = title.slice(0, 90);
+    for (const h of hlsItems) {
+      // 已经有更具体标题的（比如页面 <video> 挂了 messageId 那种）不覆盖
+      if (!(h.title || "").trim()) h.title = want;
+    }
+  }
+  // 删掉页面条目：它的 URL 是网页地址，点下载只会把 HTML 存下来
+  const drop = new Set(pageItems);
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (drop.has(items[i])) items.splice(i, 1);
+  }
+  return true;
+}
+
 
 // Telegram 视频封面在页面结构里的特征（站点针对，不在通用层判断）。
 // 真机证据（2026-10-21）：封面 URL 和尺寸跟真照片完全一样（320×180 / 179×320），
@@ -1747,6 +1813,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 这里只留那条内容的条目。**放在去重之后**：去重可能合掉条目，
         // 先收窄再合会让「命中条数」判断失真。
         const focused = applyFocusFilter(shown, rec ? rec.focus : null);
+        // HLS 播放列表要单独标一下（用户 m16052：51cg1 / 4kvm「不起作用」）。
+        // webRequest 抓到的 .m3u8 只是**文本播放列表**（几 KB~几十 KB），
+        // 真视频在它列出的成百上千个 .ts 分片里。以前它和普通 mp4 一样显示成
+        // 「视频 29KB」，用户点下载以为在下视频，其实下的是一个文本文件。
+        // 这里只打标记，不改 k（下载分派还靠 k=video 走 yt-dlp）。
+        for (const it of focused) {
+          if (isHlsUrl(it.u)) it.hint = "hls";
+        }
+        // artplayer 站（4kvm 这类）：页面侧另报了一条 `hint:"hls"` 的「页面标题条目」，
+        // 它的 key 是**页面地址**（页面拿不到真实 m3u8），所以和上面那条跑不到一起。
+        // 这里把页面条目的标题「借」给同 tab 下真正指向 m3u8 的条目，然后把页面条目丢掉。
+        // 为什么这么绕：页面侧只有 DOM（能读到 og:title，读不到 hls.js 内部地址），
+        // 后台侧只有 webRequest（能读到 m3u8，读不到标题）——两边各有一半。
+        applyHlsPageTitle(focused, tabUrl);
         // 编号必须在**所有滤网之后**做（用户 m13975：序号超出内容数量、和内容对不上）。
         // 先编号再过滤的话，被剔掉的 icon / 被去重合并的缩略图照样占掉一个号，
         // 于是 6 条内容出现 ⑨、真图从 ③ 直接跳到 ⑥。

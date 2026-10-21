@@ -49,6 +49,25 @@ check("content.js 转成 cmd:rescan", /cmd: "rescan"/.test(CONTENT));
 check("inject-main 处理 rescan", /d\.cmd === "hello" \|\| d\.cmd === "rescan"/.test(MAIN));
 check("rescan 会真的重扫 DOM", /try \{ scanMedia\(\); \}/.test(MAIN) && /try \{ scanImages\(\); \}/.test(MAIN));
 
+console.log("[5] HLS 条目的展示（用户 m16052：51cg1 / 4kvm）");
+// m3u8 是文本清单，以前和 mp4 一样显示成「视频 29KB」，用户以为下到了坏文件。
+check("popup 有 isHlsItem 判定", /function isHlsItem\(it\)/.test(JS));
+check("isHlsItem 认 hint=hls", /it\.hint === "hls"/.test(JS));
+check("isHlsItem 退回 URL 后缀判（老 state 没有 hint 也能认）", JS.indexOf("m3u8$/i") >= 0);
+check("displayName 里 HLS 走专用名字", /HLS 流（视频）/.test(JS));
+check("副行提示这是分片清单", /HLS 流 · 分片清单/.test(JS));
+check("副行提示点下载会自动拼", /点下载自动拼成完整视频/.test(JS));
+
+// 真机 51cg1 的现象：有 m3u8 的页面同时存在 blob: 录制条目和 m1/m2 分片，
+// 同一条视频在列表里显示三份。hideRecorder 必须把它们一并隐掉。
+// 但反过来——只有 blob/mN 没有 m3u8 的站——绝不能隐，否则用户什么都看不到。
+check("hideRecorder 会在有 m3u8 时隐掉录制条目",
+  /function hideRecorder\(\)\s*\{[\s\S]{0,400}allItems\.some\(isHlsItem\)/.test(JS));
+check("hideRecorder 仍然保留 B 站 / 小红书的原有判据",
+  /isBiliSite\(\) \|\| isXhsDetailPage\(\) \|\| allItems\.some\(isHlsItem\)/.test(JS));
+check("隐录制条目的前提是页面上真有 m3u8（不是无条件隐）",
+  JS.indexOf("只认 blob/mN 的站") >= 0);
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

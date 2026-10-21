@@ -16,6 +16,9 @@ keys/
 native-host/host_manifest.json
 native-host/python_path.txt
 
+# ── 宿主运行时产物（每次下载都会有）──────────────────────
+native-host/jobs/
+
 # ── Python ────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

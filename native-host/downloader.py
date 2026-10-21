@@ -206,8 +206,20 @@ def run_ytdlp(job, ytdlp, ffmpeg):
     cmd += ytdlp_header_args(job)
     if ffmpeg:
         cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
-        if job.get("kind") in ("video", "audio"):
-            cmd += ["--merge-output-format", "mp4"]
+        # 不要加 --merge-output-format mp4（2026-10-21 用户 m16052 排查 4kvm 时发现）。
+        #
+        # 原来这里写死 mp4，本意是「下完统一成 mp4 好播放」。实测一个 971MB 的
+        # HLS 流：yt-dlp 把 TS 分片合并成完整的 TS 之后，ffmpeg 重封装 mp4 这一步
+        # 报 `Postprocessing: Error opening output files: Permission denied`，
+        # **但 yt-dlp 退出码仍是 0**，于是状态被写成 done，用户看到「完成」却
+        # 拿到一个不完整的 .mp4。
+        #
+        # 不强制 mp4 的代价很小：HLS 的 TS 流本身就是完整可播的视频，mpv/PotPlayer/
+        # VLC 都能直接放；真需要 mp4 时用户拿 bin/ 里的 ffmpeg 一条命令就能转。
+        # 换来的是「要么下成、要么明确报错」，比「报完成但文件坏」好得多。
+        #
+        # 注：--merge-output-format 的合法值只有 avi/flv/mkv/mov/mp4/webm，
+        # 音频不能写 m4a，所以音频也保持原样（不传这个参数）。
 
     write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
 
@@ -261,10 +273,18 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         return
 
     proc.wait()
-    if proc.returncode == 0:
+    # 退出码 0 不等于成功（2026-10-21 4kvm 实测）：yt-dlp 的分片合并成功、
+    # 后续 ffmpeg 重封装失败时，它照样返回 0，只在输出里留一行 ERROR。
+    # 只看 returncode 会把坏文件报成「完成」，所以再扫一遍尾部输出。
+    post_err = ""
+    for ln in tail:
+        if "ERROR:" in ln:
+            post_err = ln.strip()
+            break
+    if proc.returncode == 0 and not post_err:
         write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file)
     else:
-        msg = " | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode)
+        msg = post_err or (" | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode))
         write_status(job_id, status="error", message=msg[:600])
 
 
