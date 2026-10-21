@@ -275,6 +275,14 @@
   function ordOfMedia(el) {
     try {
       if (!el || !el.parentElement) return -1;
+      // 首选「视频+图片共用一个池」的统一序号（orderMediaInMessage）。
+      // 这里必须复用同一个函数：如果视频还按「只跟 video 比」算，
+      // 同一条消息里 video 会得到 0..6、image 得到 0..18，两组 ord 撞车，
+      // background 的 compareWithinGroup 只能退到抓取时间去排 —— 表现就是
+      // 「①图②视频③图④视频」这种完全对不上的编号（用户 m15907 反馈的问题）。
+      const unified = orderMediaInMessage(el);
+      if (unified >= 0) return unified;
+      // 兜底：容器里找不到 video/img 混排（比如音频独立面板），退回同族比较
       // 找消息容器：有 data-message-id 的祖先；没有就退回父节点
       let box = el.parentElement;
       let n = el, depth = 0;
@@ -300,6 +308,55 @@
         if (Math.abs(ro.top - r.top) > 8 ? ro.top < r.top : ro.left < r.left) before++;
       }
       return before;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  /**
+   * 同一条消息里**所有**媒体的统一阅读序号（0 起），视频/音频/图片共用一列。
+   *
+   * 为什么需要它（2026-10-21 用户 m15907「序号完全对不上」）：
+   * 旧代码视频走 `ordOfMedia()`（只跟同族 video 比），图片走 scanImages 里的
+   * 列表下标 i（只跟图片比）——**两条计数流各自从 0 起**。Telegram 消息 8848
+   * 就是这样：视频 ord=0..6、图片 ord=0..3，background 按 mid+ord 排序时
+   * 两边的 0 并列，只能退到抓取时间（异步到达=随机），列表于是出现
+   * ①图 ②视频 ③图 ④视频 ⑤图 ⑥视频 这种交替错号。
+   *
+   * 判据用「消息容器里的 DOM 顺序 + 坐标」：同一行（top 差 ≤8px）从左到右，
+   * 不同行从上到下。只把**真正参与编号**的元素放进来，占位 div 不算。
+   *
+   * @returns {number} 统一序号；拿不到返回 -1
+   */
+  function orderMediaInMessage(el) {
+    try {
+      if (!el || !el.parentElement) return -1;
+      let box = el.parentElement;
+      let n = el, depth = 0;
+      while (n && n.nodeType === 1 && depth < 22) {
+        if (n.getAttribute && n.getAttribute("data-message-id")) { box = n; break; }
+        n = n.parentElement;
+        depth++;
+      }
+      if (!box || !box.querySelectorAll) return -1;
+      const nodes = [...box.querySelectorAll("video,audio,img")];
+      if (nodes.length <= 1) return 0;
+
+      // 给每个元素取一个 (行, 列) 位置：先按 top 分行，行内再按 left。
+      // 取不到 rect 的元素（display:none / 还没布局）排到最后，但保持 DOM 相对顺序。
+      const items = nodes.map((node, domIdx) => {
+        let r = null;
+        try { r = node.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+        return { node, domIdx, top: r ? r.top : 1e9, left: r ? r.left : 1e9 };
+      });
+      items.sort((a, b) => {
+        const sameRow = Math.abs(a.top - b.top) <= 8;
+        if (sameRow && Math.abs(a.left - b.left) > 1) return a.left - b.left;
+        if (a.top !== b.top) return a.top - b.top;
+        return a.domIdx - b.domIdx;
+      });
+      const at = items.findIndex((x) => x.node === el);
+      return at;
     } catch (e) {
       return -1;
     }
@@ -1605,6 +1662,12 @@
         list.sort((a, b) => cmpReadingOrder(a.row, b.row));
         for (let i = 0; i < list.length; i++) {
           const { row, src, ctx } = list[i];
+          // 用「消息内所有媒体的统一序号」而不是图片自己的下标 i：
+          // 同一条 Telegram 消息里视频和图片必须落进同一列序号，否则两边各自的
+          // 0/1/2 会并列，排序只能退回抓取时间，表现为 ①图 ②视频 ③图 循环错号。
+          // 拿不到统一序（不在消息容器里 / 单元素）才退回 i。
+          const uOrd = orderMediaInMessage(row.el);
+          const ord = uOrd >= 0 ? uOrd : i;
           const el = row.el;
           let w = 0, h = 0;
           try {
@@ -1624,11 +1687,11 @@
           const mime = (rec && rec.type) || "image/*";
           const size = (rec && rec.size) || 0;
           const prev = imgCtx.get(src);
-          if (!prev || prev.ord !== i || prev.title !== title || prev.w !== w || prev.h !== h
+          if (!prev || prev.ord !== ord || prev.title !== title || prev.w !== w || prev.h !== h
             || prev.hint !== hint || prev.inChrome !== inChrome) {
-            imgCtx.set(src, { mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+            imgCtx.set(src, { mid: ctx.mid, title, ord, w, h, hint, inChrome });
             if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
-            post({ cmd: "found", source: "imgctx", key: src, mime, size, mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+            post({ cmd: "found", source: "imgctx", key: src, mime, size, mid: ctx.mid, title, ord, w, h, hint, inChrome });
           }
         }
       }
@@ -1636,6 +1699,7 @@
   }
   setInterval(scanImages, 1200);
   window.__msImgScan = scanImages; // 供调试/测试手动触发
+  window.__msOrderInMessage = orderMediaInMessage; // 统一序号（视频/图共用一个池）
 
   // ------------------------------------------------------------ 3. 原生媒体请求（fetch / XHR）
 

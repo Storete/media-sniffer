@@ -903,6 +903,67 @@ require("./group_key.test.js")(check);
 // ---- 用户 m13863 追加：[F1] 焦点过滤、[F2] focus() 钩子、[F3] popup 提示条
 require("./focus_scope.test.js")(check);
 
+
+// ---------------------------------------------------------------- [TGORD] 消息内视频+图片共用一个序号池
+// 用户 2026-10-21 m15907：「序号完全对不上」。真机消息 8848：
+//   视频 mid=8848 ord=0..6（7 个）、图片 mid=8848 ord=0..3（4 张）。
+// 两条编号流各自从 0 起，compareWithinGroup 里 ord 相同就只能退到抓取时间（异步=随机），
+// 于是列表出现 ①图 ②视频 ③图 ④视频 ⑤图 ⑥视频 的交替错号。
+console.log("\n[TGORD] 同一条 Telegram 消息里的视频和图片共用一个 ord 序");
+
+{
+  // 直接用源码里的 compareWithinGroup 跑真实数据形态
+  const cmpSrc = bgCode.slice(
+    bgCode.indexOf("function compareWithinGroup"),
+    bgCode.indexOf("function ", bgCode.indexOf("function compareWithinGroup") + 10));
+  const cmpCtx = { __cmp: null };
+  vm.createContext(cmpCtx);
+  vm.runInContext(cmpSrc + "\nthis.__cmp = compareWithinGroup;", cmpCtx, { filename: "cmp" });
+  const cmp = cmpCtx.__cmp;
+
+  // 修复后：同消息里媒体按统一 ord 交错，mid 相同 → 必须按 ord 单调
+  const unified = [
+    { mid: "8848", ord: 0, k: "image", t: 100 },   // 统一序号 0 = 图
+    { mid: "8848", ord: 1, k: "video", t: 200 },   // 统一序号 1 = 视频
+    { mid: "8848", ord: 2, k: "image", t: 300 },
+    { mid: "8848", ord: 3, k: "video", t: 400 },
+    { mid: "8848", ord: 4, k: "image", t: 500 },
+    { mid: "8848", ord: 5, k: "video", t: 600 },
+    { mid: "8848", ord: 6, k: "video", t: 700 },
+    { mid: "8848", ord: 7, k: "image", t: 800 },
+    { mid: "8848", ord: 8, k: "video", t: 900 },
+    { mid: "8848", ord: 9, k: "video", t: 1000 },
+  ];
+  const sorted = unified.slice().sort(cmp);
+  const ords = sorted.map((x) => x.ord);
+  check("[TGORD] 统一 ord 后整条消息严格按阅读顺序",
+    JSON.stringify(ords) === JSON.stringify([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    JSON.stringify(ords));
+
+  // 反例：如果不统一（视频和图片各从 0 起），抓取时间会把顺序打乱
+  const split = [
+    { mid: "8848", ord: 0, k: "video", t: 900 },
+    { mid: "8848", ord: 0, k: "image", t: 100 },
+    { mid: "8848", ord: 1, k: "video", t: 800 },
+    { mid: "8848", ord: 1, k: "image", t: 200 },
+  ];
+  const s2 = split.slice().sort(cmp);
+  check("[TGORD] 两条独立计数流会产生交错（这就是 bug 形态）",
+    !(s2[0].k === "video" && s2[1].k === "video"),
+    JSON.stringify(s2.map((x) => x.k + x.ord)));
+
+  // 跨消息仍然按 mid 升序
+  const cross = [
+    { mid: "8848", ord: 0, t: 100 },
+    { mid: "8842", ord: 9, t: 200 },
+    { mid: "8848", ord: 1, t: 300 },
+  ];
+  const s3 = cross.slice().sort(cmp);
+  check("[TGORD] 跨消息仍按 mid 升序",
+    s3[0].mid === "8842" && s3[1].mid === "8848" && s3[1].ord === 0 && s3[2].ord === 1,
+    JSON.stringify(s3.map((x) => x.mid + ":" + x.ord)));
+}
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

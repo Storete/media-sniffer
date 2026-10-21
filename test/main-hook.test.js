@@ -901,6 +901,89 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rightOrd = ordOf("https://web.telegram.org/a/progressive/document111");
   check("左边的视频 ord=0、右边的 ord=1", leftOrd === 0 && rightOrd === 1, { leftOrd, rightOrd });
 
+  console.log("\n[5f] 视频和图片共用一个阅读序号（用户 m15907 序号对不上）");
+  // 真机消息 8848 的形态：一条消息里 7 个视频 + 4 张图交错排列。
+  // 旧代码视频走 ordOfMedia（只跟 video 比）、图片走列表下标（只跟 img 比），
+  // 两条流各自从 0 起，排序时并列 → 退到抓取时间 → ①图②视频③图④视频 循环错号。
+  {
+    const mkImg = (left, top) => {
+      const im = new FakeHTMLImageElement();
+      im.src = "blob:https://web.telegram.org/mix" + left + "_" + top;
+      im.currentSrc = im.src;
+      im._rect = { top, left, width: 100, height: 100 };
+      im.naturalWidth = 100;
+      im.naturalHeight = 100;
+      return im;
+    };
+    const mkVid = (left, top, tag) => {
+      const v = new FakeHTMLMediaElement("VIDEO");
+      v.currentSrc = "https://web.telegram.org/a/progressive/document" + tag;
+      v._rect = { top, left, width: 100, height: 100 };
+      return v;
+    };
+    // 网格 2x4：第 0 行 [图 视频]，第 1 行 [图 视频]，第 2 行 [图 视频]，第 3 行 [图 视频]
+    // DOM 顺序故意反着放，验证排序靠坐标而不是 DOM
+    const i0 = mkImg(0, 0), v0 = mkVid(200, 0, "A");
+    const i1 = mkImg(0, 200), v1 = mkVid(200, 200, "B");
+    const i2 = mkImg(0, 400), v2 = mkVid(200, 400, "C");
+    const i3 = mkImg(0, 600), v3 = mkVid(200, 600, "D");
+    const all = [v3, i3, v2, i2, v1, i1, v0, i0];
+
+    const mbox = {
+      className: "message-content", nodeType: 1, getAttribute: () => null,
+      querySelector: () => null,
+      querySelectorAll: (sel) => (/img|video|audio/.test(sel) ? all : []),
+      textContent: "",
+    };
+    const mmsg = {
+      className: "Message", nodeType: 1,
+      getAttribute: (n) => (n === "data-message-id" ? "8848" : null),
+      querySelector: () => null,
+      querySelectorAll: (sel) => (/img|video|audio/.test(sel) ? all : []),
+      textContent: "#反差 #清纯 测试消息",
+    };
+    mbox.parentElement = mmsg;
+    mmsg.parentElement = null;
+    for (const e of all) e.parentElement = mbox;
+
+    fakeDocument._mediaEls = [v0, v1, v2, v3];
+    fakeDocument._imgEls = [i0, i1, i2, i3];
+    messages.length = 0;
+    sandbox.window.__msScan();
+    // __msImgScan 才是图片扫描（__msScan 只扫媒体元素）
+    sandbox.window.__msImgScan();
+
+    // 依次取每个元素的统一序号
+    // 图片走 imgctx 通路（found + ord），视频走 progress 通路；
+    // 两条都要查，不能只查 found。
+    const ordFor = (u) => {
+      const f = messages.filter((m) => (m.cmd === "progress" || m.cmd === "found")
+        && m.key === u && typeof m.ord === "number");
+      return f.length ? f[f.length - 1].ord : undefined;
+    };
+    const seq = [
+      ["i0", ordFor(i0.src)], ["v0", ordFor("https://web.telegram.org/a/progressive/documentA")],
+      ["i1", ordFor(i1.src)], ["v1", ordFor("https://web.telegram.org/a/progressive/documentB")],
+      ["i2", ordFor(i2.src)], ["v2", ordFor("https://web.telegram.org/a/progressive/documentC")],
+      ["i3", ordFor(i3.src)], ["v3", ordFor("https://web.telegram.org/a/progressive/documentD")],
+    ];
+    const nums = seq.map((x) => x[1]);
+    check("[5f] 8 个媒体拿到 0..7 不重复的序号",
+      nums.every((n, idx) => n === idx), JSON.stringify(seq));
+
+    // 直接测统一序函数：图片和视频必须落在同一列
+    const uI0 = sandbox.window.__msOrderInMessage(i0);
+    const uV0 = sandbox.window.__msOrderInMessage(v0);
+    const uI3 = sandbox.window.__msOrderInMessage(i3);
+    check("[5f] __msOrderInMessage 导出可用", typeof sandbox.window.__msOrderInMessage === "function", typeof sandbox.window.__msOrderInMessage);
+    check("[5f] 同一行的图在视频左边 → 图序小", uI0 < uV0, { uI0, uV0 });
+    // 网格是 [图 视频] 交替，偶数位(0/2/4/6)是图、奇数位(1/3/5/7)是视频
+    check("[5f] 最后一行的图落在偶数位 6", uI3 === 6, uI3);
+    check("[5f] 图占偶数位、视频占奇数位",
+      seq.every(([name, n]) => (name.startsWith("i") ? n % 2 === 0 : n % 2 === 1)),
+      JSON.stringify(seq));
+  }
+
   console.log("\n[5b] 轮询 currentSrc 兜底（<source>/setAttribute 场景）");  messages.length = 0;
   const v2 = new FakeHTMLMediaElement("VIDEO");
   v2.currentSrc = "blob:https://web.telegram.org/via-currentsrc";

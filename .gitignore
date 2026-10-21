@@ -43,3 +43,6 @@ start_chrome_debug.ps1
 Thumbs.db
 desktop.ini
 *.log
+.dsh-fix-tmp/
+out_img/
+*.tmp
