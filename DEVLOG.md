@@ -10,12 +10,80 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-026 · 2026-10-21 · B 站视频页图片只留封面
+
+**问题**：用户报 B 站视频页图片栏混进 banner / 活动图 / 推荐位封面。真机 `BV1Este6wExx` 的 state 里 33 条 `k:"image"`，只有 1 条是 `hint:"bili-cover"`。
+
+**排查**：
+
+- 页面侧 `isImageOnly` 实测**是生效的**：视频页 45 个 `<img>`，逐个调 `site.isImageOnly()`，通过数 **0**。所以 DOM 扫描这条通路没问题。
+- 那 33 条**全部来自 webRequest**（`chrome.webRequest.onHeadersReceived` → `record()`），根本不经过页面，页面侧钩子管不到。
+- 顺手发现第二个洞：`onScanImages` / `isImageOnly` 都用 `biliPlayinfo()`（有没有 `__playinfo__`）当「是不是视频页」。这个判据有两处会错：
+  1. `__playinfo__` 是首页 JS 异步写入的，首屏几百毫秒里是 `undefined` —— 这段时间页面被判成「非视频页」→ 全放行；
+  2. 番剧/课程页的播放清单根本不在 `__playinfo__`（在 `__INITIAL_STATE__.epInfo`）→ 这类页面**永远**判成非视频页，等于完全没有过滤。
+
+**试过但没采用**：往 `isSiteUiAsset` 里继续加 URL 黑名单（`/bfs/banner/`、`/bfs/face/`、`loading-blue.gif`…）。不行——素材路径随改版换，而且用户真正想要的封面和推荐位封面在同一个 `/bfs/archive/` 目录下，只能靠「是不是这一集的封面」区分，靠 URL 区分不出来。
+
+**解决方案**：
+
+1. `extension/inject-main.js` 新增 `biliIsVideoPage()`，**只看 URL**（同步可读、不会闪）：`/video/(BV…|av…)`、`/(bangumi|cheese)/play/(ep|ss)…`。`onScanImages` 和 `isImageOnly` 都改用它。
+2. `isImageOnly` 在「视频页但拿不到封面」时由 `return true`（放行）改成 `return false`（一张都不报）——放行的话 banner 会进 state，进去就清不掉了。
+3. `extension/background.js` 新增 `preferBiliCover(items, tabUrl)`，在 `sniff:get` 里接在 `dedupeImagesByIdentity` 之后：视频页只留 `hint === "bili-cover"` 的图片，视频/音频条目不受影响；非视频页原样返回。这同时覆盖了 webRequest 那条通路。
+
+**真机证据（1.3.24）**：
+
+| 页面 | 改前 | 改后 |
+|---|---|---|
+| `/video/BV1Este6wExx`（视频页） | `image: 33` | **`image: 1`**（就是 bili-cover） |
+| 首页 `/`（对照） | — | `image: 49`（**不被误筛**） |
+
+**教训**：
+
+- 一个站点可能有**两条互不相干**的发现通路（DOM 扫描 / webRequest），在一条上做过滤，另一条完全不受影响。修之前先问「这个条目是从哪条路进来的」。
+- 拿「异步写入的全局变量存不存在」当页面类型判据很脆：首屏会闪，SPA 会滞留。页面类型要看 **URL**，内容要看 **state**，两件事分开。
+- 过滤原则要一致：**宁可这一轮空，也不要把噪声放进 state**。进了 state 的条目，之后规则改严也清不掉（见 d-025）。
+
+**涉及文件**：`extension/inject-main.js`（`biliIsVideoPage`、站点对象 `onScanImages`/`isImageOnly`）、`extension/background.js`（`preferBiliCover` + `sniff:get` 接线）、`test/site_registry.test.js`（[B10] 10 项 + [B10b] 10 项）。
+
+---
+
+## d-025 · 2026-10-21 · Telegram 陈旧封面条目清不掉
+
+**问题**：1.3.21 已给 telegram 站点对象加了 `isDecorImg` 钩子，页面上下文调用确实返回 `true`，但列表里仍有 15 条 `media-preview--image` 封面。
+
+**排查**：
+
+- 在页面里对真实元素调 `site.isDecorImg(el, el.src)` → `true`，钩子本身没问题。
+- 直接读 background 的 state：`imgs: 26`，其中 `media-preview` 命中 **15** 条。
+- 关键：过滤只在**入口**（`scanImages` 的 `continue`）。Telegram 的封面是 `blob:` URL，页面每次刷新/重渲染都换一个地址 —— 新扫描挡掉的是**新地址**，而 state 里那批**旧地址**的条目没有人删，就一直留在列表里。
+
+**解决方案**：`extension/background.js` 新增 `pruneStaleImages(rec)`，在 `sniff:get` 取快照**之前**按当前规则重算一遍，返回清掉的条数（>0 就 `flushSoon`）。只动 `k === "image"`，清三类：
+
+1. 非白名单站点的 `hint` 含 `cover`；
+2. `TG_COVER_HINT = /media-preview--image|media-preview\b/i`（Telegram 左栏列表预览）；
+3. `TG_THUMB_HINT = /(?:^|\s)thumbnail(?:\s|$)/i` 且 URL 在 `web.telegram.org`（消息内封面）。
+
+视频/音频一律不碰——它们不参与这套判定，误删代价远大于收益。
+
+**真机证据（1.3.22）**：`image` 26 → **10**；`media-preview--image` 15 → **0**；`thumbnail` → **0**；剩 8 条 `full-media` 真照片。
+
+**教训**：
+
+- **过滤只在入口做是不够的。** 规则后来变严、或页面用一次性地址（`blob:`）时，已经进 state 的条目永远清不掉。需要一轮「按当前判定重算并清理」。
+- 第一版红测是**假绿**：用 150×150 的假条目测 `looksLikeIcon`，它本来就撞上「方形小图→图标」规则返回 `true`，压根没测到新逻辑。是从真机 DOM 拿到「video + img 同容器」「`.media-preview` 配 `.icon-play`」两个特征后重写测试，才是真红测。
+
+**涉及文件**：`extension/background.js`（`pruneStaleImages` + `sniff:get` 接线）、`test/site_registry.test.js`（[TGS] 7 项）。
+
+---
+
 ---
 
 ## 索引
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-026](#d-026) | 2026-10-21 | B 站视频页图片只留封面 | 视频页判定改看 URL（`__playinfo__` 首屏为空、番剧页永远为空）；banner 全走 webRequest，得在 background 补一层 |
+| [d-025](#d-025) | 2026-10-21 | Telegram 陈旧封面条目清不掉 | 过滤只做在入口不够：blob 地址每轮换，旧条目只能靠 `pruneStaleImages` 按当前规则重算 |
 | [d-024](#d-024) | 2026-10-20 | 视频封面默认不当图片收 | 做成一张站点白名单表；小红书封面单独打 xhs-cover 才分得开 |
 | [d-023](#d-023) | 2026-10-20 | 真机复测：编号跨消息错位 + 焦点上报永久失效 | ord 语义是「消息内」的，加 mid 层；焦点补发；同组编号压过 kind |
 | [d-022](#d-022) | 2026-10-20 | 焦点收窄 + 编号对不上内容 | 编号挪到所有滤网之后；新增 focus() 钩子，Telegram 查看器只显示那条 |
