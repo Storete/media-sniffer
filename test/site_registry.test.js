@@ -162,6 +162,57 @@ check("telegram 有 isDecorImg 钩子", /isDecorImg\s*:/.test(tgPush), tgPush.sl
 check("封面判据看的是 video 兄弟节点", /querySelector\(["']video["']\)/.test(tgPush));
 check("列表预览看的是 icon-play", /icon-play/.test(tgPush));
 
+// ---------------------------------------------------------------- [TGS] 陈旧条目清理
+// 真机 2026-10-21：telegram 站点对象加了 isDecorImg 之后，**新扫描**确实挡住了封面，
+// 但 state 里仍留着 15 条 media-preview 封面。原因：Telegram 封面是 blob: URL，
+// 每轮刷新都换一个地址，新扫描挡掉的是新地址，旧地址的条目永远没人删 ——
+// 只能靠一次「按当前判定重算」清掉。
+console.log("\n[TGS] 陈旧封面条目要能被清掉（不是只挡新扫描）");
+
+const bgSrc = fs.readFileSync(path.join(ROOT, "extension", "background.js"), "utf8");
+check("background 有清理陈旧图片条目的函数", /function pruneStaleImages\s*\(/.test(bgSrc), "run after fix");
+check("sniff:get 会调用它", /pruneStaleImages\s*\(\s*rec/.test(bgSrc), "run after fix");
+
+const prStart = bgSrc.indexOf("function pruneStaleImages(");
+if (prStart >= 0) {
+  const prEnd = bgSrc.indexOf("\n}", prStart) + 2;
+  const vm = require("vm");
+  const prCtx = vm.createContext({ console, Map, Set, String, Number, Math, JSON, URL, RegExp });
+  const depsStart = bgSrc.indexOf("const ICON_MAX");
+  vm.runInContext(bgSrc.slice(depsStart, prStart) + "\n" + bgSrc.slice(prStart, prEnd), prCtx, { filename: "prune" });
+  const prune = vm.runInContext("pruneStaleImages", prCtx);
+
+  const mkRec = (items, url) => ({ items: new Map(items.map((x) => [x.u, x])), url });
+
+  let rec = mkRec([
+    { u: "blob:https://web.telegram.org/preview-old", k: "image", hint: "media-preview--image media-preview", w: 320, h: 180, t: 1 },
+    { u: "blob:https://web.telegram.org/photo-keep", k: "image", hint: "media opacity-transition shown", w: 1280, h: 720, t: 2 },
+  ], "https://web.telegram.org/a/#x");
+  const dropped = prune(rec);
+  check("[TGS] telegram 列表预览封面被清掉",
+    !rec.items.has("blob:https://web.telegram.org/preview-old"), [...rec.items.keys()]);
+  check("[TGS] telegram 真照片保留",
+    rec.items.has("blob:https://web.telegram.org/photo-keep"), [...rec.items.keys()]);
+  check("[TGS] 返回清掉的数量", dropped === 1, dropped);
+
+  rec = mkRec([
+    { u: "https://example.com/c.jpg", k: "image", hint: "bili-cover", w: 800, h: 600, t: 3 },
+    { u: "https://example.com/d.jpg", k: "image", hint: "", w: 800, h: 600, t: 4 },
+  ], "https://example.com/page");
+  prune(rec);
+  check("[TGS] 非白名单站点的 cover 被清掉", !rec.items.has("https://example.com/c.jpg"), [...rec.items.keys()]);
+  check("[TGS] 普通图保留", rec.items.has("https://example.com/d.jpg"), [...rec.items.keys()]);
+
+  rec = mkRec([
+    { u: "https://i0.hdslb.com/bfs/archive/cover.jpg", k: "image", hint: "bili-cover", w: 1920, h: 1080, t: 5 },
+  ], "https://www.bilibili.com/video/BV1xx411c7mD");
+  prune(rec);
+  check("[TGS] B 站封面在白名单站点保留",
+    rec.items.has("https://i0.hdslb.com/bfs/archive/cover.jpg"), [...rec.items.keys()]);
+
+  check("[TGS] 空 rec 不炸", prune(null) === 0 && prune({ items: new Map(), url: "" }) === 0);
+}
+
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

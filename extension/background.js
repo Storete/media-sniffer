@@ -620,6 +620,49 @@ function hostOfUrl(u) {
   }
 }
 
+// Telegram 视频封面在页面结构里的特征（站点针对，不在通用层判断）。
+// 真机证据（2026-10-21）：封面 URL 和尺寸跟真照片完全一样（320×180 / 179×320），
+// 唯一区别是 DOM 结构——
+//   ① 消息内：.media-inner 里 <video class="full-media"> 和 <img class="thumbnail"> 同容器
+//   ② 左栏列表：.media-preview 里 <img class="media-preview--image"> 配 <i class="icon icon-play">
+//   真照片是 <img class="media">，没有 video 兄弟。
+// 页面侧 scanImages 已经用 site.isDecorImg 挡住了**新**扫描；但 Telegram 的封面是
+// blob: URL，每轮刷新都换一个，旧地址的条目留在 state 里没人删。
+// 这里按 hint/class 特征做一次「按当前判定重算」，把这批陈旧条目清掉。
+const TG_COVER_HINT = /media-preview--image|media-preview\b/i;
+const TG_THUMB_HINT = /(?:^|\s)thumbnail(?:\s|$)/i;
+
+/**
+ * 清掉 rec 里「按当前判定不该显示」的图片条目，返回清掉的条数。
+ *
+ * 为什么需要它：过滤只在入口（record / scanImages）做，一旦条目已经进了 state，
+ * 规则后来变严（或页面上报的临时地址已经失效）就永远清不掉。定期按最新规则重算一次，
+ * 让 state 自然收敛到「规则认可的样子」。
+ *
+ * 只动 k === "image" 的条目：
+ *   · 非白名单站点的封面（hint 含 cover）—— 默认策略（用户 m15108）
+ *   · Telegram 的两类视频封面 —— 见上面的真机证据
+ * 视频/音频/其它一律不碰：它们不参与这套判定，误删代价远大于收益。
+ *
+ * @param {{items: Map<string, any>, url: string}|null} rec
+ * @returns {number} 清掉的条数（0 表示什么都没动，调用方据此决定要不要 flush）
+ */
+function pruneStaleImages(rec) {
+  if (!rec || !rec.items || typeof rec.items.delete !== "function") return 0;
+  const coverOK = coverAllowed(hostOfUrl(rec.url || ""));
+  let dropped = 0;
+  for (const [key, it] of [...rec.items]) {
+    if (!it || it.k !== "image") continue;
+    const hint = String(it.hint || "");
+    let stale = false;
+    if (!coverOK && hint.indexOf("cover") >= 0) stale = true;              // 默认策略
+    else if (TG_COVER_HINT.test(hint)) stale = true;                       // 左栏列表预览
+    else if (TG_THUMB_HINT.test(hint) && /web\.telegram\.org/i.test(String(it.u || ""))) stale = true;
+    if (stale) { rec.items.delete(key); dropped++; }
+  }
+  return dropped;
+}
+
 const THUMB_HINT = /\/file\/|thumb|avatar|emoji|\/icons?\/|img-apple-64|\/assets\//i;
 // B 站等站的图片 CDN 域名特征（只用于加严，不用于豁免 —— Telegram 的教训）
 const CDN_HINT = /hdslb\.com|alicdn\.com|bdstatic\.com|gtimg\.cn|byteimg\.com|360buyimg\.com/i;
@@ -1620,6 +1663,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "sniff:get": {
         await loadPromise;
         const rec = state.get(msg.tabId);
+        // 先把「按当前规则已经不该存在」的陈旧图片清掉（默认策略 / Telegram 封面）。
+        // 必须在取 items 快照**之前**，否则这一轮还是会带出去。
+        if (rec && pruneStaleImages(rec)) flushSoon(msg.tabId);
         const items = rec ? [...rec.items.values()] : [];
         let tabUrl = rec ? rec.url : "";
         // 小红书是单页应用：从信息流点开帖子常常不触发 main_frame，rec.url 还停在
