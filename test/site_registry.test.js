@@ -213,6 +213,112 @@ if (prStart >= 0) {
   check("[TGS] 空 rec 不炸", prune(null) === 0 && prune({ items: new Map(), url: "" }) === 0);
 }
 
+// ---------------------------------------------------------------- [B10] B 站 banner 泄漏
+// 用户真机 2026-10-21：B 站视频页列表里混进了 banner/活动图。
+// 根因：站点对象的 onScanImages / isImageOnly 都以 biliPlayinfo()（有没有
+// __playinfo__ 的 DASH 清单）当作「这是不是视频页」，但：
+//   ① 首屏 JS 还没写入 __playinfo__ 时返回 null → 判定成「非视频页」→ 全放行；
+//   ② 番剧/课程页的清单不在 __playinfo__（在 __INITIAL_STATE__.epInfo）→ 永远判非视频页。
+// 正确判据是「URL 是视频页」+「能不能从 state 拿到这一集的封面」两件事分开问。
+console.log("\n[B10] B 站视频页只留封面，URL 判定不能依赖 __playinfo__");
+
+const injSrc = fs.readFileSync(path.join(ROOT, "extension", "inject-main.js"), "utf8");
+
+check("[B10] 有 biliIsVideoPage（按 URL 判，不看 __playinfo__）",
+  /function biliIsVideoPage\s*\(/.test(injSrc), "run after fix");
+check("[B10] onScanImages 用 biliIsVideoPage 而不是 biliPlayinfo 判视频页",
+  /onScanImages:\s*\(\)\s*=>\s*\{[\s\S]{0,200}?biliIsVideoPage\s*\(/.test(injSrc)
+  && !/onScanImages:\s*\(\)\s*=>\s*\{[\s\S]{0,80}?if\s*\(!biliPlayinfo\(\)\)\s*return false/.test(injSrc),
+  "run after fix");
+check("[B10] isImageOnly 用 biliIsVideoPage 而不是 biliPlayinfo 判视频页",
+  /isImageOnly:\s*\(el,\s*src\)\s*=>\s*\{[\s\S]{0,220}?biliIsVideoPage\s*\(/.test(injSrc)
+  && !/isImageOnly:\s*\(el,\s*src\)\s*=>\s*\{[\s\S]{0,120}?if\s*\(!biliPlayinfo\(\)\)\s*return true/.test(injSrc),
+  "run after fix");
+
+// 行为验证：把 biliIsVideoPage 切出来单独跑
+const vpStart = injSrc.indexOf("function biliIsVideoPage(");
+if (vpStart >= 0) {
+  // 按大括号配对截取：函数体里还有 try/catch 两层，不能用第一个 "\n  }" 收尾
+  let depth = 0, vpEnd = vpStart;
+  for (let i = injSrc.indexOf("{", vpStart); i < injSrc.length; i++) {
+    const c = injSrc[i];
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) { vpEnd = i + 1; break; } }
+  }
+  const vm = require("vm");
+  const vpCtx = vm.createContext({ console, String, RegExp, URL });
+  vm.runInContext(injSrc.slice(vpStart, vpEnd), vpCtx, { filename: "vp" });
+  const isVideoPage = (href) => {
+    vpCtx.__href = href;
+    vm.runInContext("location = { href: __href, hostname: new URL(__href).hostname, pathname: new URL(__href).pathname }", vpCtx);
+    return vm.runInContext("biliIsVideoPage()", vpCtx);
+  };
+  check("[B10] /video/BV… 是视频页", isVideoPage("https://www.bilibili.com/video/BV1GJ411x7h7") === true,
+    "false");
+  check("[B10] /video/BV…?p=2 是视频页", isVideoPage("https://www.bilibili.com/video/BV1GJ411x7h7?p=2") === true,
+    "false");
+  check("[B10] /bangumi/play/ep… 是番剧页", isVideoPage("https://www.bilibili.com/bangumi/play/ep123456") === true,
+    "false");
+  check("[B10] /cheese/play/ep… 是课程页", isVideoPage("https://www.bilibili.com/cheese/play/ep123456") === true,
+    "false");
+  check("[B10] 首页不是视频页", isVideoPage("https://www.bilibili.com/") === false, "true");
+  check("[B10] 动态页不是视频页", isVideoPage("https://t.bilibili.com/12345") === false, "true");
+  check("[B10] 搜索页不是视频页", isVideoPage("https://search.bilibili.com/all?keyword=x") === false, "true");
+}
+
+// ---------------------------------------------------------------- [B10b] webRequest 路径的 B 站噪声
+// 1.3.23 修好了 DOM 扫描（isImageOnly），但真机 state 里仍有 33 条图片，
+// 全部是 webRequest 路径进来的：banner、活动图、头像、推荐位封面、loading 图。
+// 页面侧钩子管不到 webRequest，只能在 background 出列表时按「站点 + 视频页」再筛一次。
+console.log("\n[B10b] B 站视频页的 webRequest 图片只留封面");
+
+const bg2 = fs.readFileSync(path.join(ROOT, "extension", "background.js"), "utf8");
+check("[B10b] 有 preferBiliCover 函数", /function preferBiliCover\s*\(/.test(bg2), "run after fix");
+
+const pbStart = bg2.indexOf("function preferBiliCover(");
+if (pbStart >= 0) {
+  let depth = 0, pbEnd = pbStart;
+  for (let i = bg2.indexOf("{", pbStart); i < bg2.length; i++) {
+    const c = bg2[i];
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) { pbEnd = i + 1; break; } }
+  }
+  const vm = require("vm");
+  const pbCtx = vm.createContext({ console, Array, String, RegExp, URL, Set });
+  vm.runInContext(bg2.slice(pbStart, pbEnd), pbCtx, { filename: "pb" });
+  const prefer = vm.runInContext("preferBiliCover", pbCtx);
+  const mk = (hint, u) => ({ k: "image", hint, u, w: 800, h: 600 });
+  const imgsOf = (out) => out.filter((i) => i.k === "image").length;
+
+  let list = [mk("bili-cover", "https://i1.hdslb.com/bfs/archive/cover.jpg"),
+              mk("", "https://i2.hdslb.com/bfs/banner/abc.jpg"),
+              mk("", "https://i2.hdslb.com/bfs/archive/rec1.jpg"),
+              { k: "video", u: "https://x/1.m4s" }];
+  let out = prefer(list, "https://www.bilibili.com/video/BV1GJ411x7h7");
+  check("[B10b] 视频页只留封面", imgsOf(out) === 1, imgsOf(out));
+  check("[B10b] 封面本身保留", out.some((i) => i.hint === "bili-cover"), out.map((i) => i.hint));
+  check("[B10b] banner 被挡掉", !out.some((i) => /banner/.test(i.u || "")), out.map((i) => i.u));
+  check("[B10b] 视频条目不受影响", out.some((i) => i.k === "video"), out.map((i) => i.k));
+
+  list = [mk("", "https://i2.hdslb.com/bfs/banner/abc.jpg"), mk("", "https://i2.hdslb.com/bfs/archive/rec1.jpg")];
+  out = prefer(list, "https://www.bilibili.com/");
+  check("[B10b] 首页不筛", imgsOf(out) === 2, imgsOf(out));
+
+  list = [mk("bili-cover", "https://i1.hdslb.com/a.jpg"), mk("", "https://i2.hdslb.com/bfs/banner/x.jpg")];
+  out = prefer(list, "https://www.bilibili.com/bangumi/play/ep123456");
+  check("[B10b] 番剧页也筛", imgsOf(out) === 1, imgsOf(out));
+
+  list = [mk("", "https://x.com/a.jpg"), mk("", "https://x.com/b.jpg")];
+  out = prefer(list, "https://example.com/video/BV1x");
+  check("[B10b] 非 B 站不筛", imgsOf(out) === 2, imgsOf(out));
+
+  list = [mk("", "https://i2.hdslb.com/bfs/banner/abc.jpg")];
+  out = prefer(list, "https://www.bilibili.com/video/BV1GJ411x7h7");
+  check("[B10b] 视频页没有封面时一张图都不留", imgsOf(out) === 0, imgsOf(out));
+
+  check("[B10b] 空列表安全", prefer([], "https://www.bilibili.com/video/BV1x").length === 0);
+}
+
 console.log("\n==============================================");
 console.log(`通过 ${pass} 项，失败 ${fail} 项`);
 process.exit(fail ? 1 : 0);

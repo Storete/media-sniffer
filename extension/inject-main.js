@@ -2934,6 +2934,29 @@
     try { return /(^|\.)bilibili\.com$/i.test(location.hostname); } catch (e) { return false; }
   }
 
+  /**
+   * 当前是不是 B 站的「单个视频」页面（投稿 / 番剧 / 课程）。
+   *
+   * 为什么不能拿 biliPlayinfo() 当这个判据（用户真机 2026-10-21 报 banner 泄漏）：
+   *   ① `__playinfo__` 是首页 JS 异步写入的，首屏那几百毫秒里是 undefined。
+   *      DOM 扫描不会等它，于是这段窗口里页面被判成「非视频页」→ 全放行 →
+   *      banner/活动图/推荐位封面全进列表，而且进了 state 就再也不走。
+   *   ② 番剧/课程页的播放清单根本不在 `__playinfo__`（在 `__INITIAL_STATE__.epInfo`），
+   *      这类页面**永远**被判成非视频页，等于完全没有过滤。
+   * URL 是同步可读的、不会闪，所以「是不是视频页」只看 URL；
+   * 「这一集的封面是哪张」才去问 state（见 biliCoverImage）。
+   */
+  function biliIsVideoPage() {
+    try {
+      const p = location.pathname || "";
+      // /video/BVxxx | av123 | /bangumi/play/ep123456 | /cheese/play/ep123456
+      return /^\/video\/(BV[0-9A-Za-z]+|av\d+)/i.test(p)
+        || /^\/(bangumi|cheese)\/play\/(ep|ss)\d+/i.test(p);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ---- B 站站点对象（下载层钩子）----
   //
   // 以前 `startMediaDownload` 里写死 `const useBili = isBiliHost() && biliPlayinfo()`、
@@ -2974,17 +2997,17 @@
 
     // A2 用户诉求：「B 站的图片获取我想改为仅获取所点开视频的封面」。
     //
-    // 视频页（有 __playinfo__）上 DOM 里的 <img> 全是噪声：UP 主头像、推荐位
-    // 封面、广告位、番剧卡片。它们的 class 会随改版变，唯一稳的判据是
+    // 视频页上 DOM 里的 <img> 全是噪声：UP 主头像、推荐位封面、广告位、番剧卡片，
+    // 还有 banner/活动图。它们的 class 会随改版变，唯一稳的判据是
     // 「这张图是不是 __INITIAL_STATE__ 里那个 cover」。
     //
     // 返回 true 表示「这轮 B 站自己报完了，通用 DOM 扫描不用跑了」；
-    // 返回 false（拿不到封面，比如首页/动态页/state 还没就绪）就走通用逻辑，
-    // 宁可多抓也不漏抓——用户报「抓不到」比「多了几张」更难处理。
+    // 返回 false 走通用逻辑。**判视频页必须用 biliIsVideoPage() 而不是
+    // biliPlayinfo()** —— 后者首屏异步、番剧页永远为空，见该函数注释。
     onScanImages: () => {
-      if (!biliPlayinfo()) return false;   // 不是视频页，不接管
+      if (!biliIsVideoPage()) return false;   // 不是视频页，不接管
       const cover = biliCoverImage();
-      if (!cover.url) return false;        // state 没就绪，退回 DOM 扫描
+      if (!cover.url) return false;        // state 还没就绪，退回 DOM 扫描
       // 只报封面这一张。source 用 httpmedia（与 webRequest 记下的条目同源合并），
       // hint 不带 xhs-note，避免被小红书那套「分片让位」规则误伤。
       post({
@@ -3002,12 +3025,16 @@
       return true;
     },
 
-    // 视频页的图片只认封面（onScanImages 已接管；这里是兜底，防 onScanImages
-    // 因 state 未就绪返回 false 之后 DOM 扫描又把一堆推荐图放进来）
+    // 视频页的图片只认封面（onScanImages 已接管；这里是兜底，防 state 未就绪时
+    // onScanImages 返回 false 之后，DOM 扫描又把 banner/推荐图放进来）。
+    //
+    // 视频页拿不到封面时**不能放行**：宁可这一轮一张图都不报，也不能让 banner
+    // 混进去——混进去就进了 state，之后规则再改也清不掉（见 background 的
+    // pruneStaleImages 与 1.3.21 的教训）。非视频页（首页/动态/搜索）不受限制。
     isImageOnly: (el, src) => {
-      if (!biliPlayinfo()) return true;    // 非视频页不限制
+      if (!biliIsVideoPage()) return true; // 非视频页不限制
       const cover = biliCoverImage();
-      if (!cover.url) return true;         // 拿不到封面就不过滤（宁可多抓）
+      if (!cover.url) return false;        // 视频页但拿不到封面：本轮一张图都不报
       return biliIsCoverSrc(src, cover.url);
     },
   });

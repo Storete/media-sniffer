@@ -611,6 +611,40 @@ function coverAllowed(host) {
   return VIDEO_COVER_SITES.some((site) => h.endsWith("." + site.toLowerCase() + "."));
 }
 
+/**
+ * B 站「单个视频」页面：只留这一集的封面，其它图片一律不显示。
+ *
+ * 为什么藏在 background 而不是页面侧（用户真机 2026-10-21：banner 泄漏）：
+ * 页面侧 isImageOnly 只挡得住 DOM 扫描。真机 state 里 33 条图片**全部来自
+ * webRequest** —— banner、活动图、UP 主头像、推荐位封面、loading 图，
+ * webRequest 根本不经过页面，只能在出列表时再筛一次。
+ *
+ * 判据只看 URL 是不是视频页 + 有没有 bili-cover 条目：
+ *   · 视频页且已有封面 → 只留 hint=bili-cover
+ *   · 视频页但还没拿到封面 → 一张图都不留（宁可空也不放 banner 进去，
+ *     进去了就进 state，之后规则再改也清不掉）
+ *   · 非视频页（首页/动态/搜索）→ 原样返回，用户在那儿就是要看一堆封面
+ *
+ * @param {Array<any>} items
+ * @param {string} tabUrl
+ * @returns {Array<any>}
+ */
+function preferBiliCover(items, tabUrl) {
+  if (!Array.isArray(items) || !items.length) return items;
+  let isVideoPage = false;
+  try {
+    const host = new URL(String(tabUrl || "")).hostname.toLowerCase();
+    if (!/(^|\.)bilibili\.com$/.test(host)) return items;
+    const p = new URL(String(tabUrl)).pathname;
+    isVideoPage = /^\/video\/(BV[0-9A-Za-z]+|av\d+)/i.test(p)
+      || /^\/(bangumi|cheese)\/play\/(ep|ss)\d+/i.test(p);
+  } catch (e) {
+    return items;
+  }
+  if (!isVideoPage) return items;
+  return items.filter((it) => it.k !== "image" || it.hint === "bili-cover");
+}
+
 /** 从完整 URL 取宿主名；取不到返回 ""（解析失败时按「非白名单」处理，宁可少收） */
 function hostOfUrl(u) {
   try {
@@ -1708,7 +1742,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 缩略图/雪碧图/别的帖子封面全是噪声（详见 preferXhsNoteList 的注释）。
         const shown = isXhsDetailUrl(tabUrl)
           ? preferXhsNoteList(dedupeXhsNoteImages(visible))
-          : dedupeImagesByIdentity(visible);
+          : preferBiliCover(dedupeImagesByIdentity(visible), tabUrl);
         // 焦点收窄（用户 m13863）：页面在「查看器/灯箱」打开时上报当前焦点内容，
         // 这里只留那条内容的条目。**放在去重之后**：去重可能合掉条目，
         // 先收窄再合会让「命中条数」判断失真。
