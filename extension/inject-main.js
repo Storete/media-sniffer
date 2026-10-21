@@ -185,6 +185,14 @@
     if (ascii(b, 0, 4) === "OggS") return ".ogg";
     if (ascii(b, 0, 4) === "fLaC") return ".flac";
     if (b[0] === 0x47 && b[188] === 0x47) return ".ts";
+    // 图片魔数：Telegram 的图片是 blob:（类型只挂 image/jpeg 这类 MIME），
+    // 而旧逻辑只认音视频，一路兜到 ".mp4" —— 真机存出来是「真机测试图.mp4」，
+    // 十六进制却是 ffd8ffe0（JPEG）。按内容定扩展名，别信调用方给的键名。
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ".jpg";
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return ".png";
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return ".gif";
+    if (ascii(b, 0, 4) === "RIFF" && ascii(b, 8, 4) === "WEBP") return ".webp";
+    if (b[0] === 0x42 && b[1] === 0x4d) return ".bmp";
     return null;
   }
 
@@ -2244,7 +2252,7 @@
       const res = await fetchWithTimeout(key, { credentials: "include", signal }, FETCH_TIMEOUT_CHUNK);
       if (!res.ok) throw new Error("HTTP " + res.status);
       const buf = await res.arrayBuffer();
-      const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || ".mp4";
+      const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || "";
       const filename = finishName(name, key, ext);
       fireProgress(onProgress, buf.byteLength, buf.byteLength, 0);
       return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename };
@@ -2252,7 +2260,8 @@
 
     // ---- 2) 文件名：从字节头判断扩展名；Telegram 的引用（album/viewer）防重名
     let head = new Uint8Array(probe.buf.slice(0, Math.min(got, 64)));
-    const ext = sniffExt(head) || guessExtFromType(ctx.ct) || ".mp4";
+    // 兜底不再写 ".mp4"：认不出来时宁可没扩展名，也别把一个 JPEG 存成 .mp4
+    const ext = sniffExt(head) || guessExtFromType(ctx.ct) || "";
     const filename = finishName(name, key, ext);
     log(`开始下载 ${filename}（${fmtBytes(total)}，分段 ${fmtBytes(cb)}，${parallel} 并发）`);
 
@@ -3087,8 +3096,18 @@
     },
   });
 
+  const IMG_MIME_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/pjpeg": ".jpg",
+    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "image/bmp": ".bmp", "image/avif": ".avif", "image/svg+xml": ".svg",
+    "image/heic": ".heic",
+  };
+
+  /** 从 Content-Type 推扩展名。音视频 + 图片都要覆盖：
+   *  旧版只认音视频，`image/jpeg` 落成 null，最终兜到 ".mp4"（真机踩过）。 */
   function guessExtFromType(ct) {
-    const m = (ct || "").toLowerCase();
+    const m = (ct || "").toLowerCase().split(";")[0].trim();
+    if (IMG_MIME_EXT[m]) return IMG_MIME_EXT[m];
     if (m.startsWith("audio/")) return extOf(m) === ".bin" ? ".m4a" : extOf(m);
     if (m.startsWith("video/")) return extOf(m) === ".bin" ? ".mp4" : extOf(m);
     return null;
@@ -3477,7 +3496,14 @@
       }
       if (/^blob:/i.test(it.key)) {
         overlayClose();
-        doSaveBlob(it.key, it.name);
+        // blob: 不再走 doSaveBlob 的 <a download>。真机（Telegram，2026-10-21）证据：
+        //   __msRangeDownload → D:/…/文件存放处/tg-probe.mp4  72796 字节 ✅
+        //   <a download>      → C:/Users/l/Downloads/test-tg.jfif 72796 字节 ⚠️
+        // 数据其实都下下来了，但 <a download> 落在 **Chrome 默认下载目录**、
+        // 扩展名被 MIME 改写成 .jfif，用户在「文件存放处」找不到 → 看起来就是「下载失败」。
+        // 页面侧 fetch 读 blob: 完全可用（probeTotal 实测 72796 与 DOM 一致），
+        // 所以统一走 Range + Native Host，落到插件配置的目录、扩展名由内容嗅探决定。
+        startMediaDownload(it.key, it.name, {}, () => {});
         return;
       }
       if (/^m\d+$/.test(it.key)) {

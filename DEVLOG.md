@@ -10,6 +10,43 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-027 · 2026-10-21 · Telegram（以及所有 blob:）保存「全部失效」
+
+**问题**：用户报「Telegram 视频和图片下载全部失效」。
+
+**排查（先证明哪一段断了，别猜）**：
+
+真机上逐段实测，结论是**数据一直都能拿到，只是掉进了另一个目录**：
+
+| 路径 | 落点 | 结果 |
+|---|---|---|
+| `__msProbeTotal` 读 blob: | — | 72796（与 DOM 里 blob.size 一致）✅ |
+| `__msRangeDownload`（Native Host） | `D:/…/文件存放处/tg-probe.mp4` | 72796 字节 ✅ |
+| 宿主 `msfile_start/chunk/end` 手打一遍 | 同上 | 3 步全 `ok:true` ✅ |
+| 浮层「保存到本地」→ `doSaveBlob` → `<a download>` | `C:/Users/l/Downloads/test-tg.jfif` | 72796 字节 ⚠️ |
+
+- 宿主链路、blob 读取、探针全部正常，所以不是「下载器挂了」。
+- 走 `<a download>` 那条把文件丢进 **Chrome 默认下载目录**，扩展名还被 MIME 改写成 `.jfif`。用户在插件配的「文件存放处」里看不到任何东西 → 主观感受就是「下载全部失效」。
+- 顺带发现第二个坑：改走 Native Host 后文件名叫 `真机测试图.mp4`，但十六进制是 `ffd8ffe0`（JPEG）。根因是 `sniffExt` 只认音视频魔数、`guessExtFromType` 只认 `audio/*` `video/*`，两个都没命中就兜到写死的 `".mp4"`。
+
+**解决**：
+
+1. `extension/inject-main.js` 的 `runSave` 里，`blob:` 分支从 `doSaveBlob(key, name)` 改成 `startMediaDownload(it.key, it.name, {}, () => {})` —— 统一走 Range + Native Host，落到插件配置的目录、文件名由内容嗅探决定。
+2. `sniffExt` 补图片魔数（JPEG `ffd8ff` / PNG / GIF / WEBP / BMP）。
+3. `guessExtFromType` 补 `IMG_MIME_EXT` 表（jpeg/png/gif/webp/bmp/avif/svg/heic），并先按 `;` 切掉 charset。
+4. 两处 `|| ".mp4"` 兜底改成 `|| ""` —— 认不出来时宁可没扩展名，也别把 JPEG 存成 mp4。
+
+**验证**：
+
+- 真机（重载扩展 + 刷新 Telegram）：浮层显示 `完成 · D:\软件应用\DSH\文件存放处\真机复验图_99398.jpg（71.1 KB，1s）`，落盘 72796 字节，魔数 `ffd8ffe0` ✅
+- `test/site_registry.test.js` 新增 `[BLOB]` 7 项 + `[EXT]` 10 项，全套 89 项全绿。
+
+**教训**：
+
+- 「下载失败」要先分辨是**没下到**还是**下到了别处**。这次是后者，因为 `<a download>` 的文件去向完全不受扩展控制。
+- 在页面里下东西，只有两条路：`<a download>`（去浏览器下载目录，扩展管不着）和 Native Messaging（去插件配置的目录）。凡是用户要求「保存到我的目录」，就必须走后者。
+- 扩展名永远按**字节魔数**定，别信键名也别信调用方给的 MIME —— 兜底值写死成某个具体格式，一定会在别的格式上翻车。
+
 ## d-026 · 2026-10-21 · B 站视频页图片只留封面
 
 **问题**：用户报 B 站视频页图片栏混进 banner / 活动图 / 推荐位封面。真机 `BV1Este6wExx` 的 state 里 33 条 `k:"image"`，只有 1 条是 `hint:"bili-cover"`。

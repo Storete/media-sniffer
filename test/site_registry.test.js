@@ -14,6 +14,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const vm = require("vm");
 
 const ROOT = path.join(__dirname, "..");
 const SRC = fs.readFileSync(path.join(ROOT, "extension", "inject-main.js"), "utf8");
@@ -317,6 +318,127 @@ if (pbStart >= 0) {
   check("[B10b] 视频页没有封面时一张图都不留", imgsOf(out) === 0, imgsOf(out));
 
   check("[B10b] 空列表安全", prefer([], "https://www.bilibili.com/video/BV1x").length === 0);
+}
+
+// ---------------------------------------------------------------- [BLOB] blob 走 Native Host 落盘
+// 用户 m11900「Telegram 视频和图片下载全部失效」。
+// 真机 2026-10-21 的证据：
+//   · __msRangeDownload（走 Native Host）→ D:/…/文件存放处/tg-probe.mp4  72796 字节 ✅
+//   · <a download>（doSaveBlob 当前路径）→ C:/Users/l/Downloads/test-tg.jfif 72796 字节 ⚠️
+// 数据其实下下来了，但落在 Chrome 默认下载目录、扩展名被 MIME 改成 .jfif，
+// 用户在「文件存放处」找不到，看起来就是「下载失败」。
+console.log("\n[BLOB] blob: 用 Range + Native Host 落盘，不用 <a download>");
+
+const inj = fs.readFileSync(path.join(ROOT, "extension", "inject-main.js"), "utf8");
+
+// runSave 里 blob 分支必须调 startMediaDownload，不能再调 doSaveBlob
+const rsStart = inj.indexOf("const runSave = (it, btn) => {");
+// 不能用 indexOf("    };") —— runSave 里有多层 if/return，第一个缩进 4 的 };
+// 出现得很早，截出来的片段漏掉 blob 分支，红测就变成了假红。
+let rsEnd = rsStart, depth = 0;
+for (let i = inj.indexOf("{", rsStart); i < inj.length; i++) {
+  if (inj[i] === "{") depth++;
+  else if (inj[i] === "}") { depth--; if (depth === 0) { rsEnd = i + 1; break; } }
+}
+const runSave = inj.slice(rsStart, rsEnd);
+// 只取 blob 分支自己的花括号体：注释里会出现 doSaveBlob 字样（讲为什么不用它），
+// 用正则窗口扫整段会把注释当代码，红测就成了假红。
+let blobBody = "";
+{
+  const at = runSave.indexOf("/^blob:/i.test(it.key)");
+  if (at >= 0) {
+    const open = runSave.indexOf("{", runSave.indexOf(")", at));
+    let d = 0;
+    for (let i = open; i < runSave.length; i++) {
+      if (runSave[i] === "{") d++;
+      else if (runSave[i] === "}") { d--; if (d === 0) { blobBody = runSave.slice(open + 1, i); break; } }
+    }
+  }
+}
+const blobCode = blobBody.replace(/\/\/.*$/gm, "");   // 去掉行注释只留代码
+check("[BLOB] runSave 的 blob 分支走 startMediaDownload",
+  /startMediaDownload\s*\(/.test(blobCode), blobCode.slice(0, 240));
+check("[BLOB] runSave 的 blob 分支不再调 doSaveBlob",
+  !/doSaveBlob\s*\(/.test(blobCode), blobCode.slice(0, 240));
+
+// probeTotal / fetchRange 必须支持 blob:（它们本来就走 fetch，天然支持，但要防止以后加守卫）
+check("[BLOB] probeTotal 没有把 blob: 挡掉",
+  !/function probeTotal[\s\S]{0,400}?\/\^https\?:\/[:]?[\s\S]{0,80}?return 0/.test(inj),
+  "blob: would be rejected");
+check("[BLOB] range 下载入口接受 blob:",
+  /\/\^\(https\?\|blob\):\/i|blob:/.test(inj), "blob: not handled");
+
+// downloadBlob 保留（MSE / 兜底还要用），但不能再是 blob 主通路
+check("[BLOB] downloadBlob 仍存在（MSE 兜底用）", /async function downloadBlob\s*\(/.test(inj), "removed");
+check("[BLOB] doSaveBlob 仍存在（旧链路/兜底）", /async function doSaveBlob\s*\(/.test(inj), "removed");
+
+// 真机证据留档：文件必须落在 Native Host 的 outdir，而不是 Chrome 下载目录
+check("[BLOB] 注释里写清了「不能走 <a download>」的原因",
+  /Chrome 默认下载目录|落不到|outdir/.test(inj), "no rationale");
+
+// ---------------------------------------------------------------- [EXT] 扩展名按内容判定
+// 真机 2026-10-21：Telegram 图片存成「真机测试图.mp4」，十六进制却是 ffd8ffe0（JPEG）。
+// 根因：sniffExt 只认音视频魔数，guessExtFromType 只认 audio/* video/*，
+// 两者都没命中就兜到写死的 ".mp4"。
+console.log("\n[EXT] 扩展名按字节/Content-Type 判定，认不出来也不硬写 .mp4");
+
+{
+  // 把 sniffExt / extOf / guessExtFromType / ascii 切出来真跑
+  const extStart = inj.indexOf("  function extOf(mime)");
+  const extEnd = inj.indexOf("  function sanitize(name)");
+  const asciiAt = inj.indexOf("  function ascii(b, off, len)");
+  const asciiEnd = inj.indexOf("\n  }", asciiAt) + 4;
+  const sniffAt = inj.indexOf("  function sniffExt(b)");
+  let d = 0, sniffEnd = sniffAt;
+  for (let i = inj.indexOf("{", sniffAt); i < inj.length; i++) {
+    if (inj[i] === "{") d++;
+    else if (inj[i] === "}") { d--; if (d === 0) { sniffEnd = i + 1; break; } }
+  }
+  const gAt = inj.indexOf("  function guessExtFromType(ct)");
+  let g2 = 0, gEnd = gAt;
+  for (let i = inj.indexOf("{", gAt); i < inj.length; i++) {
+    if (inj[i] === "{") g2++;
+    else if (inj[i] === "}") { g2--; if (g2 === 0) { gEnd = i + 1; break; } }
+  }
+  const imgAt = inj.indexOf("  const IMG_MIME_EXT = {");
+  const imgEnd = inj.indexOf("};", imgAt) + 2;
+
+  const src = [
+    inj.slice(extStart, extEnd),
+    inj.slice(asciiAt, asciiEnd),
+    inj.slice(imgAt, imgEnd),
+    inj.slice(sniffAt, sniffEnd),
+    inj.slice(gAt, gEnd),
+    "this.__sniffExt = sniffExt; this.__guessExt = guessExtFromType;",
+  ].join("\n");
+  const ctx = { __sniffExt: null, __guessExt: null };
+  vm.createContext(ctx);
+  vm.runInContext(src, ctx, { filename: "ext" });
+
+  const b = (...n) => new Uint8Array(n.concat(new Array(16).fill(0)).slice(0, 16));
+
+  check("[EXT] JPEG 魔数 → .jpg",
+    ctx.__sniffExt(b(0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01)) === ".jpg",
+    String(ctx.__sniffExt(b(0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01))));
+  check("[EXT] PNG 魔数 → .png",
+    ctx.__sniffExt(b(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0)) === ".png",
+    String(ctx.__sniffExt(b(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0))));
+  check("[EXT] GIF 魔数 → .gif",
+    ctx.__sniffExt(new Uint8Array([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0])) === ".gif", "bad");
+  check("[EXT] WEBP 魔数 → .webp",
+    ctx.__sniffExt(new Uint8Array([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50])) === ".webp", "bad");
+  check("[EXT] mp4 魔数不受影响",
+    ctx.__sniffExt(new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d])) === ".mp4", "bad");
+
+  check("[EXT] image/jpeg → .jpg（原先返回 null）", ctx.__guessExt("image/jpeg") === ".jpg", String(ctx.__guessExt("image/jpeg")));
+  check("[EXT] image/png → .png", ctx.__guessExt("image/png") === ".png", String(ctx.__guessExt("image/png")));
+  check("[EXT] 带 charset 也能认", ctx.__guessExt("image/jpeg; charset=binary") === ".jpg", String(ctx.__guessExt("image/jpeg; charset=binary")));
+  check("[EXT] video/mp4 仍走原路", ctx.__guessExt("video/mp4") === ".mp4", String(ctx.__guessExt("video/mp4")));
+
+  // 认不出来的兜底不能再写死 .mp4
+  check("[EXT] 两处兜底都不再硬写 .mp4",
+    !/sniffExt\([^)]*\)\s*\|\|\s*guessExtFromType\([^)]*\)\s*\|\|\s*"\.mp4"/.test(inj),
+    "still falls back to .mp4");
 }
 
 console.log("\n==============================================");
