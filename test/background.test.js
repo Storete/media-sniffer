@@ -1100,6 +1100,58 @@ console.log("\n[HLSP] applyHlsPageTitle：把页面标题借给真 m3u8 条目")
     apply(mixed) === false && mixed.length === 2);
 }
 
+// 2026-10-22 真机（4kvm）：m3u8 地址是「播放一次生成一个」的，重载页面就换新 hex，
+// 旧地址 5 分钟就 404。用户在列表里看到的条目往往已经放了一会儿，于是「点下载 →
+// 报错」变成常态。处理是「报错 → reload 页面 → 等新的 m3u8 → 自动重下一次」。
+// 这里测两个纯判定：什么时候该重试、等到的地址算不算数。
+{
+  const bgsrc = fs.readFileSync(BG, "utf8");
+  check("[HRTY] 有 shouldRetryHls / retriedHlsUrl",
+    /function shouldRetryHls\(/.test(bgsrc) && /function retriedHlsUrl\(/.test(bgsrc));
+  check("[HRTY] 报错分支真的会 reload 标签页", /chrome\.tabs\.reload\(job\.tabId\)/.test(bgsrc));
+  check("[HRTY] found 分支接住了刷新后的新 m3u8", /maybeUseRetriedHls\(tid, p\)/.test(bgsrc));
+  // 4kvm 的 m3u8 只由 webRequest 抓到（页面侧只有 og:title），只在 ms:page 分支接
+  // 会永远等不到新地址 —— 真机第一次验证就栽在这（报错后 pending 一直挂着）
+  check("[HRTY] webRequest 抓到的新 m3u8 也能接住",
+    /maybeUseRetriedHls\(d\.tabId, \{ key: d\.url \}\)/.test(bgsrc));
+
+  const code = [
+    extractFn(bgsrc, "isHlsUrl"),
+    extractFn(bgsrc, "shouldRetryHls"),
+    extractFn(bgsrc, "retriedHlsUrl"),
+  ].join("\n");
+  check("[HRTY] 三个函数都能抽出来", code.indexOf("function retriedHlsUrl(") > 0);
+
+  const rctx = vm.createContext({ URL, RegExp, String, Date, console });
+  vm.runInContext(code, rctx, { filename: "hls-retry" });
+  const should = vm.runInContext("shouldRetryHls", rctx);
+  const pick = vm.runInContext("retriedHlsUrl", rctx);
+
+  const okJob = { hls: true, retried: false, tabId: 12 };
+  check("[HRTY] m3u8 + 404 -> 重试", should(okJob, "拉取播放列表失败：HTTP 404 Not Found") === true);
+  check("[HRTY] m3u8 + 「地址有时效」-> 重试", should(okJob, "该站地址有时效，请刷新页面后重试") === true);
+  check("[HRTY] 403 防盗链不重试（刷新页面没用）",
+    should(okJob, "下载分片失败（0/531 已下）：HTTP Error 403: Forbidden") === false);
+  check("[HRTY] 非 m3u8 不重试（mp4 直链失效重试也没意义）",
+    should({ hls: false, retried: false, tabId: 1 }, "HTTP 404") === false);
+  check("[HRTY] 已经重试过的不再重试（避免刷新风暴）",
+    should({ hls: true, retried: true, tabId: 1 }, "HTTP 404") === false);
+  check("[HRTY] 没有 tabId 不重试（不知道刷哪个页）",
+    should({ hls: true, retried: false, tabId: null }, "HTTP 404") === false);
+  check("[HRTY] 空 job 不炸", should(null, "HTTP 404") === false);
+
+  const pend = { oldUrl: "https://oss.example.com/m3u8/111.m3u8", deadline: 1000 };
+  check("[HRTY] 页面重放旧地址时不拿它重下（只会再 404 一次）",
+    pick(pend, "https://oss.example.com/m3u8/111.m3u8", 500) === "");
+  check("[HRTY] 出现新 m3u8 时返回它",
+    pick(pend, "https://oss.example.com/m3u8/222.m3u8", 500) === "https://oss.example.com/m3u8/222.m3u8");
+  check("[HRTY] 超时后不返回（不挂一个永不兑现的等待）",
+    pick(pend, "https://oss.example.com/m3u8/222.m3u8", 2000) === "");
+  check("[HRTY] 新上报的是网页地址（页面条目）不认",
+    pick(pend, "https://www.4kvm.net/play/ch0y0e044", 500) === "");
+  check("[HRTY] 没有等待任务时返回空", pick(undefined, "https://a.com/x.m3u8", 500) === "");
+}
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

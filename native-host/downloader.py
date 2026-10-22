@@ -7,9 +7,10 @@
   Chrome 的 service worker / 扩展弹窗随时可能被回收，如果下载跑在 native host
   里，一关弹窗就断了。这里让下载彻底独立，宿主死了也照下不误。
 
-三条下载路径（main() 里按 URL 特征分发）：
+四条下载路径（main() 里按 URL 特征分发）：
   · run_merge     音视频分离的两条流 → ffmpeg -c copy 合单文件（B 站）
   · run_ytdlp     m3u8 / mpd / 站点页 → yt-dlp（HLS 分片支持最好）
+  · run_hls_self  伪装分片的 m3u8（分片是「图片壳 + TS」）→ 自己并发拉、剥壳、拼 TS
   · run_urllib    已知直链 → 自己发 Range 请求（最简单可控，支持续传）
 
 状态写 %LOCALAPPDATA%\\MediaSniffer\\jobs\\<id>.json，宿主轮询它回传进度。
@@ -24,10 +25,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urljoin
 
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MediaSniffer")
 
@@ -469,6 +472,392 @@ def run_urllib(job):
         write_status(job_id, status="error", message=str(e)[:400])
 
 
+# ---------------------------------------------------------------- HLS 自下载（伪装分片）
+
+TS_PACKET = 188      # MPEG-TS 固定包长
+MASQ_SCAN = 4096     # 壳最多在这段前缀里找 TS 同步
+MASQ_SYNC = 5        # 连续几个包对得上才算认出
+
+
+def looks_like_hls_url(url):
+    """只看 pathname 是不是 .m3u8（不看 query）。
+
+    和扩展侧 isHlsUrl 同一个判据，理由也同一个：`?url=xxx.m3u8` 那种跳转
+    链接抓到的是跳转前地址，判成 HLS 会误导。
+    """
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url or "").path.lower().endswith(".m3u8")
+    except Exception:
+        return False
+
+
+def strip_masquerade(data, scan=MASQ_SCAN, sync=MASQ_SYNC):
+    """剥掉「图片壳 + MPEG-TS」这种伪装分片的前导壳。
+
+    真机证据（2026-10-22，4kvm.net）：分片 URL 返回 `image/png`，前 112 字节
+    是一个 64×64 的 PNG（IHDR/pHYs/IDAT/IEND 齐全，IEND 正好结束在 112），
+    从 offset 112 起就是标准 TS —— 0x47 起始、188 周期取样 50/50 命中。
+    浏览器里 hls.js 用自定义 loader 剥壳后喂 MSE，所以「能播」；而 yt-dlp /
+    ffmpeg 不剥壳，拼出来就是坏文件或直接失败。
+
+    判据只认「TS 包周期」这一件事，不认壳的长度和格式：在头 scan 字节里找
+    第一个位置，使 offset + k*188 连续 sync 个都是 0x47。这样换成 JPEG/WEBP
+    壳、壳长变了都照样能剥；真图片里零星的 0x47 也不会被误判（要求连续命中）。
+    """
+    if not data or data[0:1] == b"\x47":
+        return data
+    limit = min(len(data), scan)
+    # 分片特别短时按实际长度放宽要求，但至少 2 个包；连 2 个包都放不下就不动
+    need = max(2, min(sync, len(data) // TS_PACKET))
+    for off in range(limit):
+        if data[off] != 0x47:
+            continue
+        ok = True
+        for k in range(1, need):
+            j = off + k * TS_PACKET
+            if j >= len(data) or data[j] != 0x47:
+                ok = False
+                break
+        if ok:
+            return data[off:]
+    return data
+
+
+def parse_hls_playlist(text, base_url):
+    """解析 m3u8，返回：
+
+        kind       "master"（多码率）还是 "media"（分片清单）
+        child      master 里 BANDWIDTH 最大的子清单地址
+        segments   media 的分片地址（已按 base_url 补成绝对地址）
+        init       EXT-X-MAP 的初始化段（fMP4 才需要）
+        encrypted  是否有 EXT-X-KEY（METHOD 不是 NONE）
+        key_url    密钥地址
+        byterange  是否用了 EXT-X-BYTERANGE（自实现不支持，交回 yt-dlp）
+
+    地址补全必须用 urljoin：站方给相对路径（`seg-1.ts`）和站内绝对路径
+    （`/abs/seg-2.ts`）都很常见，直接拼字符串会拼出 `.../a/b//abs/...` 这种。
+    """
+    info = {
+        "kind": "media", "child": "", "segments": [], "init": "",
+        "encrypted": False, "key_url": "", "byterange": False,
+    }
+    best_bw = -1
+    pending_bw = None
+    for raw in (text or "").splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        if ln.startswith("#"):
+            if ln.startswith("#EXT-X-STREAM-INF"):
+                info["kind"] = "master"
+                m = re.search(r"BANDWIDTH=(\d+)", ln)
+                pending_bw = int(m.group(1)) if m else 0
+            elif ln.startswith("#EXT-X-KEY"):
+                m = re.search(r"METHOD=([^,\s]+)", ln)
+                method = (m.group(1) if m else "").upper()
+                if method and method != "NONE":
+                    info["encrypted"] = True
+                    km = re.search(r'URI="([^"]+)"', ln)
+                    if km:
+                        info["key_url"] = urljoin(base_url, km.group(1))
+            elif ln.startswith("#EXT-X-MAP"):
+                km = re.search(r'URI="([^"]+)"', ln)
+                if km:
+                    info["init"] = urljoin(base_url, km.group(1))
+            elif ln.startswith("#EXT-X-BYTERANGE"):
+                info["byterange"] = True
+            continue
+        url = urljoin(base_url, ln)
+        if pending_bw is not None:
+            if pending_bw > best_bw:
+                best_bw = pending_bw
+                info["child"] = url
+            pending_bw = None
+        else:
+            info["segments"].append(url)
+    return info
+
+
+def _hls_get(url, headers, timeout=45, retries=2):
+    """取一段字节。分片几百上千个，偶发 5xx/超时很常见，小重试比整单失败划算。"""
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            # 4xx 重试没用（地址过期/防盗链就是这个），直接抛
+            if 400 <= e.code < 500:
+                raise
+            last = e
+        except Exception as e:
+            last = e
+        if attempt < retries:
+            time.sleep(0.6 * (attempt + 1))
+    raise last
+
+
+def _header_variants(headers):
+    """分片请求的候选头组合，按「先原样、再逐项降级」排序，最多 4 档。
+
+    真机（2026-10-22，4kvm / xhscdn）：同一片带 Referer 请求是 **403**，把
+    Referer 去掉才 200 —— 和大多数站相反（一般缺 Referer 才拒），因为浏览器侧
+    是 hls.js 用 `referrerPolicy: no-referrer` 发的包。所以不能写死带或不带，
+    只能按顺序探一档：
+
+        原样 → 去 Referer → 去 Referer+Origin → 只留 UA/Cookie
+
+    顺序即优先级：越靠前越接近抓取时的真实请求，越不容易被当成爬虫。
+    """
+    def drop(keys):
+        keys = {k.lower() for k in keys}
+        return {k: v for k, v in headers.items() if k.lower() not in keys}
+
+    out = [dict(headers)]
+    no_ref = drop(["referer"])
+    if no_ref != out[-1]:
+        out.append(no_ref)
+    bare = drop(["referer", "origin"])
+    if bare != out[-1]:
+        out.append(bare)
+    ua_only = {k: v for k, v in headers.items() if k.lower() in ("user-agent", "cookie")}
+    if ua_only != out[-1]:
+        out.append(ua_only)
+    return out
+
+
+def run_hls_self(job, quiet=False):
+    """自己下 HLS：并发拉分片 → 剥伪装壳 → 按序拼成 TS → 尽力转封装。
+
+    为什么不用 yt-dlp：它按 HLS 规范把分片当字节流拼接，不认「图片壳」；
+    这个站点的 514 个分片全部是「112 字节 PNG + TS」，yt-dlp 必然失败
+    （实测 `unable to download video data: HTTP Error 404`）。
+
+    返回 True 表示已经接管并写了最终状态；False 表示这单不适合自实现
+    （AES 加密 / BYTERANGE / 没有分片），调用方可以继续 fallback。
+    quiet=True 时「不适合接管」不写状态，免得把 yt-dlp 的原始报错冲掉。
+    """
+    job_id = job["id"]
+    outdir = job.get("outdir") or DEFAULT_OUT
+    os.makedirs(outdir, exist_ok=True)
+
+    headers = {"User-Agent": job.get("ua") or UA}
+    if job.get("referer"):
+        headers["Referer"] = job["referer"]
+    if job.get("cookie"):
+        headers["Cookie"] = job["cookie"]
+    for hk, hv in (job.get("headers") or {}).items():
+        name_k = str(hk).title()
+        if name_k not in headers:
+            headers[name_k] = hv
+
+    def bail(msg, take_over=True):
+        if take_over or not quiet:
+            write_status(job_id, status="error", message=_short(msg, 300))
+        return take_over
+
+    write_status(job_id, status="downloading", percent=0, speed="", eta="",
+                 file="", message="解析播放列表")
+
+    try:
+        text = _hls_get(job["url"], headers).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return bail("拉取播放列表失败：HTTP %d %s（该站地址有时效，请刷新页面后重试）"
+                    % (e.code, e.reason))
+    except Exception as e:
+        return bail("拉取播放列表失败：%s" % e)
+
+    base = job["url"]
+    info = parse_hls_playlist(text, base)
+    if info["kind"] == "master":
+        if not info["child"]:
+            return bail("多码率清单里没找到子清单")
+        base = info["child"]
+        try:
+            text = _hls_get(base, headers).decode("utf-8", "replace")
+        except Exception as e:
+            return bail("拉取子清单失败：%s" % e)
+        info = parse_hls_playlist(text, base)
+
+    if info["encrypted"] or info["byterange"]:
+        # 这两种 yt-dlp 处理得比我们好（它能拉密钥、能按 BYTERANGE 取片），
+        # 不该抢过来 —— 抢过来只会把「能下」变成「不能下」。
+        return bail("AES 加密 / BYTERANGE 清单，交回 yt-dlp 处理", take_over=False)
+    if not info["segments"]:
+        return bail("清单里没有分片（可能是空清单或地址已失效）")
+
+    name = sanitize(job.get("filename") or "", "video")
+    root, _ext = os.path.splitext(name)
+    root = root or "video"
+    ts_path = os.path.join(outdir, root + ".ts")
+    n = 1
+    while os.path.exists(ts_path):
+        ts_path = os.path.join(outdir, "%s (%d).ts" % (root, n))
+        n += 1
+    part = ts_path + ".part"
+
+    segs = info["segments"]
+    total = len(segs)
+    workers = max(1, min(16, int(job.get("concurrency") or 8)))
+    done_bytes = 0
+    done_segs = 0
+    t0 = time.time()
+
+    # 第一片当探针：既确认分片真能取（地址没过期），也把头组合定下来。
+    #
+    # 为什么必须探：真机（4kvm / xhscdn）**带 Referer 403、不带才 200**，和大多数
+    # 站的防盗链方向相反（一般缺 Referer 才拒）；浏览器侧是 hls.js 用
+    # referrerPolicy:no-referrer 发的包。写死任何一个方向都会让另一半站点失效，
+    # 所以按 _header_variants 的顺序一档档试，试通哪档整单沿用。
+    first_data = None
+    first_err = None
+    for hv in _header_variants(headers):
+        try:
+            first_data = strip_masquerade(_hls_get(segs[0], hv))
+            headers = hv
+            first_err = None
+            break
+        except Exception as e:
+            first_err = e
+    if first_data is None:
+        return bail("下载分片失败（0/%d 已下）：%s。该站地址有时效，刷新页面后重试"
+                    % (total, first_err))
+
+    # 滑动窗口：线程池负责下载，主线程严格按 index 顺序取结果写盘。
+    # 不把整片下载到内存再拼（514×2.7MB ≈ 1.4GB），也不落成几百个临时文件
+    # （本机 safe-delete 一次删 >50 个文件会被拦，下载会卡在清理阶段）。
+    from concurrent.futures import ThreadPoolExecutor
+
+    sem = threading.Semaphore(workers * 2)
+
+    def fetch(i):
+        try:
+            if i == 0:
+                return first_data      # 探针已经下过了，别重复请求
+            return strip_masquerade(_hls_get(segs[i], headers))
+        finally:
+            sem.release()
+
+    cancelled = False
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            pending = {}
+            nxt = 0
+            submitted = 0
+            with open(part, "wb") as f:
+                if info["init"]:
+                    f.write(strip_masquerade(_hls_get(info["init"], headers)))
+                while nxt < total:
+                    while submitted < total and submitted - nxt < workers * 2:
+                        sem.acquire()
+                        pending[submitted] = ex.submit(fetch, submitted)
+                        submitted += 1
+                    data = pending.pop(nxt).result()
+                    f.write(data)
+                    done_bytes += len(data)
+                    done_segs += 1
+                    nxt += 1
+
+                    if done_segs % 5 == 0 or nxt == total:
+                        elapsed = max(0.001, time.time() - t0)
+                        speed = done_bytes / elapsed
+                        pct = done_segs / total * 100
+                        eta = ""
+                        if done_segs:
+                            per = elapsed / done_segs
+                            eta = "%ds" % int(per * (total - done_segs))
+                        # message 要清空：上面写的是「解析播放列表」，不清会一直
+                        # 挂在进度条上，看起来像卡在第一步（真机 v1.3.30 首测）。
+                        write_status(job_id, percent=round(pct, 1),
+                                     speed=fmt_speed(speed), eta=eta, message="")
+                    if is_cancelled(job_id):
+                        cancelled = True
+                        raise _Cancelled()
+        os.replace(part, ts_path)
+    except _Cancelled:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        write_status(job_id, status="cancelled", percent=0, message="用户取消")
+        return True
+    except Exception as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return bail("下载分片失败（%d/%d 已下）：%s" % (done_segs, total, e))
+
+    if os.path.getsize(ts_path) <= 0:
+        return bail("拼出来的文件是空的")
+
+    # 转封装成 mp4：-c copy 不重编码，几秒到几十秒。失败不算失败 ——
+    # TS 本身就是完整可播的视频（mpv/VLC/PotPlayer 都能放），删掉才是真的白干。
+    # 失败原因要写进 message：只说「没转成 mp4」用户没法判断是文件坏了还是
+    # 只是格式没转（真机 v1.3.30 首测就是这种情况，得再捞一次 ffmpeg 的报错）。
+    remux_err = ""
+    if job.get("remux", True):
+        ffmpeg = find_tool(["ffmpeg"])
+        if ffmpeg:
+            out_mp4 = ts_path[:-3] + ".mp4"
+            # 输出先写系统临时目录再搬回来。
+            #
+            # 本机实测（2026-10-22，三次）：ffmpeg 直接往下载目录写 mp4 一律报
+            # `Error opening output files: Permission denied`，同一目录下 python
+            # 自己写 1.3GB 的 .ts 完全正常；换成 .part 后缀也一样被拒 —— 说明不是
+            # 扩展名黑白名单，而是 ffmpeg 这个进程本身写不了那个目录（安全软件限制
+            # 未签名 exe 的写入比较常见）。临时目录通常不在限制范围内，试过再谈。
+            tmp_mp4 = os.path.join(tempfile.gettempdir(), "ms-remux-%s.mp4" % job_id)
+            write_status(job_id, status="merging", percent=100, message="转封装 mp4")
+            try:
+                r = subprocess.run(
+                    [ffmpeg, "-y", "-i", ts_path, "-c", "copy", "-f", "mp4",
+                     "-nostdin", "-hide_banner",
+                     "-loglevel", "error", tmp_mp4],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=1800, **_NO_WINDOW,
+                )
+                ok = r.returncode == 0 and os.path.isfile(tmp_mp4) and os.path.getsize(tmp_mp4) > 0
+                if not ok:
+                    tail = [ln for ln in (r.stderr or "").splitlines() if ln.strip()]
+                    remux_err = (tail[-1] if tail else "ffmpeg 退出码 %s" % r.returncode)[:180]
+            except Exception as e:
+                ok = False
+                remux_err = str(e)[:180]
+            if ok:
+                try:
+                    shutil.move(tmp_mp4, out_mp4)
+                except Exception as e:
+                    remux_err = "搬到下载目录失败：%s" % e
+                    ok = False
+            if not ok:
+                try:
+                    os.remove(tmp_mp4)
+                except OSError:
+                    pass
+            if ok:
+                try:
+                    os.remove(ts_path)
+                except OSError:
+                    pass
+                write_status(job_id, status="done", percent=100, speed="", eta="",
+                             file=out_mp4, message="已拼成完整视频")
+                return True
+
+    msg = "已拼成完整视频（TS 容器，播放器能直接放）"
+    if remux_err:
+        msg += "；转 mp4 失败：" + remux_err
+    write_status(job_id, status="done", percent=100, speed="", eta="",
+                 file=ts_path, message=msg)
+    return True
+
+
+class _Cancelled(Exception):
+    """内部用的取消信号：跳出滑动窗口循环，由外层统一收尾。"""
+
+
 def fmt_speed(bps):
     """字节/秒 → 「1.5 MB/s」。B/s 不显示小数（「1 B/s」比「1.00 B/s」自然）"""
     for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
@@ -679,6 +1068,22 @@ def main():
                  or "format=m3u8" in low)
         )
         if use_ytdlp:
+            # m3u8 先走自实现，而不是先 yt-dlp。
+            #
+            # 理由是「壳只有下第一片才知道」：伪装分片站（4kvm，2026-10-22）的
+            # 清单长得完全正常，yt-dlp 会一路重试到超时（514 个分片 × --retries 10
+            # × --fragment-retries 10，实测几分钟还停在 percent 0），用户只能干等。
+            # 自实现剥壳对普通 HLS 是原样透传（strip_masquerade 认不出壳就返回原
+            # 字节），所以先自己试没有副作用；搞不定（AES 加密 / BYTERANGE / 拉不
+            # 到清单）再由 yt-dlp 接手。
+            hls_msg = ""
+            if looks_like_hls_url(url):
+                if run_hls_self(job, quiet=True):
+                    st_h = read_status(job_id)
+                    if st_h.get("status") == "done":
+                        return
+                    hls_msg = st_h.get("message") or ""
+
             run_ytdlp(job, ytdlp, ffmpeg)
             # yt-dlp 失败时给一次普通 HTTP 下载的机会：很多「302/403」只是 yt-dlp
             # 的站点识别误判，真正带 cookie/referer 的直连反而能下。
@@ -688,10 +1093,12 @@ def main():
                 run_urllib(job)
                 st2 = read_status(job_id)
                 if st2.get("status") == "error":
-                    write_status(
-                        job_id, status="error",
-                        message=_short("yt-dlp: " + ytdlp_msg + " ／ 直连: " + (st2.get("message") or "")),
-                    )
+                    parts = []
+                    if hls_msg:
+                        parts.append("自实现 HLS: " + hls_msg)
+                    parts.append("yt-dlp: " + ytdlp_msg)
+                    parts.append("直连: " + (st2.get("message") or ""))
+                    write_status(job_id, status="error", message=_short(" ／ ".join(parts)))
         else:
             run_urllib(job)
     except Exception as e:

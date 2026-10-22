@@ -301,6 +301,8 @@ function record(d) {
     if (hdr && !existed.hdr) existed.hdr = hdr;
     confirmPageItem(existed);
     flushSoon(d.tabId);
+    // 已存在的条目也可能是「刷新后重新上报的新地址」，这里也要接一次
+    maybeUseRetriedHls(d.tabId, { key: d.url });
     return;
   }
 
@@ -321,6 +323,10 @@ function record(d) {
   rec.items.get(d.url).f = fileNameOf(d.url);
   flushSoon(d.tabId);
   bumpBadge(d.tabId, kind, rec);
+  // 「地址过期自动重取」必须在这里也接一次：4kvm 这类站的 m3u8 **只由 webRequest
+  // 抓到**（页面侧只有 og:title 那条页面条目），只挂在 ms:page 的 found 分支上
+  // 会永远等不到新地址（2026-10-22 真机就是这个原因才没自动恢复）。
+  maybeUseRetriedHls(d.tabId, { key: d.url });
 }
 
 /**
@@ -1517,7 +1523,132 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 // ---------------------------------------------------------------- Native Host
 
 let nativePort = null;
-const downloads = new Map(); // id -> {url, status}
+const downloads = new Map(); // id -> {url, status, tabId, hls, kind, filename, referer, headers}
+
+// ---------------------------------------------------------------- HLS 地址过期自动重取
+//
+// 2026-10-22 真机（4kvm）：m3u8 地址是「播放一次生成一个」的 —— 重载页面就换成
+// 新的 32 位 hex，旧地址实测 5 分钟内就 404。用户在列表里看到的条目往往已经放了
+// 一会儿，于是「点下载 → 报错」变成常态，主观上就是「这个站下不了」。
+//
+// 处理：宿主报「地址有时效 / 404」时，自动 reload 这个标签页，等页面重新上报一条
+// **新的** m3u8，再用新地址重下（只重试一次，避免刷新风暴）。用户看到的是页面闪
+// 一下，进度条接着走。
+const pendingHlsRetry = new Map(); // tabId -> {oldUrl, kind, filename, referer, headers, deadline}
+
+/** 发起一次本地下载。popup 点「下载」和「过期自动重下」都走这里 */
+async function startNativeDownload(o) {
+  const settings = await getSettings();
+  const cookie = settings.useCookies ? await buildCookieHeader(o.url) : "";
+  const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+  downloads.set(id, {
+    url: o.url,
+    status: "starting",
+    tabId: o.tabId == null ? null : o.tabId,
+    hls: isHlsUrl(o.url),
+    kind: o.kind || "other",
+    filename: o.filename || "",
+    referer: o.referer || "",
+    headers: o.headers || {},
+  });
+  postNative({
+    action: "download",
+    id,
+    url: o.url,
+    kind: o.kind || "other",
+    filename: o.filename || "",
+    referer: o.referer || "",
+    tabUrl: o.tabUrl || "",
+    cookie,
+    // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
+    // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
+    headers: o.headers || {},
+    concurrency: settings.concurrency || 16,
+    outdir: settings.outdir || "",
+  });
+  return { id };
+}
+
+/**
+ * 这单要不要「刷新页面重取地址」？
+ *
+ * 抽成纯函数是为了能单测：真实触发路径要 chrome.tabs.reload + 宿主重启，跑不起来。
+ * 判据三条缺一不可：是 m3u8、还没重试过、错因确实是地址过期/404。
+ * 别的错误（403 防盗链、磁盘满、ffmpeg 失败）刷新页面没用，只会白刷一次。
+ */
+function shouldRetryHls(job, message) {
+  if (!job || !job.hls || job.retried || job.tabId == null) return false;
+  return /时效|过期|\b404\b/.test(String(message || ""));
+}
+
+/** 宿主报错时判断要不要刷新页面重取地址。只在 m3u8 + 时效类报错上触发一次 */
+function maybeStartHlsRetry(msg) {
+  const isErr = msg && (msg.action === "error" || msg.status === "error");
+  if (!isErr || !msg.id) return;
+  const job = downloads.get(msg.id);
+  if (!shouldRetryHls(job, msg.message)) return;
+  job.retried = true;
+  pendingHlsRetry.set(job.tabId, {
+    oldUrl: job.url,
+    kind: job.kind,
+    filename: job.filename,
+    referer: job.referer,
+    headers: job.headers,
+    // 120 秒而不是 25：页面 reload + 重新拉流实测要 10~20 秒，慢网络或
+    // 站方延迟初始化播放器时更久。等不到就白刷一次页面，不如等久点。
+    deadline: Date.now() + 120000,
+  });
+  try {
+    chrome.tabs.reload(job.tabId);
+  } catch (e) {
+    pendingHlsRetry.delete(job.tabId);
+  }
+}
+
+/**
+ * 页面重新上报某条目时，判断它是不是我们要等的「新 m3u8」。
+ * 返回可用的新地址；返回空串表示继续等（或已经过期）。
+ *
+ * 必须排除 oldUrl：reload 之后页面可能先重放一遍**缓存里的旧地址**，拿它重下
+ * 只会再 404 一次，而重试机会只有一次。
+ */
+function retriedHlsUrl(pend, key, now) {
+  if (!pend) return "";
+  if (now > pend.deadline) return "";
+  const u = String(key || "");
+  if (!isHlsUrl(u) || u === pend.oldUrl) return "";
+  return u;
+}
+
+/** 页面重新上报条目时，出现「新的」m3u8 就用它重下一次 */
+function maybeUseRetriedHls(tabId, p) {
+  const pend = pendingHlsRetry.get(tabId);
+  if (!pend) return;
+  const u = retriedHlsUrl(pend, p && p.key, Date.now());
+  if (!u) {
+    // 超时的清掉，避免一直挂着一个永远不会兑现的等待
+    if (Date.now() > pend.deadline) pendingHlsRetry.delete(tabId);
+    return;
+  }
+  pendingHlsRetry.delete(tabId);
+  startNativeDownload({
+    url: u,
+    kind: pend.kind,
+    filename: pend.filename,
+    referer: pend.referer,
+    headers: pend.headers,
+    tabId,
+    tabUrl: "",
+  }).then((r) => {
+    chrome.runtime.sendMessage({
+      type: "native:progress",
+      msg: {
+        id: r.id, action: "progress", status: "downloading", percent: 0,
+        message: "视频地址已过期，已刷新页面重新开始",
+      },
+    }).catch(() => {});
+  }).catch(() => { /* 宿主没起来时 popup 自己会报连接失败 */ });
+}
 
 function connectNative() {
   if (nativePort) return nativePort;
@@ -1545,6 +1676,8 @@ function connectNative() {
       const job = downloads.get(msg.id) || {};
       Object.assign(job, msg);
       downloads.set(msg.id, job);
+      // 地址过期（m3u8 一次性）时自动刷新页面重取 —— 见 maybeStartHlsRetry 的注释
+      maybeStartHlsRetry(msg);
     }
     chrome.runtime.sendMessage({ type: "native:progress", msg }).catch(() => {});
   });
@@ -1911,6 +2044,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         if (p.cmd === "found" || p.cmd === "progress") {
           recordPageMedia(tid, (sender.tab && sender.tab.url) || "", p);
+          // 上一轮下载因「地址过期」触发了 reload，这里接住页面重新上报的新 m3u8
+          if (p.cmd === "found") maybeUseRetriedHls(tid, p);
         } else if (p.cmd === "saved") {
           // 页面保存的成败都落进 host.log：失败以前只显示在页面右下角的进度卡里，
           // 用户一关页面就什么证据都不剩，排障无从下手（Telegram 首次真机排查就栽在这）
@@ -2003,26 +2138,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "native:download": {
         try {
-          const settings = await getSettings();
-          const cookie = settings.useCookies ? await buildCookieHeader(msg.url) : "";
-          const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
-          downloads.set(id, { url: msg.url, status: "starting" });
-          postNative({
-            action: "download",
-            id,
+          const r = await startNativeDownload({
             url: msg.url,
-            kind: msg.kind || "other",
-            filename: msg.filename || "",
-            referer: msg.referer || "",
-            tabUrl: msg.tabUrl || "",
-            cookie,
-            // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
-            // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
-            headers: msg.headers || {},
-            concurrency: settings.concurrency || 16,
-            outdir: settings.outdir || "",
+            kind: msg.kind,
+            filename: msg.filename,
+            referer: msg.referer,
+            tabUrl: msg.tabUrl,
+            headers: msg.headers,
+            tabId: msg.tabId,
           });
-          sendResponse({ ok: true, id });
+          sendResponse({ ok: true, id: r.id });
         } catch (e) {
           sendResponse({ ok: false, error: String(e.message || e) + "（是否已运行安装脚本？）" });
         }

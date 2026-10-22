@@ -961,6 +961,8 @@ async function startDownload(it, btn) {
     filename: it.f,
     referer: it.i || tabUrl,
     tabUrl,
+    // background 需要它才能在「地址过期」时刷新对应标签页重取 m3u8
+    tabId,
     // 抓取时实际发出的请求头（referer/origin/accept/accept-language/user-agent）。
     // 只带 referer 时，不少 CDN 会因为没有 Origin 或 Accept 直接 403。
     headers: it.hdr || null,

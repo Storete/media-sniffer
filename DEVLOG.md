@@ -10,6 +10,100 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-032 · 2026-10-22 · 4kvm 下载不下来：PNG 壳分片 + 一次性地址
+
+**问题**：用户问「https://www.4kvm.net/ 这个网站的功能实现了吗」。抓取侧完全正常
+（popup 只剩一行「无耻之徒(美版) 第二季 - 第1集 · HLS 流（视频）」），点下载必定失败。
+
+**两条根因，缺一条都解释不了现象**：
+
+1. **地址一次性/短时效**。同一条 m3u8，抓到后放 15 分钟再下就 `HTTP 404`；
+   刷新页面会换成一个全新的 hash 文件名（`93334d…` → `c15a6c…`）。
+   这不是防盗链（防盗链一般是 403），是**签发即作废的一次性签名**。
+2. **分片是伪装的**。把分片下下来看头部：`89 50 4E 47 0D 0A 1A 0A` 是 PNG 签名，
+   跟着 IHDR/pHYs/IDAT/IEND，`IEND` 结束在 **offset 112**，**紧接一个 `0x47`**——
+   之后按 188 字节采样，50/50 命中同步字节。也就是说：**112 字节 PNG 壳 + 真 MPEG-TS**。
+
+**排查中试过但不管用的**：
+
+- `yt-dlp --retries 10 --fragment-retries 10`：514 个分片，每个都重试 10 次，
+  进度卡在 0% 好几分钟——它把壳当数据下，拼出来的 TS 也不对。**分片数一多，
+  重试就成了灾难**：失败一次不是多花几秒，是 ×10。
+- 直接拼 TS（不剥壳）：ffmpeg 认不出流，报一堆 `Packet corrupt`。
+- Referer 方向**和常见站点相反**：4kvm/xhscdn 的分片**带 Referer → 403，
+  不带 → 200**。浏览器侧是 hls.js 用 `referrerPolicy: no-referrer` 发的，
+  所以「把 Referer 补上」这种常规修复在这里是反向操作。
+
+**修法一：自己下 HLS（`native-host/downloader.py`）**
+
+- `strip_masquerade(data)`：在**前 4096 字节**里找「连续 5 个包都是 0x47」的偏移，
+  从那里截断。不看固定 offset 112——站点随时可能改壳长度；也不信 `data[0]==0x47`
+  就早退（真 TS 原样返回，不误伤）。
+- `parse_hls_playlist(text, base_url)`：`urljoin` 补绝对地址；master 清单取
+  **最大 BANDWIDTH** 的子清单；`EXT-X-KEY` 出加密标记、`EXT-X-MAP` 出 init 段、`EXT-X-BYTERANGE` 出分片区间。
+- `run_hls_self(job)`：**先探一片**（4 档请求头依次试：原样 → 去 Referer →
+  去 Referer+Origin → 只留 UA/Cookie），哪档通就整单沿用；然后滑动窗口并发
+  （`Semaphore(workers*2)`）+ **主线按 index 顺序写盘**——不把 1.4 GB 读进内存，
+  也不落成几百个临时文件（本机 safe-delete 一次删 >50 文件会被拦，临时文件根本清不掉）。
+- `main()` 分派改成 **m3u8 先走自实现**，搞不定再 yt-dlp、再直连；
+  失败时三条原因**都保留**（不然用户只看到 yt-dlp 的 404，看不出是自己 HLS 那层先挂的）。
+
+**修法二：地址过期自动重取（`extension/background.js`）**
+
+报错里带「时效/过期/404」且这单是 m3u8、且还没重试过 → 记一条
+`pendingHlsRetry.set(tabId, {oldUrl, deadline})` → `chrome.tabs.reload(tabId)`；
+页面重新上报条目时，若出现**新的** m3u8（必须排除 `oldUrl`，reload 后页面会先重放
+缓存里的旧地址）就用它重下一次，并推一条「视频地址已过期，已刷新页面重新开始」。
+
+两个细节是踩出来的：
+
+- 等待窗口 **25 秒 → 120 秒**。第一次复验失败，SW 里是
+  `pending: [{"left":-63}]` 而新地址其实已经进 state 了——页面 reload + 重新拉流
+  实测要 10~20 秒，慢网络更久。
+- **`record()` 那两处也必须接线**。4kvm 的 m3u8 **只由 webRequest 抓到**，
+  不走 `ms:page` 的 found 分支；只接后者等于没接。
+
+**验证**：
+
+- 真机：`run_hls_self` 2.8% → 84.7%（约 18 MB/s），产物 1.3 GB `.ts`，
+  首字节 `0x47`、无 PNG 签名、大小等于 6 个分片净长之和、末尾对齐 188。
+- 端到端（全新 profile + `Extensions.loadUnpacked`）：拿一条**已过期**的
+  `93334d….m3u8` 发起下载 →
+  `t+6s` 报错「自实现 HLS: 拉取播放列表失败：HTTP 404」、`job.retried=true`、
+  等待表登记成功 → `t+9s` 等待表被消费、**出现新任务**、地址换成 `49d94eb…m3u8`
+  → 百分比 0.9 → 2.8 → 5.6 → … → 47.1%。**整条链路跑通**。
+- 测试：新增 `test/host_masquerade_test.py`（29 项，含本地 mock 服务器，
+  `/seg-*` 故意「带 Referer 一律 403」复刻真机方向）；`test/background.test.js`
+  新增 `[HRTY]` 18 项；`test/host_download_job_test.py` 补「三路全失败时自实现
+  HLS 的原因也保留」。JS 642 项 / Python 10 套全绿。
+
+**已知限制**：
+
+- **remux mp4 在本机一律 `Permission denied`**。试过 `.part` 后缀、`-f mp4` 显式容器、
+  写系统 temp 再 `shutil.move`，全失败；`bin/ffmpeg.exe` 在 WorkBuddy shell 里本身
+  也起不来（rc=3221226505），但**被 Chrome 拉起的宿主里能跑**。判定为本机安全软件
+  限制未签名 exe 写入，不是代码问题。TS 本身可播，所以 done + message 里说明原因。
+- 自动重取**只有一次机会**（`job.retried` 一次）。第二次还 404 就把错误如实抛给用户——
+  再刷页面也拿不到更新的地址，只是消耗站方一次请求。
+
+**教训**：
+
+1. **「下载失败」要分两层看**：能不能下（地址还有效吗）、下的对不对（数据是不是真视频）。
+   这次两条同时坏，只修一条都还是失败。
+2. **重试次数在分片场景是会放大的**。514 片 × retries 10 不是「多等一会」，
+   是把一次失败变成十分钟卡死——先判断分派顺序，别急着调大重试。
+3. **别信「加 Referer 更安全」**。防盗链方向可以是反的，用 4 档请求头探针实测，
+   比照抄经验可靠。
+
+**涉及文件**：`native-host/downloader.py`（`strip_masquerade` / `parse_hls_playlist` /
+`_hls_get` / `_header_variants` / `run_hls_self` / `main` 分派）、
+`extension/background.js`（`pendingHlsRetry` / `shouldRetryHls` / `retriedHlsUrl` /
+`maybeStartHlsRetry` / `maybeUseRetriedHls` / `record` 接线）、
+`extension/popup.js`（`native:download` 补 `tabId`）、`test/host_masquerade_test.py`（新）、
+`test/background.test.js`、`test/host_download_job_test.py`、`test/review.test.js`。
+
+---
+
 ## d-031 · 2026-10-22 · HLS 只下到播放列表却报「完成」
 
 **问题**：真机复验 A5 时，51cg1 那条 m3u8 点下载，进度条 0% → 100%、界面显示
@@ -332,6 +426,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-032](#d-032) | 2026-10-22 | 4kvm 下载不下来：PNG 壳分片 + 一次性地址 | 地址会过期（reload 重取）+ 分片是「112 字节 PNG 壳 + 真 TS」（按 0x47 周期剥壳）；防盗链方向是反的 |
 | [d-031](#d-031) | 2026-10-22 | HLS 只下到播放列表却报「完成」 | 判据落在产物文件头（`#EXTM3U`）而不是退出码：退出码 0 + 无 ERROR 仍可能是假的 |
 | [d-030](#d-030) | 2026-10-22 | Telegram 序号与焦点全失效 | Web K 把消息号换成 `data-mid` 且每层都有：取**最外层**，分组键改 mid 优先 |
 | [d-026](#d-026) | 2026-10-21 | B 站视频页图片只留封面 | 视频页判定改看 URL（`__playinfo__` 首屏为空、番剧页永远为空）；banner 全走 webRequest，得在 background 补一层 |
