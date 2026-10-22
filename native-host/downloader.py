@@ -315,6 +315,12 @@ def run_ytdlp(job, ytdlp, ffmpeg):
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
     os.makedirs(outdir, exist_ok=True)
+    if is_cancelled(job_id):
+        # 守卫放在最前面：取消标记可能是「上一路还在跑时」写下的，轮到这一路
+        # 时任务其实已经取消了。没有这道守卫，取消会被兜底路径覆盖成
+        # downloading 并继续下（真机 1.3.33 冒烟撞到）。
+        write_status(job_id, status="cancelled", percent=0, message="用户取消")
+        return
 
     base = sanitize(job.get("filename") or "", "video")
     base = os.path.splitext(base)[0] or "video"
@@ -485,6 +491,10 @@ def run_urllib(job):
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
     os.makedirs(outdir, exist_ok=True)
+    if is_cancelled(job_id):
+        # 同 run_ytdlp：这是 yt-dlp 失败后的兜底，取消的任务不该再被它捡起来。
+        write_status(job_id, status="cancelled", percent=0, message="用户取消")
+        return
 
     name = sanitize(job.get("filename") or os.path.basename(job["url"].split("?")[0]), "file")
     path = os.path.join(outdir, name)
@@ -695,7 +705,7 @@ def _hls_get(url, headers, timeout=45, retries=2):
     raise last
 
 
-def _fetch_segment(url, headers, attempts=None, backoff=None):
+def _fetch_segment(url, headers, attempts=None, backoff=None, should_stop=None):
     """取一个分片并剥壳，带「外层」退避重试。全失败返回 `(None, 最后一次错误)`。
 
     为什么 `_hls_get` 之外还要一层（2026-10-22 真机，用户自己的下载）：
@@ -710,11 +720,17 @@ def _fetch_segment(url, headers, attempts=None, backoff=None):
 
     4xx（地址过期 / 防盗链）不重试：`_hls_get` 已经直接抛，这里也不浪费预算，
     立刻把错误交回上层——那种错重试一百次还是同样的结果。
+
+    `should_stop` 每轮之前问一次：用户点了取消就别再花剩下的重试预算。没有它
+    的时候，取消要等在途分片把 3 轮退避跑完，实测量到 **70 秒**才真正停下来。
+    命中时抛 `_Cancelled`，由主线程的既有分支统一收尾（删 .part + 写 cancelled）。
     """
     attempts = SEG_ATTEMPTS if attempts is None else max(1, int(attempts))
     backoff = SEG_BACKOFF if backoff is None else float(backoff)
     last = None
     for i in range(attempts):
+        if should_stop is not None and should_stop():
+            raise _Cancelled()
         try:
             return strip_masquerade(_hls_get(url, headers)), None
         except urllib.error.HTTPError as e:
@@ -868,7 +884,8 @@ def run_hls_self(job, quiet=False):
         try:
             if i == 0:
                 return first_data, None   # 探针已经下过了，别重复请求
-            return _fetch_segment(segs[i], headers)
+            return _fetch_segment(segs[i], headers,
+                                  should_stop=lambda: is_cancelled(job_id))
         finally:
             sem.release()
 
@@ -1238,7 +1255,10 @@ def main():
             if looks_like_hls_url(url):
                 if run_hls_self(job, quiet=True):
                     st_h = read_status(job_id)
-                    if st_h.get("status") == "done":
+                    # cancelled 也必须停：「用户点了取消」不是「这一路没搞成」，
+                    # 继续掉进 yt-dlp 等于取消按钮没作用（真机 1.3.33 冒烟撞到：
+                    # 状态被从 cancelled 覆盖成 downloading，目录又开始出现文件）。
+                    if st_h.get("status") in ("done", "cancelled"):
                         return
                     hls_msg = st_h.get("message") or ""
 
