@@ -47,5 +47,7 @@ Thumbs.db
 desktop.ini
 *.log
 .dsh-fix-tmp/
+# AI 助手的工作记忆目录（每个项目各自不同，不进仓库）
+.workbuddy/
 out_img/
 *.tmp

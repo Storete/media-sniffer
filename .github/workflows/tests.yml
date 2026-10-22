@@ -24,13 +24,13 @@ jobs:
       # 纯 Node 脚本（vm 沙箱 + 假宿主），不需要 npm install
       # 名称里的项数只是参考，真实数字以脚本自己打印的「通过 N 项」为准；
       # 改了测试记得同步，否则 CI 面板会骗人。
-      - name: main-hook（183 项）
+      - name: main-hook（188 项）
         run: node test/main-hook.test.js
 
-      # background 末尾会 require ./review.test.js（R1~R4 共 27 项）和
-      # ./group_key.test.js（G1~G4 共 17 项），所以这里的数字包含两批回归。
-      # 这两个文件都不能单独跑，直接跑会打印一行说明后退出。
-      - name: background（191 项，含 review 27 + group_key 17）
+      # background 末尾会 require 三个子回归：review（R1~R4 共 27 项）、
+      # group_key（G1~G4 共 23 项）、focus_scope（F1~F3 共 20 项），
+      # 所以这里的数字包含三批。这三个文件都不能单独跑，直接跑只会打印一行说明。
+      - name: background（244 项，含 review 27 + group_key 23 + focus_scope 20）
         run: node test/background.test.js
 
       - name: range_parallel（14 项）
@@ -42,11 +42,11 @@ jobs:
       - name: pattern_sync（4 项）
         run: node test/pattern_sync.test.js
 
-      - name: popup_wiring（21 项）
+      - name: popup_wiring（30 项）
         run: node test/popup_wiring.test.js
 
       # 架构约束：通用层不许出现站点专属判断（防模块化回退成 if 汤）
-      - name: site_registry（38 项）
+      - name: site_registry（103 项）
         run: node test/site_registry.test.js
 
       - name: 语法检查
