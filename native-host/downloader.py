@@ -171,6 +171,35 @@ PROGRESS_TPL = (
 )
 
 
+PLAYLIST_MAX = 256 * 1024
+
+
+def looks_like_playlist(path):
+    """产物是不是 HLS/DASH 播放列表文本。
+
+    yt-dlp 对 m3u8 地址有两种处理：认得出是 HLS 就下载分片并合并成视频；
+    认不出（站点改过扩展名、参数怪、或者清单本身加密）就走 generic 分支，
+    把**清单本身**当普通文件存下来 —— 退出码 0、尾部没有 ERROR，只看这两样
+    必然报成「完成」。2026-10-22 真机 51cg1 就是这样：界面显示完成，落盘是
+    38KB 的 .m3u8 文本。
+
+    判据用文件头而不是扩展名：扩展名是 yt-dlp 按响应 content-type 猜的，
+    同一份清单可能被存成 .m3u8 / .m3u / .txt。体积先兜一刀 —— 清单只有几 KB，
+    超过 256KB 的一律当视频，不去读文件头。
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) > PLAYLIST_MAX:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(16)
+        # 去 BOM 和空白的写法：有些站返回 UTF-8 BOM 开头的清单
+        return head.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
+    except Exception:
+        return False
+
+
 def run_ytdlp(job, ytdlp, ffmpeg):
     """跑 yt-dlp。适合 m3u8 / mpd / 「一个网页里藏着视频」这几类，
     HLS 分片它比我们自己拼强得多（并发、重试、音视频合并都能处理）。
@@ -282,7 +311,18 @@ def run_ytdlp(job, ytdlp, ffmpeg):
             post_err = ln.strip()
             break
     if proc.returncode == 0 and not post_err:
-        write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file)
+        # 还有第三种「假的成功」：yt-dlp 没认出是 HLS，把 m3u8 清单本身当普通
+        # 文件存了下来（退出码 0、无 ERROR）。见 looks_like_playlist 的说明。
+        if looks_like_playlist(final_file):
+            write_status(
+                job_id,
+                status="error",
+                message="只下到播放列表（#EXTM3U），不是视频。"
+                        "yt-dlp 没把这条地址当成 HLS 流，多半是该站需要 Referer/Cookie，"
+                        "或清单本身加密。",
+            )
+        else:
+            write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file)
     else:
         msg = post_err or (" | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode))
         write_status(job_id, status="error", message=msg[:600])

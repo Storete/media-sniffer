@@ -79,5 +79,43 @@ check("分派条件仍认 .m3u8",
       ".m3u8" in low)
 
 
+# ---------------------------------------------------------------- 4. 只下到播放列表时必须判失败
+#
+# 2026-10-22 真机：51cg1 那条 m3u8 让 yt-dlp 走了 generic 分支，它把**清单本身**
+# 当普通文件存成 38,299 字节的 .m3u8，退出码 0、尾部没有 ERROR —— 界面显示
+# 「完成」，用户拿到的是一段文本。只看退出码和 ERROR 都发现不了。
+import tempfile  # noqa: E402
+
+tmpdir = tempfile.mkdtemp(prefix="ms_hls_")
+playlist = os.path.join(tmpdir, "probe.m3u8")
+with open(playlist, "wb") as f:
+    f.write(b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n"
+            b"#EXTINF:10.0,\nseg-1.ts\n#EXT-X-ENDLIST\n")
+mp4 = os.path.join(tmpdir, "probe.mp4")
+with open(mp4, "wb") as f:
+    f.write(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 4096)
+missing = os.path.join(tmpdir, "不存在.mp4")
+
+has_fn = hasattr(D, "looks_like_playlist")
+check("downloader 提供 looks_like_playlist(path) 判产物类型", has_fn)
+if has_fn:
+    check("产物是 #EXTM3U 文本 -> 判定为播放列表", D.looks_like_playlist(playlist) is True)
+    check("产物是 mp4 魔数 -> 不是播放列表", D.looks_like_playlist(mp4) is False)
+    check("文件不存在 -> 不是播放列表（不误判）", D.looks_like_playlist(missing) is False)
+    check("空路径 -> 不是播放列表", D.looks_like_playlist("") is False)
+
+    # 大文件不做内容判定：清单不会超过 256KB，真实视频一定超过
+    big = os.path.join(tmpdir, "big.mp4")
+    with open(big, "wb") as f:
+        f.write(b"\x00" * (300 * 1024))
+    check("超过体积阈值的大文件直接放过（不当清单）", D.looks_like_playlist(big) is False)
+
+# 源码里 done 分支必须真的调用了它，否则函数写了也没人用
+check("done 判定里调用了 looks_like_playlist",
+      "looks_like_playlist(final_file)" in src)
+check("只下到清单时的提示能说清「不是视频」",
+      "播放列表" in src or "清单" in src)
+
+
 print("RESULT: " + ("ALL PASS" if all(results) else "FAILED %d" % results.count(False)))
 sys.exit(0 if all(results) else 1)
