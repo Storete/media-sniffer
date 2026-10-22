@@ -242,22 +242,71 @@
 
   // ------------------------------------------------------------ 2. 媒体元素发现（三种触发 + 轮询兜底）
 
-  /** 媒体所在消息的 id / 引用（Telegram 的 data-message-id 在 .Message 上） */
+  /**
+   * 媒体所在的「消息容器」元素（一条消息 = 一个编号单元）。
+   *
+   * 为什么要单独抽一层（2026-10-22 真机）：Telegram 有两套前端，消息号挂在
+   * 不同属性上 ——
+   *   · Web A（`web.telegram.org/a/`）：`.Message[data-message-id]`
+   *   · Web K（`web.telegram.org/k/`）：`.bubble[data-mid]`，
+   *     而 `data-message-id` **一个都没有**（实测整页 0 个，`data-mid` 37 个）
+   * 只读前者时 K 版的 mid 恒为空，background 认为「既没 mid 也没标题」，
+   * 整批条目不编号；焦点反查也找不到元素，查看器打开时列表不收窄。
+   *
+   * 取**最外层**带注解的祖先，而不是最近一层：同一条消息里的相册项自己也带
+   * `data-mid` 且各不相同（实测一条消息的三个相册项是 868/869/870，气泡是
+   * 868）。取最近一层会把一条消息拆成三条、每条只剩一张图，序号全落空。
+   *
+   * 站点钩子优先，通用层只认 `data-message-id` —— 站点私有属性不进通用逻辑，
+   * 免得误伤其他恰好也用 `data-mid` 的站点。
+   */
+  function msgBoxOf(el) {
+    try {
+      const site = activeSite();
+      if (site && site.msgBox) {
+        const box = site.msgBox(el);
+        if (box) return box;
+      }
+      let n = el, depth = 0;
+      while (n && n.nodeType === 1 && depth < 22) {
+        if (n.getAttribute && n.getAttribute("data-message-id")) return n;
+        n = n.parentElement;
+        depth++;
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 消息容器上的消息号；站点可以自定义读法（Telegram K 版是 data-mid）。 */
+  function msgIdOf(box) {
+    try {
+      const site = activeSite();
+      if (site && site.msgId) {
+        const v = site.msgId(box);
+        if (v) return String(v);
+      }
+      if (box && box.getAttribute) return box.getAttribute("data-message-id") || "";
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  /** 媒体所在消息的 id / 引用 */
   function mediaContext(el) {
     const out = { mid: "", ref: "" };
     try {
+      // 消息号先交给站点定位容器，再读号（两套 Telegram 前端的属性名不同）
+      const box = msgBoxOf(el);
+      if (box) out.mid = msgIdOf(box);
+      // ref 表示「这个媒体是怎么呈现的」（相册里 / 查看器里），取**最近**一层：
+      // 相册项比外层气泡更靠近媒体，先遇到哪个就是哪个。
       let n = el, depth = 0;
       while (n && n.nodeType === 1 && depth < 22) {
         const cn = String(n.className || "");
-        if (!out.mid && n.getAttribute) out.mid = n.getAttribute("data-message-id") || "";
-        if (!out.ref) {
-          if (/MediaViewerSlide/.test(cn) || /is-for-video/.test(cn)) out.ref = "viewer";
-          // `^Album\b` 只认得 Telegram 旧版的 `Album` 类名；WebZ 现在发的是
-          // 哈希类名 + `album-item`，所以补上 album-item（实测 8928 的
-          // 两个 video 都挂在 div.AOksc2b1.Q1Cqmt5K.album-item 里）。
-          else if (/^Album\b|album-item/.test(cn)) out.ref = "album";
-        }
-        if (out.mid && out.ref) break;
+        if (/MediaViewerSlide/.test(cn) || /is-for-video/.test(cn)) { out.ref = "viewer"; break; }
+        // `^Album\b` 只认得 Telegram 旧版的 `Album` 类名；WebZ 现在发的是
+        // 哈希类名 + `album-item`，所以补上 album-item（实测 8928 的
+        // 两个 video 都挂在 div.AOksc2b1.Q1Cqmt5K.album-item 里）。
+        else if (/^Album\b|album-item/.test(cn)) { out.ref = "album"; break; }
         n = n.parentElement;
         depth++;
       }
@@ -283,14 +332,8 @@
       const unified = orderMediaInMessage(el);
       if (unified >= 0) return unified;
       // 兜底：容器里找不到 video/img 混排（比如音频独立面板），退回同族比较
-      // 找消息容器：有 data-message-id 的祖先；没有就退回父节点
-      let box = el.parentElement;
-      let n = el, depth = 0;
-      while (n && n.nodeType === 1 && depth < 22) {
-        if (n.getAttribute && n.getAttribute("data-message-id")) { box = n; break; }
-        n = n.parentElement;
-        depth++;
-      }
+      // 找消息容器：站点的消息容器优先；没有就退回父节点
+      let box = msgBoxOf(el) || el.parentElement;
       if (!box || !box.querySelectorAll) return -1;
       // 只跟同一种媒体比：消息里一条视频 + 一条音频时各自从 ① 起
       const tag = el.tagName === "AUDIO" ? "audio" : "video";
@@ -331,13 +374,9 @@
   function orderMediaInMessage(el) {
     try {
       if (!el || !el.parentElement) return -1;
-      let box = el.parentElement;
-      let n = el, depth = 0;
-      while (n && n.nodeType === 1 && depth < 22) {
-        if (n.getAttribute && n.getAttribute("data-message-id")) { box = n; break; }
-        n = n.parentElement;
-        depth++;
-      }
+      // 消息容器由站点给出（见 msgBoxOf）：Web K 的相册项各自带 data-mid，
+      // 必须爬到外层气泡，否则每个相册项里只有 1 个媒体、序号全从 0 起。
+      const box = msgBoxOf(el) || el.parentElement;
       if (!box || !box.querySelectorAll) return -1;
       const nodes = [...box.querySelectorAll("video,audio,img")];
       if (nodes.length <= 1) return 0;
@@ -3131,6 +3170,8 @@
   // 钩子清单（通用层只认这几个名字，不认识具体站点）：
   //   match()            是否属于本站
   //   focus()            当前焦点（查看器打开时返回内容 id，否则 ""）
+  //   msgBox(el)         媒体所在的消息容器（决定「谁和谁算同一条消息」）
+  //   msgId(box)         从消息容器上读消息号（不同前端属性名不同）
   //   isDecorImg()       是否装饰图（头像/图标）
   //   isImageOnly()      只允许 <img> 上的某张图
   //   isDecorVideo()     是否装饰视频（贴纸/占位）
@@ -3143,6 +3184,34 @@
     name: "telegram",
     match: () => /(^|\.)telegram\.(org|me|dog)$/i.test(location.hostname || ""),
     focus: () => tgFocus(),
+
+    // 消息容器 + 消息号（2026-10-22：Web K 完全不认 data-message-id）
+    //
+    // Web K 把消息号放在 `data-mid` 上，而且**每一层都放**：一条消息的
+    // `.bubble` 是 868，里面三个 `.album-item` 却是 868/869/870。所以只能取
+    // 最外层命中的那个，取最近一层会把一条消息拆成三条。
+    // 同一元素上两个属性都有的情况（过渡期）以 `data-mid` 为准。
+    msgBox: (el) => {
+      try {
+        let n = el, depth = 0, found = null;
+        while (n && n.nodeType === 1 && depth < 22) {
+          if (n.getAttribute) {
+            const v = n.getAttribute("data-mid") || n.getAttribute("data-message-id");
+            // 继续往上走：最后一个命中的才是最外层的消息容器
+            if (v) found = n;
+          }
+          n = n.parentElement;
+          depth++;
+        }
+        return found;
+      } catch (e) { return null; }
+    },
+    msgId: (box) => {
+      try {
+        if (!box || !box.getAttribute) return "";
+        return box.getAttribute("data-mid") || box.getAttribute("data-message-id") || "";
+      } catch (e) { return ""; }
+    },
 
     // 视频封面不是照片（用户 m15279「telegram 没有按照默认策略吗，为什么还把封面
     // 当作图片」）。TG 把封面塞在两个地方，都只能从 DOM 结构认，URL 和尺寸完全

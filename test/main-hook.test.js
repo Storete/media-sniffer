@@ -984,6 +984,97 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       JSON.stringify(seq));
   }
 
+  // 2026-10-22 真机：Telegram Web K 改版后消息号挂在 `data-mid` 上，
+  // `data-message-id` 一个都没有（实测 0 个）。旧代码只读后者，于是
+  //   · mid 恒为空 → background 认为「既没 mid 也没标题」，整批不编号；
+  //   · 焦点反查也找不到元素 → 查看器打开时列表不收窄。
+  // 这一段锁定两件事：**读哪条属性**、**取最外层还是最近一层**。
+  console.log("\n[TGK] Telegram Web K 的消息号（data-mid）");
+  {
+    const mkBox = (cls, attrs) => {
+      const e = new FakeHTMLElement("DIV");
+      e.className = cls;
+      for (const k of Object.keys(attrs)) e.setAttribute(k, attrs[k]);
+      e.querySelector = () => null;
+      e.querySelectorAll = () => [];
+      return e;
+    };
+    const mkImg = (src, w, h) => {
+      const im = new FakeHTMLImageElement();
+      im.src = src;
+      im.naturalWidth = w;
+      im.naturalHeight = h;
+      return im;
+    };
+    // 造「气泡 > 相册项 > 图」的祖先链。相册项自己也带 data-mid，且与外层
+    // 不同 —— 真机实测同一条消息的三个相册项是 868/869/870，气泡是 868。
+    // 消息号只能取外层气泡的，否则一条消息会被拆成三条、序号各自从 ① 起。
+    //
+    // 每个用例的 src 必须唯一：imgCtx 按 src 缓存，同一 src 再来一次只要
+    // ord/title 没变就不会重发，断言会误读成「未上报」。
+    let treeSeq = 0;
+    const drawTree = (bubbleAttrs, albumMids) => {
+      treeSeq++;
+      const bubble = mkBox("bubble channel-post", bubbleAttrs);
+      const imgs = [];
+      albumMids.forEach((mid, i) => {
+        const img = mkImg("https://web.telegram.org/a/progressive/tgk" + treeSeq + "-" + mid + "_" + i + ".jpg", 800, 600);
+        img._rect = { top: i * 600, left: 0, width: 800, height: 600 };
+        const item = mkBox("album-item grouped-item", mid ? { "data-mid": String(mid) } : {});
+        item.appendChild(img);
+        item.querySelectorAll = () => [img];
+        bubble.appendChild(item);
+        imgs.push(img);
+      });
+      bubble.querySelectorAll = (sel) => (/img|video|audio/.test(sel) ? imgs : []);
+      return { bubble, imgs };
+    };
+    const scanMids = (imgs) => {
+      fakeDocument._imgEls = imgs;
+      fakeDocument._mediaEls = [];
+      messages.length = 0;
+      sandbox.window.__msImgScan();
+      return imgs.map((im) => {
+        const hit = messages.filter((m) => m.cmd === "found" && m.source === "imgctx" && m.key === im.src);
+        return hit.length ? hit[hit.length - 1].mid : "(未上报)";
+      });
+    };
+
+    const t1 = drawTree({ "data-mid": "7498" }, ["7498", "7499", "7500"]);
+    const mids1 = scanMids(t1.imgs);
+    check("[TGK] 相册项各自 data-mid 不同时仍归到外层消息号",
+      mids1.length === 3 && mids1.every((m) => m === "7498"), mids1);
+
+    const ords1 = t1.imgs.map((im) => sandbox.window.__msOrderInMessage(im));
+    check("[TGK] 同一条消息 3 张图的统一序号是 0,1,2",
+      JSON.stringify(ords1) === JSON.stringify([0, 1, 2]), ords1);
+
+    const t2 = drawTree({ "data-message-id": "8928" }, ["8928"]);
+    const mids2 = scanMids(t2.imgs);
+    check("[TGK] 只有 data-message-id 的旧结构仍取到 mid（Web A 兼容）",
+      mids2.every((m) => m === "8928"), mids2);
+
+    const t3 = drawTree({ "data-mid": "7498", "data-message-id": "9001" }, ["7498"]);
+    const mids3 = scanMids(t3.imgs);
+    check("[TGK] 同一元素同时带两个属性时取 data-mid",
+      mids3.every((m) => m === "7498"), mids3);
+
+    const t4 = drawTree({ "data-message-id": "9001" }, ["7498"]);
+    const mids4 = scanMids(t4.imgs);
+    check("[TGK] 外层消息号压过内层相册项（不是取最近的）",
+      mids4.every((m) => m === "9001"), mids4);
+
+    const lone = mkImg("https://web.telegram.org/a/progressive/tgk-lone.jpg", 640, 480);
+    const mids5 = scanMids([lone]);
+    check("[TGK] 消息容器外的图 mid 为空", mids5[0] === "", mids5);
+
+    const t6 = drawTree({ "data-mid": "-1001234567890" }, ["-1001234567890"]);
+    const mids6 = scanMids(t6.imgs);
+    check("[TGK] 负数 mid 原样保留（不加前缀、不改写）",
+      mids6.every((m) => m === "-1001234567890"), mids6);
+    fakeDocument._imgEls = [];
+  }
+
   console.log("\n[5b] 轮询 currentSrc 兜底（<source>/setAttribute 场景）");  messages.length = 0;
   const v2 = new FakeHTMLMediaElement("VIDEO");
   v2.currentSrc = "blob:https://web.telegram.org/via-currentsrc";

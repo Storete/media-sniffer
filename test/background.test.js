@@ -395,7 +395,12 @@ const rec3 = mkRec([{ u: "solo", k: "image", mid: "1", ord: 0, t: 1 }]);
 numberRec(rec3);
 check("组里只有一张不加序号", rec3.items.get("solo").mark === "", rec3.items.get("solo").mark);
 
-// 视频也编号，而且和图片分开排
+// 视频也编号，而且和图片**共用一个序号池**
+//
+// 2026-10-22 改：这条原本断言「图片和视频各自从 ① 起」，那是旧语义。真机上
+// 用户看到的同一条消息是 ①图 ②视频 ③图 ④视频 连续往下走（d-029 已把页面侧
+// 的 ord 统一成「整条消息一条数列」），编号却还按 kind 拆成两个池子，于是
+// 列表里出现两个 ①，用户没法判断谁先谁后 —— 这正是 A6「图视频错位」的另一半。
 const rec4 = mkRec([
   { u: "i1", k: "image", mid: "9", ord: 0, t: 1 },
   { u: "i2", k: "image", mid: "9", ord: 1, t: 2 },
@@ -403,9 +408,54 @@ const rec4 = mkRec([
   { u: "v2", k: "video", mid: "9", ord: 1, t: 4 },
 ]);
 numberRec(rec4);
-check("图片和视频各自从 ① 起",
-  rec4.items.get("i1").mark === "①" && rec4.items.get("v1").mark === "①",
-  [...rec4.items.values()].map((x) => [x.k, x.u, x.mark]));
+check("[TGK] 同一消息里图片和视频不再各自从 ① 起（共用一个池）",
+  rec4.items.get("i1").mark === "①" && rec4.items.get("v1").mark === "②"
+    && rec4.items.get("i2").mark === "③" && rec4.items.get("v2").mark === "④",
+  [...rec4.items.values()].map((x) => [x.k, x.u, x.ord, x.mark]));
+
+// 真机形态：一条消息里 3 图 + 2 视频，ord 已经是整条消息的统一序（0..4），
+// 期望列表从上到下就是 ①②③④⑤，而不是「图 ①②③ + 视频 ①②」。
+const recTGK1 = mkRec([
+  { u: "m0", k: "image", mid: "7498", ord: 0, t: 1 },
+  { u: "m1", k: "video", mid: "7498", ord: 1, t: 2 },
+  { u: "m2", k: "image", mid: "7498", ord: 2, t: 3 },
+  { u: "m3", k: "video", mid: "7498", ord: 3, t: 4 },
+  { u: "m4", k: "image", mid: "7498", ord: 4, t: 5 },
+]);
+numberRec(recTGK1);
+check("[TGK] 同一消息 3 图 + 2 视频编号 ①②③④⑤ 连续",
+  ["①", "②", "③", "④", "⑤"].every((mk, i) => recTGK1.items.get("m" + i).mark === mk),
+  [...recTGK1.items.values()].map((x) => [x.k, x.ord, x.mark]).sort((a, b) => a[1] - b[1]));
+
+// 两条消息各自独立：A 的 3 条 ①②③，B 的 2 条 ①②，不会连成 ①…⑤
+const recTGK2 = mkRec([
+  { u: "a0", k: "image", mid: "7498", ord: 0, t: 1 },
+  { u: "a1", k: "video", mid: "7498", ord: 1, t: 2 },
+  { u: "a2", k: "image", mid: "7498", ord: 2, t: 3 },
+  { u: "b0", k: "image", mid: "7500", ord: 0, t: 4 },
+  { u: "b1", k: "video", mid: "7500", ord: 1, t: 5 },
+]);
+numberRec(recTGK2);
+check("[TGK] 两条消息各自从 ① 起（图视频混排也一样）",
+  recTGK2.items.get("a0").mark === "①" && recTGK2.items.get("a1").mark === "②"
+    && recTGK2.items.get("a2").mark === "③" && recTGK2.items.get("b0").mark === "①"
+    && recTGK2.items.get("b1").mark === "②",
+  [...recTGK2.items.values()].map((x) => [x.mid, x.u, x.mark]));
+
+// 有 mid 时以「消息」为分组单位：同一个标题发在多条消息里，各自从 ① 起。
+// 这是对 B6「同标题跨消息合并连号」的**有意替换** —— 消息才是 Telegram 的
+// 内容单元，跨消息连号会让用户以为「第 12 张」还在这一条里。
+const recTGK3 = mkRec([
+  { u: "s0", k: "image", mid: "7498", title: "编号：#CC0385", ord: 0, t: 1 },
+  { u: "s1", k: "image", mid: "7498", title: "编号：#CC0385", ord: 1, t: 2 },
+  { u: "s2", k: "image", mid: "7500", title: "编号：#CC0385", ord: 0, t: 3 },
+  { u: "s3", k: "image", mid: "7500", title: "编号：#CC0385", ord: 1, t: 4 },
+]);
+numberRec(recTGK3);
+check("[TGK] 有 mid 时同标题不跨消息合号（各消息各自 ①②）",
+  recTGK3.items.get("s0").mark === "①" && recTGK3.items.get("s1").mark === "②"
+    && recTGK3.items.get("s2").mark === "①" && recTGK3.items.get("s3").mark === "②",
+  [...recTGK3.items.values()].map((x) => [x.mid, x.u, x.mark]));
 
 // ord 缺失时退回按抓到时间排
 const rec5 = mkRec([

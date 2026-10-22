@@ -461,25 +461,27 @@ function visibleItems() {
 
   const order = ["video", "audio", "doc", "image", "font", "other", "seg"];
 
-  // 先判断「两条是不是同一编号组」。判据对齐 background 的分组键（见 renumberImages）：
-  //   ① 两个都有标题且标题相同  → 同组（background 的 gk = "t:" + title）
-  //   ② 都没标题但 mid 相同      → 同组
+  // 先判断「两条是不是同一编号组」。判据必须与 background 的分组键一致
+  // （见 renumberImages）：**mid 优先，其次标题**。
+  //   ① 两个都有 mid            → 比 mid（一条消息一个池）
+  //   ② 都没有 mid              → 比标题（普通网站 / 抓不到消息号）
+  //   ③ 一个有 mid 一个没有     → 不是同一组
   // 同组且都编了号时，**序号必须压过 kind**。
   //
   // 为什么（2026-10-20 真机，问题①的最后一环）：
-  // Telegram 同一标题下视频和图片共用一个序号池（①~⑳），background 按
-  // 「mid 升序 → 组内 ord」编好。但这里原来第一行就是 `if (ka !== kb) return ka - kb;`，
+  // 同一条消息里视频和图片共用一个序号池（①~⑳），background 按
+  // 「组内 ord」编好。但这里原来第一行就是 `if (ka !== kb) return ka - kb;`，
   // 把所有 video 提到所有 image 前面，于是拿到的顺序是
   //   ②④⑥⑧…（video）在前，①③⑤⑦…（image）在后
   // —— 用户看到「序号和内容对不上、跳号」。序号本来就是「阅读顺序」，
   // kind 只是「同序号时的兜底排序」，不能反过来压过它。
+  //
+  // 2026-10-22 改：这里原来只认标题（v3），与 background 的「mid 优先」不一致
+  // 会让同一条消息的条目被判成不同组、退回按体积排 —— 编号对了但顺序乱。
   const sameGroup = (a, b) => {
-    const ta = (a.title || "").trim(), tb = (b.title || "").trim();
-    if (ta && tb && ta === tb) return true;
-    if (!ta && !tb) {
-      const ma = a.mid || "", mb = b.mid || "";
-      return ma !== "" && ma === mb;
-    }
+    const ma = a.mid || "", mb = b.mid || "";
+    if (ma && mb) return ma === mb;
+    if (!ma && !mb) return (a.title || "").trim() === (b.title || "").trim();
     return false;
   };
 

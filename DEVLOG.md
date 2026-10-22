@@ -10,6 +10,77 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-030 · 2026-10-22 · Telegram 序号与焦点全失效——Web K 换了消息号属性
+
+**问题**：登录态下真机复验 1.3.18 / 1.3.26，发现 Telegram 上**一条序号都编不出来**、
+打开相册查看器列表也不收窄。同一套编号代码在小红书详情页正常（24 条 `①…㉔` 连续）。
+
+**真机 dump（Chrome 156 + 当前 Web K，已登录）**：
+
+| 断言 | 实测 |
+|---|---|
+| `[data-message-id]` 元素 | **0** |
+| `[data-mid]` 元素 | **37**（`.bubble` 14 / `.album-item` 3 / `.grid-item.media-container` 20） |
+| `.text-content` / `.message-text` | **0 / 0** |
+| 抓到的 image/video 条目 | 17 条，`mid` 有值 **0 条**、`mark` 有值 **0 条** |
+| 打开相册后 `__msActiveSite().focus()` | `""` |
+
+**根因**：K 版把消息号从 `data-message-id` 换成了 `data-mid`，而 `mediaContext()`
+只读前者 → `mid` 恒空 → `numberShown` 认为「既没 mid 也没标题」整批 `continue`。
+焦点那两条路径（`tgFocus` / `tgFocusByMedia`）也依赖同一个属性，一起失效。
+
+**层级陷阱**：`data-mid` **每一层都有**，而且值不一样——同一条消息实测
+`.bubble` 是 `4294972868`，里面三个 `.album-item` 是 `…868 / …869 / …870`。
+按「最近的祖先」取会把一条消息拆成三条、每条只剩一张图；必须取**最外层**
+命中的那个。
+
+**一个必须纠正的误判**：我先以为分组键是 `kind + mid + ref`、所以补 `mid` 也
+会图文分池。读代码后确认 `gk` 是**标题优先**（`t:标题` → 才退回 `kind|mid|ref`），
+d-029 真机 `①→⑲` 连续正是因为那 19 条都有标题。所以「图文分池」只发生在
+**抓不到标题**的时候——而 Web K 改了正文类名后标题大面积抓不到（17 条里 14 条
+无标题），补 `mid` 后会重新踩进这个坑。**两件事必须一起改。**
+
+**修法（1.3.28，页面侧 + 后台侧 + 弹窗侧三处）**：
+
+1. `inject-main.js` 新增站点钩子 `msgBox(el)` / `msgId(box)`：Telegram 实现里
+   逐层往上读 `data-mid || data-message-id`，**最后一次命中的**才是消息容器。
+   通用层仍然只认 `data-message-id`，`data-mid` 一个字都没进通用逻辑
+   （避免误伤其他也用这个属性的站点）。
+2. `mediaContext` / `orderMediaInMessage` / `ordOfMedia` 三处统一走 `msgBoxOf()`。
+3. `background.js` 分组键顺序改为 **mid → 标题 → kind|ref**；
+   `popup.js` 的 `sameGroup` 同步（不然编号对了、排序会按体积乱掉）。
+
+**产品语义变更（有意，需记账）**：同上标题的多条消息**不再跨消息连号**，
+每条消息各自从 ① 起。理由：①一条消息就是一个内容单元；②焦点收窄是**按消息**
+过滤的，编号若按标题、焦点按消息，一收窄就错位。代价是用户会看到多组 ①②③。
+
+**测试**：先写红再改绿。`[TGK]` 新增 7 条（main-hook）+ 4 条（background），
+并按新语义改写 `group_key` 的 6 条旧断言（原断言写的是「跨消息连号」）。
+改前红 10 条，改后 **JS 625 项全绿 / Python 9 套全通过**。
+
+**真机**：调试实例里重载扩展（1.3.28）后，在真实页面构造 `.bubble[data-mid]`
++ 内层 `.album-item[data-mid]` 的结构，`__msActiveSite().msgBox/msgId` 返回
+`999001`（不是内层的 `999002`）、`__msOrderInMessage` 返回有效 ord。
+会话消息本身因网络拉不下来，**完整真机（真实消息的 ①②③ 与焦点收窄）待补**。
+
+**教训**：
+1. **「属性名换了」比「逻辑错了」更常见。** 两次「修过还不对」都是盯着算法，
+   实际是数据源换了（d-029 是 ord 语义、这条是属性名）。先 dump 页面结构，
+   再怀疑代码。
+2. **层级注解要取最外层。** 内层相册项带自己的 mid 是「这一格」的号，不是
+   「这条消息」的号。取最近一层会让所有计数从 0 重开——症状和 d-029 一模一样，
+   但根因完全不同。
+3. **改分组键必须三处同步**（background 两处 + popup 一处）。漏了 popup 就是
+   B6 的旧症状「⑪ 在最上面、下面才是 ①②③」。
+
+**涉及文件**：`extension/inject-main.js`（`msgBoxOf`/`msgIdOf`/`mediaContext`/
+`orderMediaInMessage`/`ordOfMedia`/telegram 站点对象）、`extension/background.js`
+（`renumberImages`/`numberShown` 的 `gk`）、`extension/popup.js`（`sameGroup`）、
+`test/main-hook.test.js`（`[TGK]`）、`test/background.test.js`（`[TGK]`）、
+`test/group_key.test.js`（G1/G1b/G4 改期望）。
+
+---
+
 ## d-029 · 2026-10-21 · Telegram 序号「对不上」（第三次修）——两套计数流
 
 **问题**：用户 m15907 附截图：「总数差不多，但是序号完全对不上，这个问题已经修过两次了」。
@@ -230,6 +301,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-030](#d-030) | 2026-10-22 | Telegram 序号与焦点全失效 | Web K 把消息号换成 `data-mid` 且每层都有：取**最外层**，分组键改 mid 优先 |
 | [d-026](#d-026) | 2026-10-21 | B 站视频页图片只留封面 | 视频页判定改看 URL（`__playinfo__` 首屏为空、番剧页永远为空）；banner 全走 webRequest，得在 background 补一层 |
 | [d-025](#d-025) | 2026-10-21 | Telegram 陈旧封面条目清不掉 | 过滤只做在入口不够：blob 地址每轮换，旧条目只能靠 `pruneStaleImages` 按当前规则重算 |
 | [d-024](#d-024) | 2026-10-20 | 视频封面默认不当图片收 | 做成一张站点白名单表；小红书封面单独打 xhs-cover 才分得开 |

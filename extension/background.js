@@ -1059,11 +1059,14 @@ function renumberImages(rec) {
     // 会额外给 album/viewer 两种 ref，拆得最碎，所以最先暴露。
     //
     // 新的键顺序（越靠前越优先）：
-    //   1. 有标题 → 用标题。标题就是「同一条内容」最接近的标识，也是用户
-    //      肉眼分组时依据的东西；跨消息、跨 ref、跨 kind 都并到一起。
-    //      为什么连 kind 也不分：用户说的就是「视频或图片放在一起」。
-    //   2. 没标题但有 mid（Telegram 的相册里偶尔抓不到标题文字）→ 退回
-    //      原来的 `kind+mid+ref`，至少同一格的还能排上序。
+    //   1. 有 mid → 用 mid。**一条消息就是一个编号单元**：消息内的图片/视频
+    //      共用一个 ①~Ⓝ 池子，不同消息各自从 ① 起。
+    //      2026-10-22 调整（原来是「有标题就用标题、跨消息合并连号」）：
+    //      真机上跨消息连号会让用户以为「第 12 张」还在他打开的那一条里；
+    //      而且焦点收窄是**按消息**过滤的，编号若按标题、焦点按消息，一收窄
+    //      就出现序号错位 —— 两者必须是同一粒度。
+    //   2. 没 mid 但有标题（普通网站、抓不到消息号的 Telegram 相册）→ 用标题，
+    //      跨 kind 合并（用户说的就是「视频或图片放在一起」）。
     //   3. 都没有 → 调用方已经 continue 掉了，走不到这里。
     //
     // 小红书详情页仍然是整页一个池子（"xhs"），首页 feed 仍然整段跳过，
@@ -1071,9 +1074,11 @@ function renumberImages(rec) {
     const titleKey = (it.title || "").trim();
     const gk = xhsDetail
       ? "xhs"
-      : titleKey
-        ? "t:" + titleKey
-        : it.k + "|" + (it.mid ? "m:" + it.mid : "") + "|" + (it.ref || "");
+      : it.mid
+        ? "m:" + it.mid
+        : titleKey
+          ? "t:" + titleKey
+          : it.k + "|" + (it.ref || "");
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(it);
   }
@@ -1121,7 +1126,7 @@ function compareWithinGroup(a, b) {
 /**
  * 在「真正要显示的条目」上编号。
  *
- * 与 renumberImages 共用同一套分组规则（标题优先），区别只有两个：
+ * 与 renumberImages 共用同一套分组规则（mid 优先，其次标题），区别只有两个：
  *   1. 只处理传进来的这批条目（已经过 icon 过滤 + 去重），所以序号一定连续；
  *   2. 编号顺序用「标题分组 + 组内 DOM 顺序」，与 popup 的排序判据一致，
  *      用户看到的 ①②③ 就是从上到下。
@@ -1153,9 +1158,11 @@ function numberShown(items, tabUrl) {
     const titleKey = (it.title || "").trim();
     const gk = xhsDetail
       ? "xhs"
-      : titleKey
-        ? "t:" + titleKey
-        : it.k + "|" + (it.mid ? "m:" + it.mid : "") + "|" + (it.ref || "");
+      : it.mid
+        ? "m:" + it.mid
+        : titleKey
+          ? "t:" + titleKey
+          : it.k + "|" + (it.ref || "");
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(it);
   }
