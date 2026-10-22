@@ -140,6 +140,18 @@ def write_status(job_id, **fields):
     _replace_retry(tmp, path)
 
 
+def write_progress(job_id, percent, speed="", eta=""):
+    """进度刷新统一入口。**必须清空 message。**
+
+    write_status 是合并式的（只更新传入的字段），所以上一步写下的提示会一直留着。
+    真机（2026-10-22 51cg1）：自实现 HLS 开头写了「解析播放列表」，随后清单加密
+    交回 yt-dlp，yt-dlp 的进度更新只写 percent/speed/eta —— 于是界面上从 0% 到
+    87.7% 全程显示「解析播放列表」，用户看到的是「卡在解析」，其实一直在下载。
+    """
+    write_status(job_id, status="downloading", percent=percent,
+                 speed=speed, eta=eta, message="")
+
+
 def read_status(job_id):
     """读状态文件，读不到/坏 JSON 一律返回空 dict（调用方用 .get 就不会炸）"""
     try:
@@ -368,13 +380,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
                         pct = float(pct_raw)
                     except ValueError:
                         pct = 0.0
-                    write_status(
-                        job_id,
-                        status="downloading",
-                        percent=pct,
-                        speed=parts[1].strip(),
-                        eta=parts[2].strip(),
-                    )
+                    write_progress(job_id, pct, parts[1].strip(), parts[2].strip())
             elif line.startswith("FILE:"):
                 final_file = line[len("FILE:"):].strip()
             else:
@@ -1191,14 +1197,6 @@ def main():
             run_urllib(job)
     except Exception as e:
         write_status(job_id, status="error", message=("下载进程异常: " + str(e))[:400])
-
-
-def read_status(job_id):
-    try:
-        return json.load(open(status_path(job_id), encoding="utf-8"))
-    except Exception:
-        return {}
-
 
 if __name__ == "__main__":
     main()

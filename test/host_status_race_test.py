@@ -93,7 +93,19 @@ st2 = D.read_status("race2")
 check("退化为直接覆写后仍能读到内容",
       st2.get("message") == "一直写不进去也不能崩", st2)
 
-# ---------------------------------------------------------------- 3. 清理 yt-dlp 碎片
+# ---------------------------------------------------------------- 3. 进度刷新必须清 message
+has_prog = hasattr(D, "write_progress")
+check("downloader 提供 write_progress（统一进度入口）", has_prog)
+if has_prog:
+    D.write_status("prog", status="downloading", percent=0, message="解析播放列表")
+    D.write_progress("prog", 42.5, "6.2MiB/s", "00:10")
+    stp = D.read_status("prog")
+    check("进度刷新后 percent 更新了", stp.get("percent") == 42.5, stp.get("percent"))
+    check("进度刷新后 message 被清空（不然界面上一直挂着「解析播放列表」）",
+          stp.get("message") == "", repr(stp.get("message")))
+    check("status 仍是 downloading", stp.get("status") == "downloading", stp.get("status"))
+
+# ---------------------------------------------------------------- 4. 清理 yt-dlp 碎片
 out = os.path.join(TMP, "out")
 os.makedirs(out, exist_ok=True)
 base = "77aa0dea31e85ff16ea6fb79cea2780e"
@@ -141,7 +153,7 @@ if has_fn:
     check("内容不是播放列表的同名 .m3u8 不删（宁少删不多删）",
           os.path.exists(os.path.join(out2, base + ".m3u8")), os.listdir(out2))
 
-# ---------------------------------------------------------------- 4. 接线检查
+# ---------------------------------------------------------------- 5. 接线检查
 src = open(D.__file__, encoding="utf-8").read()
 check("write_status 不再直接裸调 os.replace",
       "os.replace(tmp, path)" not in src or "_replace_retry" in src)
