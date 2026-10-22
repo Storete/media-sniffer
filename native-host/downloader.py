@@ -72,6 +72,48 @@ def cancel_path(job_id):
     return os.path.join(JOBS_DIR, _job_id_or_raise(job_id) + ".cancel")
 
 
+def _replace_retry(tmp, path, attempts=10, first_delay=0.01):
+    """把 tmp 换成 path，撞上「对方正持有句柄」时重试，最后退化为直接覆写。
+
+    为什么不能裸调 os.replace（2026-10-22 真机踩到）：
+    宿主 poll_job 每 0.4 秒用 `open()` 读同一个状态文件，Windows 上目标文件
+    被别人持有句柄时 MoveFileEx 直接返回 ERROR_ACCESS_DENIED → PermissionError
+    [WinError 5]。窗口很短，但一次 40 分钟、上千分片的任务要写几十上百次状态，
+    撞上几乎是必然。
+
+    真正致命的地方不是「少一次进度」，而是**这个异常会从 write_status 抛出去**：
+    调用方多数在 except 块里写错误原因，于是「为什么会失败」这条最重要的话
+    恰好写不进去，进程带着 traceback 退出，状态里留着上一次的 done/100——
+    用户看到「完成」，目录里却没有视频。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return True
+        except PermissionError as e:
+            last = e
+            time.sleep(min(0.08, first_delay * (2 ** i)))
+        except OSError as e:  # 跨卷/权限之外的系统错误，重试没意义
+            last = e
+            break
+    # 兜底：放弃原子性，直接覆写。宁可宿主可能读到半个 JSON（它有容错，
+    # 坏 JSON 当空 dict），也不能让状态彻底写不进去。
+    try:
+        with open(tmp, "r", encoding="utf-8") as f:
+            buf = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(buf)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        sys.stderr.write("write_status: 状态写盘失败 %s (%s)\n" % (path, last))
+        return False
+
+
 def write_status(job_id, **fields):
     """**合并式**写状态：读出旧内容、update 新字段、原子替换。
 
@@ -95,7 +137,7 @@ def write_status(job_id, **fields):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    _replace_retry(tmp, path)
 
 
 def read_status(job_id):
@@ -201,6 +243,50 @@ def looks_like_playlist(path):
         return head.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
     except Exception:
         return False
+
+
+def cleanup_ytdlp_junk(outdir, base):
+    """清掉 yt-dlp 一次失败留下的碎片，返回删除个数。
+
+    为什么会留：yt-dlp 下 HLS 先写 `<base>.mp4.part`，再按分片落
+    `<base>.mp4.part-FragN.part` 和 `.ytdl` 断点文件；失败或被中断时这些
+    全堆在输出目录里（真机实测一次失败 31 个文件）。用户不知道能不能删，
+    而本机 safe-delete 一次删 >50 文件会被拦 → 越积越多，「以后再说」等于
+    永远清不掉。
+
+    只认三类，宁少删不多删：
+      · `<base>.*.part*` —— 未完成的下载与分片
+      · `<base>.*.ytdl`  —— yt-dlp 断点记录
+      · 内容确实是播放列表的 `<base>.m3u8` —— 「只下到清单」的残骸，不是视频
+    最终成片（.mp4/.ts/.mkv）和名字相近的别的任务一律不碰。
+    """
+    if not outdir or not os.path.isdir(outdir):
+        return 0
+    prefix = base + "."
+    removed = 0
+    try:
+        names = os.listdir(outdir)
+    except OSError:
+        return 0
+    for n in names:
+        if not n.startswith(prefix):
+            continue
+        low = n.lower()
+        p = os.path.join(outdir, n)
+        if ".part" in low or low.endswith(".ytdl"):
+            drop = True
+        elif low == (base + ".m3u8").lower() and looks_like_playlist(p):
+            drop = True
+        else:
+            drop = False
+        if not drop:
+            continue
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def run_ytdlp(job, ytdlp, ffmpeg):
@@ -317,6 +403,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         # 还有第三种「假的成功」：yt-dlp 没认出是 HLS，把 m3u8 清单本身当普通
         # 文件存了下来（退出码 0、无 ERROR）。见 looks_like_playlist 的说明。
         if looks_like_playlist(final_file):
+            cleanup_ytdlp_junk(outdir, base)
             write_status(
                 job_id,
                 status="error",
@@ -328,6 +415,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
             write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file)
     else:
         msg = post_err or (" | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode))
+        cleanup_ytdlp_junk(outdir, base)
         write_status(job_id, status="error", message=msg[:600])
 
 
