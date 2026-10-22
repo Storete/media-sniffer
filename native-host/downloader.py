@@ -571,6 +571,8 @@ def run_urllib(job):
 TS_PACKET = 188      # MPEG-TS 固定包长
 MASQ_SCAN = 4096     # 壳最多在这段前缀里找 TS 同步
 MASQ_SYNC = 5        # 连续几个包对得上才算认出
+SEG_ATTEMPTS = 3     # 单个分片在 _hls_get 之外还允许几轮重试（见 _fetch_segment）
+SEG_BACKOFF = 1.0    # 秒；指数退避 1s → 2s，合计横跨约 3 秒的抖动窗口
 
 
 def looks_like_hls_url(url):
@@ -691,6 +693,39 @@ def _hls_get(url, headers, timeout=45, retries=2):
         if attempt < retries:
             time.sleep(0.6 * (attempt + 1))
     raise last
+
+
+def _fetch_segment(url, headers, attempts=None, backoff=None):
+    """取一个分片并剥壳，带「外层」退避重试。全失败返回 `(None, 最后一次错误)`。
+
+    为什么 `_hls_get` 之外还要一层（2026-10-22 真机，用户自己的下载）：
+    `_hls_get` 的 2 次重试是**紧接着**的（间隔 0.6s / 1.2s），对「服务端连续几秒
+    抽风」不够。实测 4kvm 178 片下到第 31 片被掐连接：
+
+        IncompleteRead(528064 bytes read, 1614008 expected)
+
+    3 次尝试全撞在抽风窗口里 → 异常一路抛到主循环 → 整单判失败、`.part` 删掉，
+    **前 30 片全白下**；用户手动重试一次（同地址同网络）立刻成功。瞬时抖动
+    不该等于整单失败，所以这里再加 3 轮、退避 1s→2s，横跨约 3 秒的抖动窗口。
+
+    4xx（地址过期 / 防盗链）不重试：`_hls_get` 已经直接抛，这里也不浪费预算，
+    立刻把错误交回上层——那种错重试一百次还是同样的结果。
+    """
+    attempts = SEG_ATTEMPTS if attempts is None else max(1, int(attempts))
+    backoff = SEG_BACKOFF if backoff is None else float(backoff)
+    last = None
+    for i in range(attempts):
+        try:
+            return strip_masquerade(_hls_get(url, headers)), None
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500:
+                return None, e
+            last = e
+        except Exception as e:
+            last = e
+        if i < attempts - 1:
+            time.sleep(backoff * (2 ** i))
+    return None, last
 
 
 def _header_variants(headers):
@@ -827,10 +862,13 @@ def run_hls_self(job, quiet=False):
     sem = threading.Semaphore(workers * 2)
 
     def fetch(i):
+        """返回 `(data, err)`，**不抛异常**——异常在 worker 里抛会丢掉「第几片」
+        这层上下文，主线程只能看到一个光秃秃的 IncompleteRead。
+        """
         try:
             if i == 0:
-                return first_data      # 探针已经下过了，别重复请求
-            return strip_masquerade(_hls_get(segs[i], headers))
+                return first_data, None   # 探针已经下过了，别重复请求
+            return _fetch_segment(segs[i], headers)
         finally:
             sem.release()
 
@@ -848,7 +886,12 @@ def run_hls_self(job, quiet=False):
                         sem.acquire()
                         pending[submitted] = ex.submit(fetch, submitted)
                         submitted += 1
-                    data = pending.pop(nxt).result()
+                    data, seg_err = pending.pop(nxt).result()
+                    if data is None:
+                        # 这片重试到底也没取到，交给外层统一写提示。
+                        # 不再在这里把异常往上抛原始类型：外层要能说出「第几片、
+                        # 重试了几次」，光一个 IncompleteRead 用户没法判断严重程度。
+                        raise _SegmentFailed(nxt, seg_err)
                     f.write(data)
                     done_bytes += len(data)
                     done_segs += 1
@@ -877,6 +920,14 @@ def run_hls_self(job, quiet=False):
             pass
         write_status(job_id, status="cancelled", percent=0, message="用户取消")
         return True
+    except _SegmentFailed as e:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        return bail("下载分片失败（%d/%d 已下）：第 %d 片重试 %d 轮仍失败：%s"
+                    "。网络抖一下不会这样，多半是这一片在服务端有问题，"
+                    "刷新页面换个地址重试" % (done_segs, total, e.idx + 1, SEG_ATTEMPTS, e.err))
     except Exception as e:
         try:
             os.remove(part)
@@ -950,6 +1001,19 @@ def run_hls_self(job, quiet=False):
 
 class _Cancelled(Exception):
     """内部用的取消信号：跳出滑动窗口循环，由外层统一收尾。"""
+
+
+class _SegmentFailed(Exception):
+    """某个分片重试到底仍失败。带上是第几片（0 起算）和最后那个错误。
+
+    单独一个类型是为了让外层能把「已知的坏片」和「别的意外」分开写提示：
+    前者要告诉用户是第几片、重试了几次；后者直接把异常字符串贴出来。
+    """
+
+    def __init__(self, idx, err):
+        self.idx = idx
+        self.err = err
+        super().__init__("第 %d 片: %s" % (idx + 1, err))
 
 
 def fmt_speed(bps):
