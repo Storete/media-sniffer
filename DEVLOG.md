@@ -10,6 +10,170 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-046 · 2026-10-23 · 红果能下、腾讯是私有分片、西瓜没网页版；blob 条目按替代品取舍
+
+三站补测（高德换成红果/腾讯/西瓜），结果和预期都不一样，值得分开记。
+
+### 红果短剧：域名先搞错了一次
+
+第一轮我按搜索结果的印象去开 `hongguo.com`，返回 `ERR_CONNECTION_CLOSED`，还以为是代理问题。
+换 Clash 显式走、换 http/https 都一样。后来查实测帖才知道**官方域名是 `hongguoduanju.com`**，
+`hongguo.com` 只剩跳转页。而搜索结果里排前面的 `novelquickapp.com` / `hongguoduanju.com?ref=xxx`
+全是带推广参数的入口 —— 域名对不代表能当样本用，但域名错就一定测不出东西。
+
+站本身是 A 类：`<video src>` 是完整 `https://v3-hgweb.qznovelvod.com/…mime_type=video_mp4`，
+80 秒竖屏 10MB。curl Range 验证：`206` + `ftypisom` + `Content-Length: 10004275` + `Accept-Ranges: bytes`，
+**去掉 Referer 也照样 206**。结论：现有下载链一行不改就能下。
+
+### 腾讯视频：不是 DRM，是私有分片协议
+
+预期是「DRM，确认边界就行」。实测分片 `ltscsy.qq.com/….ts?index=1&start=10880&end=21560&token=…`
+取下来 652924 字节、`content-type: video/MP2T`、首字节 `0x47`、开头是标准 PAT(`47 40 00 10 00 00 b0 0d`)
+—— **明文，没有加密**。所以「DRM 加密」这个标签对腾讯是错的。
+
+真实障碍在于：`performance` 里 89 个资源只有 3 条媒体请求，**没有 m3u8**，清单来自私有 JSON 接口；
+每片带独立 token、按毫秒区间切、约 10 秒一片。要拼完整正片 = 逆向播放信息接口 + 按序抓全 + 逐片处理 token。
+
+用户实际能拿到的只有 `m1`~`m4`（appendBuffer 录到的已播部分）。这直接决定了下面的修法。
+
+### 西瓜视频：站方自己撤了网页版
+
+`www.ixigua.com` 的官方 title 就是「西瓜视频APP官方下载_安卓版_iOS版」，首页和 `/search/` 一律 302 到 `/app/`。
+不是我们的网络问题 —— 手机 UA 能拿 `m.ixigua.com`，19 位数字 ID 的单视频 URL 也不跳，但桌面环境没有播放器可用。
+`yt-dlp` 有 `Ixigua` extractor，所以这需求本质是「解析链接」，不该由浏览器扩展兜。
+
+### 由此暴露的缺陷：blob 条目并排显示
+
+红果 4 条「视频」里 3 条点了必失败（2 条 `blob:` + 1 条 0 字节占位），腾讯 6 条里 3 条 blob。
+
+**原本是有意保守**：`hideRecorder()` 注释写着「只认 blob/mN 的站一旦也隐掉，用户什么都看不到」。
+所以不能简单地把 blob 一律删掉 —— 那会把 Telegram 整站清空。
+
+新判据是「看替代品」：同一页存在 `k=video/audio` 且 `http(s)` 且 `s>0` 的条目时，`blob:` 才有资格被删。
+三点细节：
+
+1. `s>0` 必须卡死。红果那条 0 字节的 `…/360p.mp4` 只是没拿到 content-length，
+   拿它当替代品会把真能下的 10MB 直链一起挤掉。
+2. **只删 `blob:`，不删 `m\d+`** —— 后者是 appendBuffer 录到的真数据，是腾讯正片唯一路径。
+3. 按能力判，不按站名判（B22 的教训：按 `it.page` 分派导致带标题的 HLS 下不了）。
+
+真机：红果 **42→40 条、视频 4→2、blob 0**；腾讯**完全不动**（本轮没抓到任何 http 视频直链，
+`hasCompleteMedia` 为 false，按设计不该删）。第二行比第一行更能说明判据是对的。
+
+### 方法论
+
+- **「未登录能不能用」和「是不是 DRM」都必须实测。** 抖音那次我按 91rb 类推猜错，这次腾讯又差点贴上 DRM 标签。
+- **搜索结果的第一个域名不一定是官方的**，尤其短剧/影视这类站点，仿冒站和推广入口排得比官网前。
+- **验证「用户看到什么」不能读 `sniff:get` 的返回** —— 那是后台数据，popup 的 `shownItems()`
+  还会再过滤一层。第一次验证时我读后台，得出「修了没效果」的错误结论，实际是测错了层。
+
+## d-045 · 2026-10-23 · 20 站审计：图标过滤一直没看 URL
+
+用户要求「测国内使用人数最多的 20 个网站」。这个任务如果按字面理解是无限的，所以先把**产出物**定清楚：不是「适配了 20 个站」，而是**「这 20 个站在真实用户手里表现如何」**。完整报告在 `docs/site-audit.md`。
+
+### 方法
+
+19 站（抖音已在 d-044 单独测），Chrome 156 + 游客态 + 独立 profile，逐站打开首页、等 13 秒，跑两轮：
+
+- **第一轮**读后台 `state`（原始条目）
+- **第二轮**开 `popup.html` 发 `sniff:get`（用户真正看到的、过掉 icon 之后的视图）
+
+两轮必须分开：`state` 存的是原始条目，`sniff:get` 里才跑 `looksLikeIcon` 把图标标成 `icon` 再过滤掉。只读 state 会把「过滤得很好」误判成「噪声很大」——这个坑差点让我得出相反结论。
+
+### 关键发现一：真正是缺陷的只有 4 个站
+
+| 站 | 现象 | 性质 |
+|---|---|---|
+| 京东 | 316 张图（`m.360buyimg.com/babel/`） | **正确行为**：页面确实有这么多商品图/活动 banner |
+| 淘宝/拼多多 | 大量商品图 | 同上 |
+| 高德 | 7 张图**全是** `_next/static/media/` 图标 | 缺陷 |
+| 芒果TV | 58 张，含 `apm.log.mgtv.com/s.gif` 埋点、`download_client.png` | 缺陷 |
+| 百度 | `wenxinlogo`、`v.gif?logactid=` | 缺陷 |
+| 支付宝/快手 | 极小图标、`web-app-logo.png` | 缺陷 |
+
+**「图多」不等于「噪声」**。判据应该是「这张图是不是页面内容」，而不是「用户想不想要」——用户在京东页面，列表里有商品图是如实反映。
+
+### 关键发现二：首页测不了下载能力
+
+B站、小红书、腾讯视频首页 `video` **全是 0** —— 封面瀑布流，视频要点进去才创建播放器。所以这一轮只能量噪声，不能量下载。真要验下载必须进详情页（那是另一轮）。
+
+### 根因：过滤只看 DOM，不看 URL
+
+`looksLikeIcon()` 的判据几乎全建立在 DOM 上下文上（`hint` / `ic` / `w` / `h`），而 webRequest-only 的条目这三样**全空**。于是掉到最后的「裸条目」分支，那里只检查 `/assets/`、`.svg|.ico` 后缀和 24KB 体积线 —— **URL 里的 `icon` / `logo` / 埋点特征从来没被检查过**。
+
+最刺眼的是高德：`satellite-icon.png` 21506 字节，名字里就写着 icon，却因为「不到 24KB 所以不够小、也不够大」而通过。
+
+### 改法
+
+新增 6 个 URL 判据，**全部排在 24KB 体积线之前**：
+
+```js
+UI_NAME_URL      // icon|logo|sprite|favicon|avatar|badge|placeholder|loading|btn…（词边界）
+UI_NAME_GLUED    // 拼音拼接：wenxinlogo_
+UI_DIR_PATH      // /controlbar/ /toolbar/ /navbar/ /skin/ /theme(s)/
+TRACKER_URL      // 统计子域、/s.gif /v.gif、?logactid=、fourier 的 /ts
+BUILD_ASSET_DIR  // /_next/static/media/ /static/media/
+TINY_IMAGE       // 2KB 以下且无标题
+```
+
+**为什么必须排在体积线之前**：d-020 那次 47KB 的 `svg-next` 素材就是被 `s > 24KB → return false` 抢先放行的。同一个坑换了个站点还会再踩。
+
+**为什么敢只按 URL 判**：真封面一个都不命中 —— B 站 `bfs/archive/<hash>.jpg@672w`、快手 `p*.yximgs.com/upic/…`、淘宝 `…_360x360`、小红书 `…/spectrum/1040g…!`。`TINY_IMAGE` 加了「有标题就不算」的保护。
+
+### 真机验证（改后复测）
+
+| 站 | 图（前→后） | 说明 |
+|---|---|---|
+| 高德 | **7 → 0** | 7 张全是构建产物图标，全清 |
+| 百度 | 4 → 2 | logo + `v.gif` 清掉 |
+| 快手 | 4 → 3 | `web-app-logo.png` 清掉，3 张视频封面保留 |
+| 芒果TV | 58 → 41 | 埋点/按钮清掉；剩余见下 |
+| 小红书 | 45 → 51 | **未误杀**（波动来自信息流不同） |
+| B站 | 28 → 21 | 封面未误杀 |
+
+`test/icon_filter.test.js` **20 项**（素材命名 7 / 埋点 3 / 构建产物 1 / 极小体积 3 / 误杀回归 5），先红 15 → 全绿；Node 12 套全绿。
+
+### 有意不做的一件事
+
+芒果剩下的 41 张是 `vipcdn.mgtv.com/upload4/mgtv_cashier/` 下的抽奖/支付弹窗背景（`LotteryDialog`、`red_pack_top`、`bg_light` 169KB）。再加一条 `dialog|popup|modal` 就能清光，**但那就是逐站适配的起点**——每加一条都在抬高误杀面，而芒果是 DRM 站、本来就不在支持范围。停在这里，写进报告的「已知局限」。
+
+## d-044 · 2026-10-23 · 抖音探测：不是登录墙，但也没有一条完整地址
+
+用户提「项目还剩两个任务：适配抖音、适配大部分网站」。为了不在猜的基础上排期，先花半小时只 dump 不改代码，判定抖音属于哪一类。结论与最初判断**一半相反**。
+
+**最初的猜测（错的）**：91rb 是游客态不给内容，抖音大概也是登录墙。
+
+**实测（Chrome 156，独立 profile，未登录）**：抖音 `modal_id` 页正常出画面，`<video> dur=602.9s、1290×720`，`currentSrc` 全是 `blob:`。所谓 `loginWall: true` 是我正则匹配到「打开 APP」引导的误判。
+
+**接着撞上真正的墙**：
+
+1. **页面变量里没有播放地址**。`<script id="RENDER_DATA">` 有 134KB 但无 `play_addr`；`_ROUTER_DATA` 是 undefined；`window.RENDER_DATA` 只有 `__reactFiber$` / `__reactProps$` 两个 DOM 引用键。
+   → B 站那套「读 `__playinfo__` 拿 DASH 清单」在抖音**用不上**。
+2. **yt-dlp 裸跑不行**：`ERROR: [Douyin] …: Fresh cookies (not necessarily logged in) are needed`。
+   加 `--cookies-from-browser chrome` → `Could not copy Chrome cookie database`（Chrome 156 锁库/加密，yt-dlp issue 7271）。
+3. **扩展侧 512 条里 8 条媒体全是碎片**：
+   - `douyinvod.com/.../media-video-hvc1/` × 2（各 ~511KB，视频轨分片）
+   - `douyinvod.com/.../media-audio-und-mp4a/` × 2（各 ~160KB，音频轨，**被归成 video**，因为服务端给 `video/mp4`）
+   - `m2` 2.26MB（MSE 录到的视频）、`m1` 833KB / `m3` 1KB（MSE 录到的音频）
+
+**判断 B 类站的关键，不是「有没有 blob」，而是「有没有一条能 Range 到头的地址」。**
+抖音两样都有：`currentSrc` 是 blob，直链也是真的，但每条 `content-length` 只有 2475（206 分片）—— 603 秒的视频不可能只有 500KB，所以抓到的一切都是碎片。
+
+**三个可选方案与代价**：
+
+| 方案 | 代价 | 致命限制 |
+|---|---|---|
+| A 拼 DASH（init + N 片 + 音频轨 + ffmpeg） | 2~3 天 | 分片 URL 各带签名且有时效，脆弱 |
+| B MSE 录制（复用已有 `appendBuffer` hook） | 1 天 | **只能存「播过的部分」**（和 Telegram A3 同病） |
+| C cookie 链 + yt-dlp | 原估 2 天 → **实际低得多** | 见下 |
+
+**C 的成本被一条既有实现砍掉了**：`background.js` 里 `buildCookieHeader()` 早就在用 `chrome.cookies.getAll({url})` 拼 Cookie 头，`downloader.py` 用 `yt-dlp --add-header "Cookie: …"` 递给它（不是 cookie 文件）。`useCookies` 默认 `true`。
+**未验证**：yt-dlp 的 Douyin extractor 报错来自 `self._get_cookies()`（读 cookiejar）还是 HTTP 响应头。如果是前者，`--add-header` 无效、仍需写 Netscape 文件 —— 这是决定 C 是半天还是两天的分水岭，**下一期开工第一件事就是验它**。
+
+**决定**：抖音**不进本轮收尾**，单开一期 v1.4。理由不是难，而是性质不同 —— 前面 22 条都是「已有链路的小缺陷」，这一条是**从没做过的新能力**，三个方案都不干净。收尾阶段做新功能 = 永远收不了尾。
+
+**方法论**：「未登录能不能用」必须实测，不能从别的站类推。这次差一点因为 91rb 的经验，把抖音误判成不可用。
+
 ## d-043 · 2026-10-23 · 两条「HLS 流（视频）」分不清：给列表加行号
 
 **用户**（贴 51cg1 详情页 popup 截图）：「这两个视频无法区分哪个是哪个，像这种就按出现顺序加上序号吧」。

@@ -772,6 +772,34 @@ function pruneStaleImages(rec) {
 const THUMB_HINT = /\/file\/|thumb|avatar|emoji|\/icons?\/|img-apple-64|\/assets\//i;
 // B 站等站的图片 CDN 域名特征（只用于加严，不用于豁免 —— Telegram 的教训）
 const CDN_HINT = /hdslb\.com|alicdn\.com|bdstatic\.com|gtimg\.cn|byteimg\.com|360buyimg\.com/i;
+
+// ---------------------------------------------------------------- 站点 UI 素材的 URL 判据
+//
+// 2026-10-23 审计 19 个国内高频站（见 DEVLOG d-044）的结论：图标过滤几乎全靠
+// DOM 上下文（hint / w / h），而 webRequest-only 的条目这三样全空，于是
+// 「URL 自己就写着它是素材」的图整批漏进图片栏：
+//   高德  _next/static/media/satellite-icon.png(21506B)、logo@2x.png、controlbar/ctb.png
+//   快手  ks-web/web-app-logo.png(9238B)
+//   芒果  apm.log.mgtv.com/s.gif（埋点）、download_client.png、LotteryRedPackDialog/close.png
+//   百度  sp1.baidu.com/…/v.gif?logactid=（埋点）
+//
+// 这些特征都在 URL 里、不依赖 DOM，所以判据落在 URL 形状上是安全的 ——
+// 真封面一个都不命中：B 站 bfs/archive/<hash>.jpg@672w、快手 p*.yximgs.com/upic/…、
+// 淘宝 …_360x360、小红书 …/spectrum/1040g…。
+//
+// 顺序原则：**识别素材的判据必须排在体积线之前**。d-020 那次 47KB 的
+// svg-next 素材就是被 `s > 24KB` 抢先放行的，同一个坑换个站点还会再踩一次。
+const UI_NAME_URL = /(?:^|[\/_.\-@])(?:icon|logo|sprite|favicon|avatar|badge|placeholder|loading|spinner|btn|button)(?:[\/_.\-@]|$)/i;
+// 中文拼音/英文单词直接拼在素材词前面（百度的 wenxinlogo_），上面前缀规则抓不到
+const UI_NAME_GLUED = /[a-z](?:logo|icon)(?:[_.\-@]|$)/i;
+// 站点 UI 的固定目录：地图控件、主题皮肤
+const UI_DIR_PATH = /\/(?:controlbar|toolbar|navbar|nav-bar|skin|themes?)\//i;
+// 埋点/统计像素：统计子域、1×1 gif、埋点参数、阿里 fourier 的 /ts
+const TRACKER_URL = /\/\/(?:[\w-]+\.)*(?:log|apm|track|beacon|stat|pixel|mon|fourier)\.|\/[sv]\.gif(?:$|\?)|[?&](?:logactid|logid|trackid|spm)=|^https?:\/\/[^/]+\/ts$/i;
+// 构建产物目录：Next.js / Vite 打包出来的静态素材
+const BUILD_ASSET_DIR = /\/_next\/static\/media\/|\/static\/media\//i;
+// 2KB 以下的图片不可能是用户要保存的内容（站点图标、间隔物、loading 占位）
+const TINY_IMAGE = 2048;
 // 小红书头像/二维码的 URL 特征：头像走 sns-avatar.xhscdn.com 且路径含 view2/2/w/60 这种
 // 小尺寸裁切，二维码/logo 是 xhscdn.com 上的固定素材。即使页面侧 imgIsXhsDecor 漏了，
 // 这里也能把走 webRequest-only 路径抓到的头像/二维码判成 icon（popup 已过滤 icon）。
@@ -954,7 +982,16 @@ function looksLikeIcon(it, rec) {
   // 而原来的 `if (s > 24KB) return false` 写在 CDN 特征之前 —— 47KB 直接放行，
   // CDN_HINT 那行永远轮不到。现在把「站点素材目录 / 处理后缀」的判断提到前面。
   if (isSiteUiAsset(u)) return true;
+  // URL 自己就写着它是站点素材（埋点 / 构建产物 / 图标名 / 控件目录）。
+  // 不依赖 DOM，所以必须排在体积线之前 —— 21KB 的 satellite-icon.png
+  // 在旧顺序下会被当成「大图」放行。
+  if (TRACKER_URL.test(u)) return true;
+  if (BUILD_ASSET_DIR.test(u)) return true;
+  if (UI_NAME_URL.test(u) || UI_NAME_GLUED.test(u)) return true;
+  if (UI_DIR_PATH.test(u)) return true;
   if (s && s > 24 * 1024) return false;          // 大于 24KB 的先当真图
+  // 2KB 以下不可能是用户要保存的内容；有标题的除外（标题是页面给的「这是内容」信号）
+  if (s > 0 && s < TINY_IMAGE && !String(it.title || "").trim()) return true;
   if (THUMB_HINT.test(u)) return true;
   if (/\.(svg|ico)(\?|$)/i.test(u)) return true; // svg/ico 基本都是图标
   if (CDN_HINT.test(u)) return true;             // 已知图片 CDN 上的无尺寸小文件

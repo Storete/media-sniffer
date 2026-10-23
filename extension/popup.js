@@ -141,6 +141,31 @@ function hideRecorder() {
   return isBiliSite() || isXhsDetailPage() || allItems.some(isHlsItem);
 }
 
+/** 这一页有没有「能完整下载」的真实视频/音频：http(s) 地址 + 已知体积。
+ *
+ *  0 字节的不算 —— 红果短剧会留下一条 `…/360p.mp4` 的空壳（webRequest 抓到
+ *  请求头但没等到 content-length），拿它当「替代品」会把真能下的那条也挤掉。 */
+function hasCompleteMedia(list) {
+  return (list || []).some((it) => (it.k === "video" || it.k === "audio")
+    && /^https?:/i.test(String(it.u || "")) && (it.s || 0) > 0);
+}
+
+/** 有真实直链时，把 blob: 条目从列表里去掉。
+ *
+ *  blob: 是页面 createObjectURL 出来的内部地址，宿主读不到，最多只能录到
+ *  「已播放的部分」。同一条视频既有 blob 又有直链时，两条并排显示，用户点
+ *  blob 那条必然失败（红果 4 条视频里 3 条是这种）。
+ *
+ *  **只在真有替代时删**：Telegram 这类「本来就只有 blob」的站整站如此，
+ *  删了列表会空（hideRecorder 的注释记的是同一件事）。
+ *  **只删 blob:，不删 m\\d+**：m\\d+ 是扩展 appendBuffer 录到的真数据，宿主能
+ *  落盘，是腾讯正片唯一可行的路径。 */
+function dropBlobItems(list) {
+  const src = list || [];
+  if (!hasCompleteMedia(src)) return src.slice();
+  return src.filter((it) => !/^blob:/i.test(String(it.u || "")));
+}
+
 /**
  * 过滤后的条目清单 —— 列表、chip 计数、「全部保存」三处都从这里取，保证口径一致。
  *
@@ -155,6 +180,9 @@ function shownItems() {
   // 「B 站视频（完整 DASH 流）」，点了当然什么也下不下来。
   const hide = hideRecorder();
   let list = hide ? allItems.filter((it) => !isRecorderItem(it)) : allItems.slice();
+  // 有真实直链时 blob 条目是纯噪声（红果/腾讯实测，见 dropBlobItems 注释）。
+  // 放在站点特判之前：B 站的合成条目要等下面才 unshift，不能被这里看见。
+  list = dropBlobItems(list);
   if (isXhsDetailPage()) {
     // 小红书详情页还有一类噪声：页面播放器拉的 m4a 音轨 / m3u8 分片被 webRequest
     // 单独记下来，既没有标题也不是 page 条目，混在「音频」栏里就是一条
