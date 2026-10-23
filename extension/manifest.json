@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "资源嗅探 Media Sniffer",
-  "version": "1.3.40",
+  "version": "1.3.41",
   "description": "自动嗅探当前网页的视频、音频、图片、文档等资源，一键交给本地 yt-dlp 多线程下载。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3TeguACY/F3EmrhRXnbfhXZuL8vMTp336OtlSUpRG/a/bih5b91ytV2tvVFBbXTl/BGFgmzCChpBDPY7+FU51Oa8soNmA8dUq29HSCKmDlpJujunq0WHWGFDfCuvIjd5JEuBQP9CjJE3J1zr1rXP9XqtVo8xIifNo08Y1Yw7wSl/SLIAhFe1qS7Iz6UMF57dHwKaXoekE7EAfYptd8mEFo22+Muq/jiLQuABwHFIY3aJJWUyTwLlepUuSkq69jJep6OjmlZUXv3dVFa7PdI+nXmNgQqYxK6UyAMvkVXoRlXOZo2LYJNdnUnD3AHHqu2kh1IkZUdsXKnjoKvgOTYvLQIDAQAB",
   "minimum_chrome_version": "116",

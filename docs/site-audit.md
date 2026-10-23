@@ -118,3 +118,99 @@ TINY_IMAGE       // 2KB 以下且无标题
 
 **A + E 覆盖绝大多数站，C + D 不该也不用覆盖，剩下的只有 B —— 而 B 每站都要单独写，写不完。**
 所以收口标准不是「支持多少站」，而是 **「A 类成功率做实 + B/C/D 的失败说得清」**。
+
+---
+
+## 六、补测：红果短剧 / 腾讯视频 / 西瓜视频（2026-10-23 晚）
+
+高德换成这三个，理由不同：红果是新的短剧头部站（用户明确要看）、腾讯要确认 DRM 边界、西瓜是国内 MAU 前列。
+
+### 6.1 一句话结论
+
+| 站点 | 类型 | 能不能下 | 证据 |
+|---|---|---|---|
+| **红果短剧** | **A 类**（标准 mp4 直链） | **能，通用层直接下，不用改代码** | `206` + `ftypisom` + `Content-Length: 10004275` + `Accept-Ranges: bytes`，**不带 Referer 也返回 206** |
+| **腾讯视频** | **B 类**（MSE + 私有 TS 分片） | 正片下不了；只有「已播部分」能录 | 4 个 `<video>` 全 `blob:`；分片是**明文 TS**（首字节 `0x47`、标准 PAT），但**没有 m3u8**，每片带独立 `token` |
+| **西瓜视频** | **桌面无网页版** | 无从下手 | `www.ixigua.com` 的任何路径（首页、搜索）都 302 到 `/app/` 下载页；只有 `/<19位数字>` 单视频 URL 不跳 |
+
+### 6.2 红果短剧：两件必须先澄清的事
+
+**① 官方域名是 `hongguoduanju.com`，不是 `hongguo.com`。**
+`hongguo.com` 现在 `ERR_CONNECTION_CLOSED`（已实测，沙箱外 + Clash 都是），只作为跳转页存在。网上大量以 `hongguo88` / `hongguo2026` 命名的仿冒站，写规则时别认错。
+
+**② 游客态能播，且是真直链。**
+`<video src>` 是完整的 `https://v3-hgweb.qznovelvod.com/…?a=8662&…&mime_type=video_mp4`，不是 blob。80 秒、360×640（竖屏短剧），10MB。
+用 curl 直接 Range 取 1KB：`http=206`、`content-type: video/mp4`、魔数 `ftypisom`。**说明红果落在 A 类，现有下载链一行不改就能下。**
+
+**③ 列表噪声集中在两处（修前 42 条）：**
+
+- **23 条 `other` 全是 JS / CSS / 埋点**：`player.6bc08ec74d.js`、`zg.d714d1fb22.js`（1.8MB！）、`mon.zijieapi.com/monitor_browser`、`mcs.zijieapi.com/list`、`abtestvm.bytedance.com`。
+- **4 条「视频」里 3 条是假的**：2 条 `blob:https://hongguoduanju.com/…` + 1 条 0 字节的 `…/video/public/769…/360p.mp4`（webRequest 抓到请求但没等到 content-length）。真正能下的只有那条 10MB 直链。
+
+修后 **42 → 40 条，视频 4 → 2 条，blob 全清**（见第七节）。
+
+### 6.3 腾讯视频：不是 DRM，比 DRM 更尴尬
+
+先说容易判错的一点：**它的分片是明文的。**
+从 `ltscsy.qq.com` 取一片（652924 字节，`content-type: video/MP2T`），首字节 `0x47`，开头是标准 PAT 表（`47 40 00 10 00 00 b0 0d`）—— 没有任何 AES 加密特征。所以「DRM 加密、技术上无法支持」这个说法对腾讯**不准确**。
+
+真实形态是 **私有分片协议**：
+
+- 正片 `<video>` 全是 `blob:`，不是密文，是 MSE 的地址。
+- 分片地址形如 `…/svp_50112/….ts?index=1&start=10880&end=21560&brs=…&bre=…&token=…`，`start/end` 是毫秒区间，每片约 10 秒、500~850KB、**每片一个独立 token**。
+- **没有任何 m3u8**：`performance.getEntriesByType("resource")` 里 89 个资源，媒体请求只有 3 条 `.ts`，清单来自某个 JSON 接口（`vd6.l.qq.com/vinfo_proxy` 这类），接口是私有的。
+
+所以腾讯属于 B 类，但比抖音更难：抖音至少有 `play_addr` 可循，腾讯要逆向播放信息接口 + 按序抓全部分片 + 每片 token 单独处理。
+
+**用户实际能拿到的是**：`m1`/`m2`/`m3`/`m4`（MSE `appendBuffer` 录到的已播部分，实测 4MB + 192KB + 1.7MB + 2.4MB）+ 4 条 `seg`。这也是为什么 `dropBlobItems` **只删 `blob:`、绝不删 `m\d+`** —— 后者是腾讯正片唯一可行的路径。
+
+### 6.4 西瓜视频：站方自己撤了网页版
+
+这个不用怀疑网络或代理：`www.ixigua.com` 的**官方网页标题就是「西瓜视频APP官方下载_安卓版_iOS版」**，网页描述写的是「本站提供西瓜视频APP手机版…官方下载地址与入口」。首页、`/search/美食/` 一律 302 到 `/app/`。
+
+- 桌面浏览器 → 只有下载页，没有播放器，扩展无从嗅探。
+- 手机 UA → 跳 `m.ixigua.com`（200，39KB，SPA），但桌面环境不适用。
+- `https://www.ixigua.com/7300000000000000000`（19 位数字 ID）**不跳转**，说明单视频页还活着，但没有真实 ID 无法验证播放。
+- `yt-dlp` **有 `Ixigua` extractor**，所以「能不能下」这条路是通的，只是不走浏览器。
+
+**结论：西瓜不是扩展该解决的问题。** 用户遇到的需求本质是「给我西瓜视频链接」，那是 yt-dlp 的活。写进已知局限，不做站点钩子。
+
+---
+
+## 七、由这轮暴露的缺陷与修法（1.3.41）
+
+### 症状
+
+红果 4 条「视频」里 3 条点了必失败：2 条 `blob:`（宿主读不到）+ 1 条 0 字节。腾讯 6 条视频里 3 条 `blob:`。而这两站**都不在** `hideRecorder()` 的生效范围里。
+
+### 为什么原来没管
+
+`hideRecorder()` 里写得很清楚：「**必须先确认页面上真有 m3u8 才隐** —— 只认 blob/mN 的站一旦也隐掉，用户就什么都看不到了」。红果和腾讯都没有 m3u8（腾讯是私有 `.ts` 分片），所以 blob 照显示。这是**有意的保守设计**，不是疏忽。
+
+### 新判据：看替代品，不看站名
+
+```js
+function hasCompleteMedia(list) {          // 有能完整下载的真实媒体吗
+  return list.some((it) => (it.k === "video" || it.k === "audio")
+    && /^https?:/i.test(it.u) && (it.s || 0) > 0);
+}
+function dropBlobItems(list) {             // 有，就把 blob 条目去掉
+  if (!hasCompleteMedia(list)) return list.slice();
+  return list.filter((it) => !/^blob:/i.test(it.u));
+}
+```
+
+三条边界都是踩过才知道的：
+
+1. **`s > 0` 是硬条件**。红果那条 0 字节的 `…/360p.mp4` 如果被当成「替代品」，会把真能下的 10MB 直链一起挤掉。0 字节只说明「没拿到 content-length」，不说明「下不了」。
+2. **只删 `blob:`，不删 `m\d+`**。`m\d+` 是扩展 `appendBuffer` 录到的真数据，宿主能落盘，是腾讯正片唯一路径。
+3. **不按站名分派**。这是 B22 的教训（按 `it.page` 分派导致带标题的 HLS 下不了）：决定该不该删的是「这条能不能下」，不是「这是哪个站」。
+
+### 真机验证（Chrome 156，重新 loadUnpacked）
+
+| 站 | 修前 | 修后 |
+|---|---|---|
+| 红果短剧 | 42 条 / 视频 4 条（2 blob + 1 零字节 + 1 直链） | **40 条 / 视频 2 条，blob 0** |
+| 腾讯视频 | 134 条 / 媒体 11 条（3 blob + m1~m4 + 4 seg） | **完全不动** —— 本轮它没抓到任何 http 视频直链，`hasCompleteMedia` 为 false，按设计**不该删** |
+
+第二行是关键：改动没有「顺手」删掉腾讯的 blob，因为那站真的只有 MSE。**这条边界不成立的话，Telegram 整站会变空白**（`test/blob_item.test.js` C 组就是守这个的）。
