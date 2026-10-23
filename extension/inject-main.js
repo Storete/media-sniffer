@@ -2285,13 +2285,9 @@
     log(`读取媒体信息 ${key}`);
     const probeLabel = ctx.kind === "audio" ? "正在读取音频信息…" : "正在读取媒体信息…";
     stage(probeLabel);
-    // 首段可能要等 CORS 预检 + 首字节；超过 PROBE_HINT_AFTER 还没回来就补一句
-    // 「仍在连接…」，配合下面的超时，用户至少知道它没死、也能点取消。
-    const probeHintAt = Date.now();
-    const probeHintTimer = setInterval(() => {
-      const s = Math.round((Date.now() - probeHintAt) / 1000);
-      if (s >= PROBE_HINT_AFTER / 1000) stage(`${probeLabel}（已等 ${s}s，仍在连接，可点取消）`);
-    }, 1000);
+    // 首段可能要等 CORS 预检 + 首字节。这期间的「已等 N 秒 / 仍在连接，可点取消」
+    // 由进度卡自己的心跳统一报（见 uiTick）：以前这里另起一个 1 秒定时器往
+    // 阶段行里写「已等 Ns」，和心跳抢同一块屏幕，卡片上会出现两处不同的计时。
     let probe = null;
     try {
       // 注意 fetchRange 的 end 是**包含式**的：要 cb 个字节就得到 cb-1。
@@ -2321,7 +2317,6 @@
         return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename: name };
       }
     } finally {
-      clearInterval(probeHintTimer);
       stage(probeLabel);
     }
     if (!first) first = probe;
@@ -2894,12 +2889,14 @@
     const base = withPart(wanted || safeFileName(stripExt(fileNameTitle(biliTitle() || ""))) || "bilibili");
     const res = [];
 
-    onStage && onStage("正在下载视频流（完整流，与播放进度无关）…", 0);
+    // 阶段行只说「在做什么」。「（完整流，与播放进度无关）」是解释实现，用户看不懂，
+    // 而且这句说明在点保存前的浮层（站点 saveHint）里已经讲过一次了。
+    onStage && onStage("正在下载完整视频流", 0);
     const v = await biliFetchStream(picked.video, `${base}-video`, onProgress, signal);
     res.push(v);
     let a = null;
     if (picked.audio && !(signal && signal.aborted)) {
-      onStage && onStage("正在下载音频流…", 0);
+      onStage && onStage("正在下载音频流", 0);
       a = await biliFetchStream(picked.audio, `${base}-audio`, onProgress, signal);
       res.push(a);
     }
@@ -2907,13 +2904,13 @@
 
     if (a && v.filename && a.filename && !(signal && signal.aborted)) {
       try {
-        onStage && onStage("合并音视频…", 0);
+        onStage && onStage("合并音视频", 0);
         const ack = await hostRequest(
           { action: "msfile_merge", video: v.filename, audio: a.filename, out: base },
           signal, 45000);
         if (!ack || ack.ok === false) throw new Error((ack && ack.error) || "本地下载器无法开始合并");
         const fin = await hostWaitJob(ack.id, {
-          onProgress: (pct) => onStage && onStage(`合并音视频… ${Math.round(pct)}%`, pct),
+          onProgress: (pct) => onStage && onStage(`正在合并 ${Math.round(pct)}%`, pct),
           signal,
         });
         return {
@@ -3103,8 +3100,8 @@
 
     // 浮层底部说明：B 站是音视频分开落盘、需要 ffmpeg 合并
     saveHint: () => (biliPlayinfo()
-      ? "B 站走完整流抓取（视频流 + 音频流分开落盘），与播放进度无关。"
-        + "下载完成后会用 bin/ 目录自带的 ffmpeg 自动合并成单文件。"
+      ? "保存的是整段视频（不是只存正在播的那一段）：视频和音频分开抓，"
+        + "下载完自动用 bin 目录里的 ffmpeg 合成一个文件。"
       : ""),
 
     // 每次开始保存前清空上报签名：否则 SPA 换集后签名不变，popup 标题停在旧集
@@ -3473,7 +3470,21 @@
 
   // ------------------------------------------------------------ 下载进度卡（页面内悬浮 UI）
 
-  const UI = { root: null, bar: null, text: null, btn: null, job: null, stage: "", lastFile: "" };
+  // 进度条的填充色。抽成常量是因为失败态会把 background 改成红色、下一次开始时
+  // 要复原——写成字面量散在两处，迟早有一处忘同步（真机就翻过：复原时写成了
+  // `""`，整条进度条变成透明，光带扫过去屏幕上什么都看不见）。
+  const UI_BAR_FILL = "linear-gradient(90deg,#3b82f6,#22c55e)";
+
+  const UI = {
+    root: null, bar: null, text: null, btn: null, stage: null, revealBtn: null,
+    job: null, lastFile: "",
+    barAnim: null,   // 不确定进度的光带动画（Web Animations）
+    waiting: false,  // 当前是否处于「不知道还要多久」状态
+    hasBytes: false, // 有没有真实字节数可报——决定进度行归进度回调还是计时器写
+    hasTotal: false, // 有没有拿到总长——拿到就该显示真实百分比
+    t0: 0,           // 本次任务开始时刻，用来报「已等 N 秒」
+    tick: null,      // 心跳计时器句柄
+  };
 
   function uiEnsure() {
     if (UI.root && document.documentElement.contains(UI.root)) return UI.root;
@@ -3503,7 +3514,7 @@
       const barWrap = document.createElement("div");
       barWrap.style.cssText = "height:6px;border-radius:3px;background:rgba(255,255,255,.16);margin:8px 0;overflow:hidden";
       const bar = document.createElement("i");
-      bar.style.cssText = "display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .25s";
+      bar.style.cssText = "display:block;height:100%;width:0;transition:width .25s;background:" + UI_BAR_FILL;
       barWrap.append(bar);
       // 按钮行：取消/关闭在左，「打开所在文件夹」在右（下载完才出现）
       const actions = document.createElement("div");
@@ -3530,82 +3541,156 @@
     }
   }
 
+  /** 打开卡片，并把上一条任务留下的痕迹清干净。 */
   function uiShow(name) {
     const root = uiEnsure();
     if (!root) return;
-    UI.text.textContent = "准备中… " + (name || "");
-    UI.text.title = "";
-    UI.bar.style.width = "0%";
+    UI.text.textContent = "";
+    UI.text.title = name || "";
     UI.btn.textContent = "取消";
     UI.btn.disabled = false;
     UI.stage.textContent = "";
     UI.stage.style.display = "none";
     UI.revealBtn.style.display = "none";
+    // 上一次失败留下的红条要复原。注意是复原成渐变、不是清空——清空等于把
+    // 进度条变成透明，光带扫过去屏幕上什么都没有。
+    UI.bar.style.background = UI_BAR_FILL;
+    UI.hasBytes = false;
+    UI.hasTotal = false;
+    UI.t0 = Date.now();
+    // 一开始就不知道要多久（连总长都还没问出来），直接让光带走起来。
+    // 原来这里写 bar.width = 0% 就不管了，整条流跑几十秒到几分钟，
+    // 用户看到的就是一条永远不动的灰槽。
+    // 先硬复位：卡片可能是上一轮被强行关掉后重建的，此时 UI.waiting 还停在
+    // true，uiSetWaiting 会因为「状态没变」直接返回，进度条就留在 0%。
+    UI.waiting = false;
+    UI.barAnim = null;
+    uiSetWaiting(true);
+    uiStartTick();
+  }
+
+  /**
+   * 不确定进度：进度条里跑一条来回扫的光带。
+   *
+   * 用 Web Animations 而不是注入 <style> + @keyframes：这是页面主世界的脚本，
+   * 往用户页面 <head> 里塞全局样式容易和站点自己的 CSS 打架，而且结束时要能
+   * 精确 cancel——内联 animation-name 得靠改 style 才能撤，容易残留。
+   */
+  function uiSetWaiting(on) {
+    if (!UI.bar) return;
+    if (!!on === UI.waiting) return;
+    UI.waiting = !!on;
+    if (!on) {
+      if (UI.barAnim) { try { UI.barAnim.cancel(); } catch (e) { /* 忽略 */ } UI.barAnim = null; }
+      UI.bar.style.marginLeft = "";
+      return;
+    }
+    UI.bar.style.width = "34%";
+    try {
+      UI.barAnim = UI.bar.animate(
+        [{ marginLeft: "-34%" }, { marginLeft: "100%" }],
+        { duration: 1200, iterations: Infinity, easing: "ease-in-out" }
+      );
+    } catch (e) {
+      // 老内核没有 Web Animations：退化成半宽的静态条，至少不是 0% 空槽
+      UI.barAnim = null;
+    }
   }
 
   function uiProgress(got, total, speed, name) {
     const root = uiEnsure();
     if (!root) return;
     lastUiAt = Date.now();
-    const pct = total ? (got / total) * 100 : 0;
-    UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
-    const parts = total > 0
-      ? [`${pct.toFixed(1)}%  ${fmtBytes(got)} / ${fmtBytes(total)}`]
-      : [fmtBytes(got)];
-    if (speed) parts.push(fmtBytes(speed) + "/s");
-    // 有阶段名时保留阶段标签行，数字行只放进度，避免两种信息互相覆盖
-    if (UI.stage && UI.stage.style.display !== "none" && UI.stage.textContent) {
+    UI.hasBytes = true;
+    if (total > 0) {
+      UI.hasTotal = true;
+      uiSetWaiting(false);
+      const pct = (got / total) * 100;
+      UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      const parts = [`${pct.toFixed(1)}%  ${fmtBytes(got)} / ${fmtBytes(total)}`];
+      if (speed) parts.push(fmtBytes(speed) + "/s");
       UI.text.textContent = parts.join("  ·  ");
     } else {
-      UI.text.textContent = parts.join("  ·  ") + (name ? "  ·  " + name : "");
+      // 总长未知（Telegram 的单段流、B 站整条流刚开始）：光带继续跑，只报已收
+      const parts = [fmtBytes(got)];
+      if (speed) parts.push(fmtBytes(speed) + "/s");
+      UI.text.textContent = parts.join("  ·  ");
     }
     UI.text.title = name || "";
   }
 
-  // 心跳：上一次真正拿到新字节的时间。Telegram 的单段要 1-6 秒才回来，
-  // 那期间进度条完全不动，用户会以为卡死（真机反馈「卡到 17%」就是这么来的）。
-  // 超过 1.2 秒没新字节就补一行「等待数据…」，让人知道还在跑。
+  // 进度行的心跳。
+  //
+  // 两种「看着像卡死」原因不同，说的话也不一样：
+  //   - 还没有任何字节（首段要等 CORS 预检、服务器迟迟不回）→ 报「已等 N 秒」
+  //   - 有字节但 1.2 秒没新进展（Telegram 单段要 1-6 秒才回来）→ 补「等待数据…」
+  // 计时**只在这里做**：以前 runRangeDownload 自己带一个 probeHintTimer 往阶段行
+  // 写「已等 Ns」，和这里抢同一句话，卡片上就出现两处不同的计时。
+  const UI_TICK = 500;
   let lastUiAt = 0;
-  let uiHeartbeat = null;
-  function startUiHeartbeat() {
-    stopUiHeartbeat();
-    lastUiAt = Date.now();
-    uiHeartbeat = setInterval(() => {
-      if (!UI.root) return;
-      const idle = Date.now() - lastUiAt;
-      if (idle < 1200) return;
-      const base = UI.text.textContent.replace(/\s*·\s*等待数据…$/, "");
+
+  function uiTick() {
+    if (!UI.root) { uiStopTick(); return; }
+    const now = Date.now();
+    if (!UI.hasBytes) {
+      const secs = Math.floor((now - UI.t0) / 1000);
+      if (secs < 3) return;  // 刚开始那两秒别闪
+      let s = `已等 ${secs} 秒`;
+      if (now - UI.t0 >= PROBE_HINT_AFTER) s += "  ·  仍在连接，可点取消";
+      UI.text.textContent = s;
+      return;
+    }
+    if (UI.hasTotal) {
+      if (now - lastUiAt < 1200) return;
+      const base = String(UI.text.textContent || "").replace(/\s*·\s*等待数据…$/, "");
       UI.text.textContent = base + "  ·  等待数据…";
-    }, 600);
-  }
-  function stopUiHeartbeat() {
-    if (uiHeartbeat) { clearInterval(uiHeartbeat); uiHeartbeat = null; }
+    }
   }
 
+  function uiStartTick() {
+    uiStopTick();
+    lastUiAt = Date.now();
+    UI.tick = setInterval(uiTick, UI_TICK);
+  }
+
+  function uiStopTick() {
+    if (UI.tick) { clearInterval(UI.tick); UI.tick = null; }
+  }
+
+  function startUiHeartbeat() { uiStartTick(); }
+  function stopUiHeartbeat() { uiStopTick(); }
+
   /**
-   * 阶段提示（下载视频流 / 音频流 / 合并中）。
+   * 阶段行：只说「正在做什么」。
    *
-   * 第 3 点要求：下载视频时提示「正在下载视频」，下载音频时提示「正在下载音频」。
-   * 做法是把阶段名放进独立的 stage 标签行（蓝色小字），并让它**优先于**
-   * uiProgress 的纯数字行——否则每 400ms 一次进度回调就会把阶段名冲掉。
-   * 当前阶段同时记在 UI.stage，供 uiProgress 拼前缀。
+   * 这里**不再写进度行**。真机图二里那两行一模一样，就是因为本函数最后还有
+   * 一句 `UI.text.textContent = t`——同一句话被写进了两个元素，一上一下重复。
+   * 现在分工是死的：阶段行进阶段行，数字/耗时进进度行，谁也不碰对方。
    */
   function uiStage(text, pct) {
     const root = uiEnsure();
     if (!root) return;
-    if (typeof pct === "number") UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
     if (!text) return;
     const t = String(text).trim();
-    // 合并阶段不属于「下载视频/音频」，也让标签行如实反映
     UI.stage.textContent = t;
-    UI.stage.style.display = t ? "block" : "none";
-    UI.text.textContent = t;
+    UI.stage.style.display = "block";
+    if (typeof pct === "number" && pct > 0) {
+      // 有真实百分比（合并音视频会报）：切回确定进度
+      UI.hasTotal = true;
+      uiSetWaiting(false);
+      UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    } else if (!UI.hasBytes) {
+      // 还没开始收字节：光带跑起来，别给一条 0% 的死槽
+      uiSetWaiting(true);
+    }
   }
 
   function uiDone(ok, msg, file) {
     const root = uiEnsure();
     if (!root) return;
     stopUiHeartbeat();
+    // 结束态必须是「确定的」：光带还在扫、进度条还在半路，都没有意义
+    uiSetWaiting(false);
     UI.stage.style.display = "none";
     UI.text.textContent = ok ? "完成 · " + msg : "失败 · " + msg;
     UI.text.title = msg || "";
@@ -3641,6 +3726,10 @@
       }
       // 成功自动消失：原来固定 6s，现在有「打开文件夹」按钮，给足 12s
       setTimeout(() => { try { if (UI.root) { UI.root.remove(); UI.root = null; } } catch (e) { /* 忽略 */ } }, 12000);
+    } else {
+      // 失败时别把条丢在半路：铺满并转红，用户一眼就知道「这条没下完」
+      UI.bar.style.width = "100%";
+      UI.bar.style.background = "#ef4444";
     }
   }
 
@@ -4082,6 +4171,9 @@
   window.__msBiliCurrentCid = biliCurrentCid; // 供真机排查
   window.__msParseSidxTotal = parseSidxTotal;
   window.__msStartMediaDownload = startMediaDownload;
+  // 页面内进度卡的显示层（测试要直接断言「阶段行/进度行各写什么」）
+  window.__msUiCard = () => UI;
+  window.__msUiApi = { show: uiShow, progress: uiProgress, stage: uiStage, done: uiDone, tick: uiTick };
   window.__msNativeMedia = () => [...mediaSeen.entries()].map(([u, v]) => ({ url: u, ...v }));
   window.__msFileNameTitle = fileNameTitle; // 文件名截断规则（测试要直接断言）
   window.__msSafeFileName = safeFileName;   // 文件名清洗（百分号解码 / 首尾点 / 非法字符）
