@@ -62,18 +62,24 @@ Chrome 扩展「资源嗅探 Media Sniffer」+ 本地 Python 宿主。
 # 语法
 for f in extension/*.js; do node --check "$f" || exit 1; done
 
-# JS 单元测试（7 套）
+# JS 单元测试（8 套）
 node test/background.test.js
 node test/detect.test.js
 node test/main-hook.test.js
 node test/pattern_sync.test.js
 node test/popup_wiring.test.js
 node test/range_parallel.test.js
+node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（8 套，自动跳过缺 ffmpeg 的）
+# Python（16 套，自动跳过缺 ffmpeg 的）
 python test/run_all.py
 ```
+
+提示：`test/*.test.js` 全套共 14 个文件（上面 8 个之外还有 `icon_filter`、`blob_item`、`ui_card`、
+`focus_scope`、`group_key`、`review`）；其中 `focus_scope` / `group_key` 只在失败时输出，
+`review.test.js` 由 `background.test.js` 引入执行，单独跑会提示跳过。整套跑法：
+`for f in test/*.test.js; do node "$f"; done`。
 
 **说「通过」之前必须真的跑过，并贴出数字。** 不许写「应该能过」。
 
@@ -134,7 +140,7 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 7 套 JS + 8 套 Python 全绿，数字记进 `DEVLOG.md`
+- [ ] 8 套 JS + 16 套 Python 全绿，数字记进 `DEVLOG.md`
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行
 - [ ] `DEVELOPMENT.md` 待办状态已更新
 - [ ] `manifest.json` 版本号已升

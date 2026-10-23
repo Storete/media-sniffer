@@ -11,6 +11,10 @@
 // service worker 是经典脚本，用 importScripts 挂到全局 MSDetect 上。
 try { importScripts("detect.js"); } catch (e) { console.warn("detect.js 未加载", e); }
 
+// 会话数据契约（产品化 L0）。纯函数，只挂全局 MSSession，**不改任何现有行为**——
+// 这一版是先让模型存在并与旧路径并行对照，等 popup/下载侧都切过去之后再删旧路径。
+try { importScripts("session.js"); } catch (e) { console.warn("session.js 未加载", e); }
+
 const HOST_NAME = "com.starmediasniffer.host";
 const MAX_PER_TAB = 5000;
 const MAX_SEGMENTS = 400;

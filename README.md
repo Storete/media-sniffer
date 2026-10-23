@@ -313,6 +313,7 @@ media-sniffer/
 ├── extension/               扩展本体（加载这个目录）
 │   ├── manifest.json        固定了 key，所以 ID 稳定
 │   ├── background.js        嗅探 + 分类 + 调宿主
+│   ├── session.js           会话数据契约（纯函数；把扁平条目整理成 tracks/variants/manifest）
 │   ├── inject-main.js       ★ 页面主世界 hook（Blob / MSE / B 站 DASH / 小红书）
 │   ├── content.js           页面 ↔ 扩展的搬运层
 │   ├── popup.html/css/js    列表界面
@@ -334,6 +335,7 @@ media-sniffer/
 │   ├── popup_wiring.test.js popup 接线单测（47 项）
 │   ├── ui_card.test.js      进度卡与阶段文案单测（39 项）
 │   ├── detect.test.js       类型判定单测（30 项）
+│   ├── session_model.test.js 会话数据契约单测（69 项）
 │   ├── icon_filter.test.js  图标/噪声过滤单测（20 项）
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
