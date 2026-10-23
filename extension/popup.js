@@ -558,8 +558,8 @@ function renderList() {
     return;
   }
 
-  for (const it of items) {
-    box.append(renderItem(it));
+  for (let i = 0; i < items.length; i++) {
+    box.append(renderItem(items[i], i + 1));
   }
 }
 
@@ -618,7 +618,24 @@ function canPreviewSrc(it) {
   return /^(https?|blob|data):/i.test(u);
 }
 
-function renderItem(it) {
+/**
+ * 渲染一条。
+ *
+ * @param {object} it 条目
+ * @param {number} [no] 行号 = 它在**当前列表**里的位置（1 起）。
+ *
+ * 为什么要有行号（2026-10-23 用户 51cg1 截图）：同一个视频在列表里出现两条，
+ * 一条是页面钩子上报的（带站点标题）、一条是 webRequest 抓的（无标题），
+ * 两条都叫「HLS 流（视频）」，用户的原话是「无法区分哪个是哪个」——
+ * 点错了下到的是另一路流。行号让人能说「第 2 条」，也让截图能对上号。
+ *
+ * 与 ①②③（it.mark）**不是一套东西**，别混：
+ *   · ①②③ 由 background 按「消息/标题」分组编，表达「这是这条消息里的第几张」，
+ *     写在名字里，跟着标题一起被截断；
+ *   · 行号是「列表里的第几行」，随筛选/排序变，表达位置而不表达归属。
+ * 所以行号单独占一列，在类型徽标左边。
+ */
+function renderItem(it, no) {
   const row = el("div", "item");
   const isPage = !!it.page;
 
@@ -645,6 +662,11 @@ function renderItem(it) {
     if (box.checked) row.classList.add("picked");
     row.append(box);
   }
+
+  // 行号放在勾选框**右边**：批量模式下勾选框占最左，是全局一致的约定；
+  // 行号紧贴类型徽标，两种模式下都落在同一列，不会左右跳。
+  const noEl = el("div", "no", no ? String(no) : "");
+  row.append(noEl);
 
   const badge = el("div", "badge " + it.k, KIND_ICON[it.k] || "?");
   badge.title = (isPage ? "页面内捕获 · " : "") + (KIND_LABEL[it.k] || it.k);

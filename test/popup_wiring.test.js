@@ -96,6 +96,22 @@ check("HLS 不许进「保存所选」批量（否则批量下一堆清单文本
 check("页面条目下载时用标题当文件名（否则落盘是哈希名）",
   /filename: it\.f \|\| \(it\.title \? shortTitle\(it\.title\) : ""\)/.test(JS));
 
+console.log("[8] 列表行号：按出现顺序编号（用户 2026-10-23 51cg1 截图）");
+// 51cg1 详情页有两条 m3u8：一条页面钩子上报（有站点标题）、一条 webRequest 抓的（无标题）。
+// 两条都叫「HLS 流（视频）」，用户看不出哪个是哪个 —— 点错了下到的是另一路流。
+// 行号必须是**当前列表的显示顺序**，不是 it.idx（那是 ①②③ 的池子，按消息分组编的）。
+check("renderList 把显示顺序传给 renderItem",
+  /for \(let i = 0; i < items\.length; i\+\+\)\s*\{\s*box\.append\(renderItem\(items\[i\], i \+ 1\)\);\s*\}/.test(JS));
+check("renderItem 接收行号", /function renderItem\(it, no\)/.test(JS));
+check("行号建成独立的 .no 元素（不混进 displayName，否则会被标题截断吃掉）",
+  /const noEl = el\("div", "no"/.test(JS));
+check("行号排在类型徽标之前", JS.indexOf('row.append(noEl)') >= 0
+  && JS.indexOf('row.append(noEl)') < JS.indexOf('row.append(badge)'));
+check("批量模式下勾选框在最左（行号在它右边，两种模式同一列）",
+  JS.indexOf("row.append(box)") >= 0 && JS.indexOf("row.append(box)") < JS.indexOf("row.append(noEl)"));
+check("CSS 给 .no 固定宽度（否则名字列宽随序号位数跳动）",
+  /\.no\s*\{[\s\S]{0,160}flex:\s*0 0 \d+px/.test(CSS));
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);
