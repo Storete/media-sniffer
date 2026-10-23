@@ -30,7 +30,7 @@ jobs:
       # background 末尾会 require 三个子回归：review（R1~R4 共 27 项）、
       # group_key（G1~G4 共 23 项）、focus_scope（F1~F3 共 20 项），
       # 所以这里的数字包含三批。这三个文件都不能单独跑，直接跑只会打印一行说明。
-      - name: background（249 项，含 review 27 + group_key 25 + focus_scope 20）
+      - name: background（266 项，含 review 27 + group_key 25 + focus_scope 20）
         run: node test/background.test.js
 
       - name: range_parallel（14 项）
@@ -42,8 +42,20 @@ jobs:
       - name: pattern_sync（4 项）
         run: node test/pattern_sync.test.js
 
-      - name: popup_wiring（30 项）
+      - name: popup_wiring（47 项）
         run: node test/popup_wiring.test.js
+
+      # 进度卡与阶段文案（1.3.38 起）：防止界面上出现「与播放进度无关」这类解释性废话
+      - name: ui_card（39 项）
+        run: node test/ui_card.test.js
+
+      # 图标/噪声过滤（1.3.40 起）：6 条 URL 判据 + 真封面误杀回归
+      - name: icon_filter（20 项）
+        run: node test/icon_filter.test.js
+
+      # blob 条目取舍（1.3.41 起）：有真实直链才隐藏 blob，且绝不删 m\d+
+      - name: blob_item（18 项）
+        run: node test/blob_item.test.js
 
       # 架构约束：通用层不许出现站点专属判断（防模块化回退成 if 汤）
       - name: site_registry（103 项）

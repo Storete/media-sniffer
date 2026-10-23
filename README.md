@@ -4,6 +4,8 @@
 
 一个自己写的 Chrome 扩展：**自动嗅探当前网页的所有资源**，视频/音频交给本地 yt-dlp 多线程下载，图片/文档等直接抓取。没有限额、没有限速、不采集数据。
 
+> **先说边界**：能下的是「有一条能 Range 到头的地址」的站（下面 [支持范围](#支持范围) 里的 A 类与 E 类）；DRM 与登录墙不做；MSE 站（B 类）逐站适配。国内 20 个高频站的实测数据在 [`docs/site-audit.md`](docs/site-audit.md)。
+
 ![B 站视频嗅探](docs/screenshot-bili.png)
 
 ---
@@ -212,6 +214,38 @@ MTProto 分块传输 → 浏览器端解密 → 拼成完整 Blob / 喂进 MSE �
 
 ---
 
+## 支持范围
+
+**一句话判据：这个站有没有一条能 Range 到头的地址。** 有 → 直接能下；没有 → 才会落进下面 B / C / D 三种情况。
+
+| 类 | 站点长什么样 | 例子 | 支持 |
+|---|---|---|---|
+| **A** 标准流 | `<video src>`，或 `.mp4` / `.m3u8` 能 Range 到末尾 | 红果短剧、微博、今日头条、绝大多数图文与资讯站 | ✅ 开箱可用，不用为它写任何适配 |
+| **B** MSE / Blob | 播放器边下边拼，页面拿不到完整地址 | B 站（✅ 读 `__playinfo__` 的 DASH 清单 + ffmpeg 合并）、Telegram（✅ 页面内 hook）、抖音（❌ 未做）、腾讯视频（⚠️ 只有已播片段） | 每站单独写，写不完 |
+| **C** DRM | Widevine 等加密 | 芒果 TV、爱奇艺 / 优酷 / 腾讯的正片 | ❌ 不做 |
+| **D** 登录墙 | 游客态不给播放器 | 91rb 等 | ❌ 技术无解，不是缺陷 |
+| **E** 伪装 / 加密分片 | 清单长得正常、内容是壳 | 4kvm（PNG 壳分片）、51cg1（AES-128 + 分片断流） | ✅ 剥壳 + 分片退避重试 + 魔数判完成 |
+
+**A + E 覆盖绝大多数站；C + D 不该也不必覆盖；剩下的只有 B，而 B 每站都要单独写。**
+所以这里不承诺「支持多少个站」，只承诺两件事：**A 类下得稳，B / C / D 失败时说清为什么。**
+
+2026-10-23 用 Chrome 156 + 游客态实测了国内 20 个高频站点（抖音另测），完整数据与原始计数在 [`docs/site-audit.md`](docs/site-audit.md)。三个结构性结论：
+
+- 真正有缺陷的只有 4 个站（百度 logo、支付宝极小图标、高德地图控件图标、芒果弹窗素材），1.3.40 已修
+- 京东 316 张商品图、淘宝 / 拼多多的商品图**不是噪声**，是页面真实内容，如实反映
+- 首页只能量噪声、量不了下载能力：B 站 / 小红书 / 腾讯视频首页 `video` 全为 0，视频要点进详情页才创建播放器
+
+### 看到这些现象别当成 bug
+
+| 现象 | 原因 |
+|---|---|
+| 图片栏几十上百张（京东、淘宝、小红书） | 页面本来就有这么多图，列表如实反映 |
+| 同一个视频既有 `blob:` 又有 http 直链 | 有真实直链时 `blob:` 条目会自动隐藏（1.3.41）；**没有替代品时会保留**，因为它们可能是唯一能录到数据的路径 |
+| 视频条目点了失败 | 大概率是 B / C / D 类：MSE 需要登录态播放、地址已过期（刷新页面重抓）、DRM 不支持 |
+| 刚打开页面时列表是空的 | 视频还没创建播放器。滚一滚、点一下播放，再点右上角 **⟳** |
+
+---
+
 ## 能力对照
 
 | | 这个扩展 |
@@ -231,6 +265,16 @@ MTProto 分块传输 → 浏览器端解密 → 拼成完整 Blob / 喂进 MSE �
 ---
 
 ## 排错
+
+**点了下载但失败：先对这三类**
+
+| 提示 / 现象 | 是什么 | 怎么办 |
+|---|---|---|
+| 需要登录态播放 / 视频条目点了没反应 | B 类 MSE 站。播放地址在播放器内部，扩展只能录到**已经播过的部分** | 登录后把视频**播放一遍**再点 ⟳；B 站是特例，能直接拿完整 DASH |
+| 地址过期 / 下到一半 403 | 签名直链有有效期，腾讯、爱奇艺这类只有几分钟 | 刷新页面重新抓，别复用旧链接 |
+| DRM 内容（爱奇艺 / 优酷 / 芒果 / 腾讯正片） | 加密流，解密等于破解 Widevine | 不支持，也不会做 |
+
+扩展在 `扩展` 与 `本地下载器` 之间的失败原因会显示在任务卡上（形如「失败 · 自实现 HLS: … ／ yt-dlp: … ／ 直连: …」），先看那行再说。
 
 **扩展提示「未安装本地下载器」**
 
@@ -284,11 +328,18 @@ media-sniffer/
 │   └── *.example            本机配置模板（install 时生成真实文件）
 ├── test/
 │   ├── page.html            浏览器手动测试页（Blob / MSE）
-│   ├── main-hook.test.js    inject-main.js 单测（120 项）
-│   ├── background.test.js   background.js 单测（88 项）
+│   ├── background.test.js   background.js 单测（266 项，另引入 focus_scope / group_key / review）
+│   ├── main-hook.test.js    inject-main.js 单测（195 项）
+│   ├── site_registry.test.js 站点注册表单测（103 项）
+│   ├── popup_wiring.test.js popup 接线单测（47 项）
+│   ├── ui_card.test.js      进度卡与阶段文案单测（39 项）
+│   ├── detect.test.js       类型判定单测（30 项）
+│   ├── icon_filter.test.js  图标/噪声过滤单测（20 项）
+│   ├── blob_item.test.js    blob 条目取舍单测（18 项）
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
-│   └── *.py                 宿主侧 Python 测试（8 套）
-├── docs/                    截图
+│   ├── pattern_sync.test.js 扩展与宿主的正则同步校验（4 项）
+│   └── *.py                 宿主侧 Python 测试（15 套）
+├── docs/                    截图 + 站点审计报告（site-audit.md）
 ├── bin/                     ffmpeg 放这里（不进仓库）
 └── gen_icons.py             图标生成脚本
 ```
@@ -302,12 +353,22 @@ media-sniffer/
 ## 跑测试
 
 ```bash
-# JS（需要 Node 18+，不需要 npm install）
-node test/main-hook.test.js        # 120 项
-node test/background.test.js       # 88 项
+# JS（需要 Node 18+，不需要 npm install）—— 13 套 / 736 项
+node test/background.test.js       # 266 项（含 focus_scope / group_key / review）
+node test/main-hook.test.js        # 195 项
+node test/site_registry.test.js    # 103 项
+node test/popup_wiring.test.js     # 47 项
+node test/ui_card.test.js          # 39 项
+node test/detect.test.js           # 30 项
+node test/icon_filter.test.js      # 20 项
+node test/blob_item.test.js        # 18 项
 node test/range_parallel.test.js   # 14 项
+node test/pattern_sync.test.js     # 4 项
 
-# Python（不需要 pytest，也不装任何依赖）
+# 全跑一遍（bash）
+for f in test/*.test.js; do node "$f"; done
+
+# Python（15 套，不需要 pytest，也不装任何依赖）
 python test/run_all.py             # 一串跑完并汇总（没装 ffmpeg 的套件自动 SKIP）
 
 # 或单个跑
@@ -316,7 +377,7 @@ cd test && for f in *_test.py; do python "$f"; done
 
 `big_file_test.py` 是慢速大文件测试（默认不纳入 `run_all.py`），跑到 120 秒超时是预期的。
 
-推送到 GitHub 时 `tests.yml` 会自动跑上面这些：JS 三套在 Node 18/20/22 上各跑一遍，
+推送到 GitHub 时 `tests.yml` 会自动跑上面这些：JS 套件在 Node 18/20/22 上各跑一遍，
 Python 在 Ubuntu + Windows 上跑（`host_merge_test.py` 等需要真 ffmpeg 的套件在没装 ffmpeg 的环境里自动跳过）。
 
 ---
