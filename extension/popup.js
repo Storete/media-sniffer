@@ -624,7 +624,8 @@ function renderItem(it) {
 
   // 批量选择只对 page=1 的条目开放：这类数据必须由页面自己取（和「保存」同一条
   // 链路），直链条目的批量下载另有语义，混在一起容易下出一堆意外文件。
-  if (selecting && isPage) {
+  // HLS 也要排除：它必须走本地下载器，混进「保存所选」等于批量下一堆清单文本。
+  if (selecting && isPage && !isHlsItem(it)) {
     const box = document.createElement("input");
     box.type = "checkbox";
     box.className = "sel-box";
@@ -694,7 +695,17 @@ function renderItem(it) {
 
   const ops = el("div", "ops");
 
-  if (isPage) {
+  // HLS 条目**一律走本地下载器**，不管它是页面钩子上报的还是 webRequest 抓的。
+  //
+  // 真机（2026-10-22 51cg1，用户截图）：DPlayer 页面的 `data-config` 里读出来的那条
+  // m3u8 带站点标题，看着最像「该点的那一条」，可它 page=1 → 走下面的页面分支 →
+  // 只有「预览 / 保存」。而「保存」这条链路是给 Telegram（blob 地址、要在页面里
+  // 带 Range、512KB 限制）和 B 站（`__playinfo__`）设计的：点下去页面会去 Range 拉
+  // 那个 m3u8，拿到的是 **38.5KB 的清单文本**，不是视频 —— 用户的原话就是
+  // 「上面那个用不了，下面那个能用」。
+  // m3u8 只有「几百个分片拼一个文件」这一种下法，宿主才会拼，所以按类型分派，
+  // 不按来源分派。
+  if (isPage && !isHlsItem(it)) {
     // 预览：判据见 canPreviewSrc() 的注释（blob: 也放行，Telegram 靠它）。
     //
     // 为什么不给 MSE（u 就是 "m1"/"m2"）：那是录制的合成条目，扩展页拼不出
@@ -734,7 +745,9 @@ function renderItem(it) {
   open.addEventListener("click", () => chrome.tabs.create({ url: it.u }));
   ops.append(open);
 
-  if (canPreviewSrc(it)) {
+  if (canPreviewSrc(it) && !isHlsItem(it)) {
+    // m3u8 不挂预览：Chrome 的 <video> 不会放 HLS（扩展页更没有 hls.js），
+    // 点开必然「预览加载失败」，比没有按钮更让人困惑。
     const pv = el("button", "btn", "预览");
     pv.addEventListener("click", () => showPreview(it));
     ops.append(pv);
@@ -958,7 +971,10 @@ async function startDownload(it, btn) {
     type: "native:download",
     url: it.u,
     kind: it.k,
-    filename: it.f,
+    // 页面钩子上报的条目没有 it.f（那是 webRequest 侧按 URL 推出来的名字），
+    // 但通常**有标题**。不给名字的话落盘就是 `d41c6e6e…11260.mp4` 这种哈希，
+    // 用户下完根本认不出是哪一集（真机 2026-10-22 的现场就是这个文件名）。
+    filename: it.f || (it.title ? shortTitle(it.title) : ""),
     referer: it.i || tabUrl,
     tabUrl,
     // background 需要它才能在「地址过期」时刷新对应标签页重取 m3u8

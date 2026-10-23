@@ -33,7 +33,7 @@ for (const id of ["selectToggle", "batchBar", "selAllBox", "selInv", "selSave", 
 check("#selectToggle 绑定了 setSelecting", /#selectToggle"\)\.addEventListener\("click",\s*\(\)\s*=>\s*setSelecting/.test(JS));
 check("#selSave 绑定了 saveSelected", /#selSave"\)\.addEventListener\("click"/.test(JS));
 check("批量条默认隐藏", /id="batchBar" class="batch-bar hidden"/.test(HTML));
-check("勾选框只给 page 条目", /if \(selecting && isPage\)/.test(JS));
+check("勾选框只给 page 条目（HLS 除外，见 [7]）", /if \(selecting && isPage && !isHlsItem\(it\)\)/.test(JS));
 check("保存所选复用 page:save-batch", /type: "page:save-batch"/.test(JS));
 
 console.log("[3] 屏蔽站点");
@@ -80,6 +80,21 @@ check("结束态要摘掉 wait 类（否则光带一直走）",
   (JS.match(/classList\.remove\("wait"\)/g) || []).length >= 2);
 check("CSS 有 wait 的动画", /\.job\.wait \.bar i\s*\{[\s\S]{0,120}animation:\s*jobwait/.test(CSS));
 check("CSS 有 jobwait 关键帧", /@keyframes jobwait/.test(CSS));
+
+console.log("[7] HLS 条目按类型分派，不按来源分派（B22）");
+// 真机 2026-10-22：DPlayer 页面 data-config 里读出来的那条 m3u8 带站点标题、看着最像
+// 「该点的那条」，但它 page=1 → 只给「预览/保存」；点保存 = 页面去 Range 拉 m3u8，
+// 拿到 38.5KB 清单文本。用户原话：「上面那个用不了，下面那个能用」。
+check("页面分支要排除 HLS（否则带标题的 HLS 只能「保存」）",
+  /if \(isPage && !isHlsItem\(it\)\)/.test(JS));
+check("非页面分支的下载按钮仍在（HLS 走这条）",
+  /const dl = el\("button", "btn primary", "下载"\)/.test(JS));
+check("HLS 不挂预览（Chrome 的 video 不会放 HLS，点了必然失败）",
+  /canPreviewSrc\(it\) && !isHlsItem\(it\)/.test(JS));
+check("HLS 不许进「保存所选」批量（否则批量下一堆清单文本）",
+  /if \(selecting && isPage && !isHlsItem\(it\)\)/.test(JS));
+check("页面条目下载时用标题当文件名（否则落盘是哈希名）",
+  /filename: it\.f \|\| \(it\.title \? shortTitle\(it\.title\) : ""\)/.test(JS));
 
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
