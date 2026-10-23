@@ -230,6 +230,87 @@ PROGRESS_TPL = (
 
 PLAYLIST_MAX = 256 * 1024
 
+# 真视频的下限。只用来挡「只有前几个字节正确」的残片，所以定得很低：
+# 播放列表只有几十 KB，但**判是不是视频靠的是魔数，不是体积**——真短视频
+# （十几秒的片段）几百 KB 也得认，把线画在 1MB 会把正常成片误判成失败，
+# 而失败会让人以为白下了一遍。64KB 足够采样 TS 的 188×5 个同步点。
+MEDIA_MIN = 64 * 1024
+
+
+def is_real_media(path, min_size=MEDIA_MIN):
+    """按**魔数**判断这是不是一个真视频文件。
+
+    为什么不能只看扩展名：「扩展名是 yt-dlp 按 content-type 猜的」——m3u8 的
+    content-type 是 `application/vnd.apple.mpegurl`，猜不出来时会被存成没有
+    扩展名的 `<base>`；反过来 `.mp4` 里装的也可能是 TS 字节（d-032 真机）。
+    所以 done 的判据必须落到文件头。
+
+    认得的容器：mp4/mov(ftyp)、mkv/webm(EBML)、avi(RIFF)、flv、ogg、mp3/aac(帧同步)、
+    以及 MPEG-TS（0x47 起始 + 188 周期连续命中）。
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) < min_size:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(16)
+            if len(head) < 12:
+                return False
+            if head[4:8] == b"ftyp":
+                return True
+            if head.startswith(b"\x1a\x45\xdf\xa3"):        # EBML：mkv / webm
+                return True
+            if head.startswith(b"RIFF") and head[8:12] == b"AVI ":
+                return True
+            if head.startswith(b"FLV\x01"):
+                return True
+            if head.startswith(b"OggS"):
+                return True
+            if head.startswith(b"ID3") or (head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+                return True
+            if head[0:1] == b"\x47":                        # MPEG-TS
+                for k in range(1, 5):
+                    f.seek(k * TS_PACKET)
+                    if f.read(1) != b"\x47":
+                        return False
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def find_done_product(outdir, base):
+    """在这次任务的产物里挑出最大的一个**真视频**，挑不到返回空串。
+
+    只认 `<base>.*`，所以：
+      · 不会挑到裸的 `<base>`（那正是「只下到播放列表」时被存下来的清单）
+      · 不会挑到 `job2.mp4` 这种名字相近的别的任务
+    取最大而不是第一个：同一个 base 下可能同时躺着半截残片和完整成片。
+    """
+    if not outdir or not base or not os.path.isdir(outdir):
+        return ""
+    best, best_size = "", 0
+    try:
+        names = os.listdir(outdir)
+    except OSError:
+        return ""
+    prefix = base + "."
+    for n in names:
+        if not n.startswith(prefix):
+            continue
+        p = os.path.join(outdir, n)
+        if not is_real_media(p):
+            continue
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            continue
+        if sz > best_size:
+            best, best_size = p, sz
+    return best
+
+
 
 def looks_like_playlist(path):
     """产物是不是 HLS/DASH 播放列表文本。
@@ -266,10 +347,12 @@ def cleanup_ytdlp_junk(outdir, base):
     而本机 safe-delete 一次删 >50 文件会被拦 → 越积越多，「以后再说」等于
     永远清不掉。
 
-    只认三类，宁少删不多删：
+    只认四类，宁少删不多删：
       · `<base>.*.part*` —— 未完成的下载与分片
       · `<base>.*.ytdl`  —— yt-dlp 断点记录
       · 内容确实是播放列表的 `<base>.m3u8` —— 「只下到清单」的残骸，不是视频
+      · 内容确实是播放列表的 `<base>` 本身 —— 同上，只是 yt-dlp 猜不出扩展名时
+        会连后缀都不给（真机 2026-10-22：29,251 字节的清单就叫 `<base>`）
     最终成片（.mp4/.ts/.mkv）和名字相近的别的任务一律不碰。
     """
     if not outdir or not os.path.isdir(outdir):
@@ -281,16 +364,21 @@ def cleanup_ytdlp_junk(outdir, base):
     except OSError:
         return 0
     for n in names:
-        if not n.startswith(prefix):
-            continue
-        low = n.lower()
         p = os.path.join(outdir, n)
-        if ".part" in low or low.endswith(".ytdl"):
-            drop = True
-        elif low == (base + ".m3u8").lower() and looks_like_playlist(p):
-            drop = True
+        low = n.lower()
+        if n == base:
+            # 无后缀的 <base>：只有「内容真是清单」才算垃圾。成片不可能没有后缀，
+            # 但仍然用 looks_like_playlist 再确认一次，避免误删用户手放的文件。
+            drop = looks_like_playlist(p)
+        elif n.startswith(prefix):
+            if ".part" in low or low.endswith(".ytdl"):
+                drop = True
+            elif low == (base + ".m3u8").lower() and looks_like_playlist(p):
+                drop = True
+            else:
+                drop = False
         else:
-            drop = False
+            continue
         if not drop:
             continue
         try:
@@ -424,8 +512,19 @@ def run_ytdlp(job, ytdlp, ffmpeg):
                         "或清单本身加密。",
             )
         else:
-            write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file)
+            write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file,
+                         message="")
     else:
+        # 尾部有 ERROR 行**不等于**失败（真机 2026-10-22 51cg1 第三次下载）：
+        # yt-dlp 退出码 0、170MB 的真 mp4 已经下好，却打了一行内容为空的
+        # `ERROR:`；旧代码把它当失败，接着兜底拿 m3u8 又下一遍，最后落成
+        # 「done + message 残留 ERROR: + file 指向 29KB 清单」。
+        # 判据改成「目录里有没有真视频」：有就是成了，那行 ERROR 只是噪声。
+        product = find_done_product(outdir, base)
+        if proc.returncode == 0 and product:
+            write_status(job_id, status="done", percent=100, speed="", eta="",
+                         file=product, message="")
+            return
         msg = post_err or (" | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode))
         cleanup_ytdlp_junk(outdir, base)
         write_status(job_id, status="error", message=msg[:600])
@@ -524,6 +623,16 @@ def run_urllib(job):
         if resumed:
             headers["Range"] = f"bytes={resumed}-"
 
+    # 兜底前先认现有产物。这一路是「yt-dlp 失败后换个办法再试」，而 yt-dlp 的
+    # 「失败」经常是假的（退出码 0、真视频已下好、尾部一行空 ERROR）。真机
+    # 2026-10-22：这里又拿 m3u8 下了一遍，把 29KB 清单存成 `<base>` 并报 done,
+    # 覆盖掉旁边 170MB 的真 mp4。目录里已经有真视频就直接收工。
+    existing = find_done_product(outdir, os.path.splitext(name)[0] or name)
+    if existing:
+        write_status(job_id, status="done", percent=100, speed="", eta="",
+                     file=existing, message="")
+        return
+
     write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
     req = urllib.request.Request(job["url"], headers=headers)
 
@@ -569,7 +678,21 @@ def run_urllib(job):
                         last_t, last_b = now, done
 
         os.replace(part, path)
-        write_status(job_id, status="done", percent=100, speed="", eta="", file=path)
+        # 下完还得验内容：m3u8 地址被当成普通文件下，拿到的是**清单文本**。
+        # 真机 2026-10-22 就是这么把一个 29KB 的 #EXTM3U 报成「完成」的。
+        if looks_like_playlist(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            write_status(
+                job_id, status="error",
+                message="只下到播放列表（#EXTM3U），不是视频。这条地址是 HLS 清单，"
+                        "得按分片下载；请用扩展列表里的「下载」交给本地下载器。",
+            )
+            return
+        write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
+                     message="")
     except urllib.error.HTTPError as e:
         write_status(job_id, status="error", message=f"HTTP {e.code} {e.reason}")
     except Exception as e:
