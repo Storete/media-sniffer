@@ -211,20 +211,53 @@ def read_status(job_id):
         return {}
 
 
+MAX_BASE = 100
+# 超过这个长度的"扩展名"不是扩展名。见下面的注释，这是个真的坑。
+EXT_KEEP = 16
+
+
+def _strip_edges(s):
+    """去掉首尾所有空白和点。
+
+    不能只写 s.strip(" .")：它只认 ascii 空格和点，而 str.strip() 认**全部
+    Unicode 空白**。两者混用会留下以 U+3000（全角空格）开头的名字 —— 中文
+    标题里"　第1集"这种写法很常见 —— 而且不幂等：洗一次剩 \\u3000，洗两次
+    才干净。变异测试（tools/fuzz_host.py 的 S6）就是这么揪出来的。
+    """
+    i, j = 0, len(s)
+    while i < j and (s[i] == "." or s[i].isspace()):
+        i += 1
+    while j > i and (s[j - 1] == "." or s[j - 1].isspace()):
+        j -= 1
+    return s[i:j]
+
+
 def sanitize(name, fallback="video"):
     """洗成合法的 Windows 文件名。
 
-    处理四件事：非法字符换 _、去掉首尾的点和空格（Windows 上以点/空格结尾
+    处理五件事：非法字符换 _、去掉首尾的点和空白（Windows 上以点/空格结尾
     的文件名建不出来）、保留设备名（con/prn/aux/nul/com1-9/lpt1-9 会失败）
-    换掉、超长按「主干 100 减扩展名长度」截断以保住扩展名。
+    换掉、超长按「主干 100 减扩展名长度」截断以保住扩展名、**截断之后再洗一遍
+    尾部**（否则第 100 个字符正好是空格时，会留下以空格结尾的名字）。
+
+    扩展名的边界：os.path.splitext("a." + "b"*300) 会认出一个 301 字符的"扩展名"，
+    这时 100 - len(ext) 变成负数，切片直接失效、长度完全不受控（实测返回 301 字符，
+    超过 Windows 255 上限就真的建不出文件）。所以 ext 太长的，一律当它不是扩展名，
+    整个名字按正文截断。
     """
-    name = (name or "").strip()
-    name = ILLEGAL.sub("_", name).strip(" .")
+    name = _strip_edges(name or "")
+    name = _strip_edges(ILLEGAL.sub("_", name))
     if not name or RESERVED.match(name):
         name = fallback
-    if len(name) > 100:
+    if len(name) > MAX_BASE:
         root, ext = os.path.splitext(name)
-        name = root[:100 - len(ext)] + ext
+        if not ext or len(ext) > EXT_KEEP:
+            root, ext = name, ""
+        root = _strip_edges(root[: MAX_BASE - len(ext)])
+        name = root + ext
+        # 截断后可能只剩点/空格（原名 100 个 "."），也可能刚好落回保留名
+        if not _strip_edges(name) or RESERVED.match(name):
+            name = fallback
     return name
 
 
@@ -810,6 +843,25 @@ def strip_masquerade(data, scan=MASQ_SCAN, sync=MASQ_SYNC):
     return data
 
 
+def _hls_uri(line):
+    """从 #EXT-X-KEY / #EXT-X-MAP 这类标签行里取 URI 属性。
+
+    规范要求带双引号，但站方不总是守规矩：变异测试里试过
+    `URI=key.bin`、`URI='key.bin'` 两种写法都能被真实的打包器吐出来。
+    只认双引号的话，KEY 拿不到密钥还好（encrypted 一置位就交回 yt-dlp），
+    但 **EXT-X-MAP 拿不到 init 段就是坏文件** —— fMP4 分片没有初始化段
+    根本没法播，而这条路径是我们自己下载的。
+    """
+    m = re.search(r'URI\s*=\s*"([^"]*)"', line)
+    if m:
+        return m.group(1)
+    m = re.search(r"URI\s*=\s*'([^']*)'", line)
+    if m:
+        return m.group(1)
+    m = re.search(r"URI\s*=\s*([^,\s]+)", line)
+    return m.group(1) if m else ""
+
+
 def parse_hls_playlist(text, base_url):
     """解析 m3u8，返回：
 
@@ -823,7 +875,13 @@ def parse_hls_playlist(text, base_url):
 
     地址补全必须用 urljoin：站方给相对路径（`seg-1.ts`）和站内绝对路径
     （`/abs/seg-2.ts`）都很常见，直接拼字符串会拼出 `.../a/b//abs/...` 这种。
+
+    开头若有 UTF-8 BOM 必须先剥掉：否则首行变成 "\\ufeff#EXTM3U"，不以 "#"
+    开头，会被当成**分片地址**去下载（变异测试跑出来的，真机上就是拉回一个
+    404 或者一段垃圾塞进文件头）。改过解码为 utf-8-sig 之后这里仍然兜一层，
+    因为这个函数是纯函数，谁调都得安全。
     """
+    text = (text or "").lstrip("\ufeff")
     info = {
         "kind": "media", "child": "", "segments": [], "init": "",
         "encrypted": False, "key_url": "", "byterange": False,
@@ -831,7 +889,9 @@ def parse_hls_playlist(text, base_url):
     best_bw = -1
     pending_bw = None
     for raw in (text or "").splitlines():
-        ln = raw.strip()
+        # 行首可能粘着 BOM / 零宽空格：这类字符不是 str.isspace()，strip() 去不掉，
+        # 留着会让 "#EXTM3U" 变成 "\ufeff#EXTM3U"，于是被当成一个分片地址。
+        ln = raw.strip().lstrip("\ufeff\u200b\u200e\u200f")
         if not ln:
             continue
         if ln.startswith("#"):
@@ -844,13 +904,13 @@ def parse_hls_playlist(text, base_url):
                 method = (m.group(1) if m else "").upper()
                 if method and method != "NONE":
                     info["encrypted"] = True
-                    km = re.search(r'URI="([^"]+)"', ln)
-                    if km:
-                        info["key_url"] = urljoin(base_url, km.group(1))
+                    uri = _hls_uri(ln)
+                    if uri:
+                        info["key_url"] = urljoin(base_url, uri)
             elif ln.startswith("#EXT-X-MAP"):
-                km = re.search(r'URI="([^"]+)"', ln)
-                if km:
-                    info["init"] = urljoin(base_url, km.group(1))
+                uri = _hls_uri(ln)
+                if uri:
+                    info["init"] = urljoin(base_url, uri)
             elif ln.startswith("#EXT-X-BYTERANGE"):
                 info["byterange"] = True
             continue
@@ -988,7 +1048,7 @@ def run_hls_self(job, quiet=False):
     phase = Phase(job_id, "解析播放列表")
 
     try:
-        text = _hls_get(job["url"], headers).decode("utf-8", "replace")
+        text = _hls_get(job["url"], headers).decode("utf-8-sig", "replace")
     except urllib.error.HTTPError as e:
         return bail("拉取播放列表失败：HTTP %d %s（该站地址有时效，请刷新页面后重试）"
                     % (e.code, e.reason))
@@ -1002,7 +1062,7 @@ def run_hls_self(job, quiet=False):
             return bail("多码率清单里没找到子清单")
         base = info["child"]
         try:
-            text = _hls_get(base, headers).decode("utf-8", "replace")
+            text = _hls_get(base, headers).decode("utf-8-sig", "replace")
         except Exception as e:
             return bail("拉取子清单失败：%s" % e)
         info = parse_hls_playlist(text, base)

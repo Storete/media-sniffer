@@ -89,9 +89,15 @@ jobs:
 
       # 只依赖标准库，不需要 pip install
       - name: 语法检查
-        run: python -m compileall -q native-host test
+        run: python -m compileall -q native-host test tools
 
       # -r 让 -m unittest 能发现 test/ 下的子目录模块
       # 只跑不依赖本机条件的套件；见下方「跳过」说明
       - name: 运行测试
         run: python test/run_all.py
+
+      # 变异测试当门禁：固定 seed 保证可复现，2000 轮约 2 秒。
+      # 这几条不变量曾抓到「超长扩展名返回 301 字符」这类单测覆盖不到的缺陷，
+      # 放在 CI 里是为了防止以后退回去。
+      - name: 变异测试（固定 seed 门禁）
+        run: python tools/fuzz_host.py --rounds 2000 --seed 1

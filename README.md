@@ -338,7 +338,9 @@ media-sniffer/
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
 │   ├── pattern_sync.test.js 扩展与宿主的正则同步校验（4 项）
-│   └── *.py                 宿主侧 Python 测试（15 套）
+│   └── *.py                 宿主侧 Python 测试（16 套）
+├── tools/
+│   └── fuzz_host.py         变异/性质测试（喂畸形输入找边界 bug，见下）
 ├── docs/                    截图 + 站点审计报告（site-audit.md）
 ├── bin/                     ffmpeg 放这里（不进仓库）
 └── gen_icons.py             图标生成脚本
@@ -368,14 +370,24 @@ node test/pattern_sync.test.js     # 4 项
 # 全跑一遍（bash）
 for f in test/*.test.js; do node "$f"; done
 
-# Python（15 套，不需要 pytest，也不装任何依赖）
+# Python（16 套，不需要 pytest，也不装任何依赖）
 python test/run_all.py             # 一串跑完并汇总（没装 ffmpeg 的套件自动 SKIP）
 
 # 或单个跑
 cd test && for f in *_test.py; do python "$f"; done
+
+# 变异测试：喂畸形输入找边界 bug（默认 3000 轮 × 4 区，约 3 秒）
+python tools/fuzz_host.py
+python tools/fuzz_host.py --rounds 20000 --verbose
+python tools/fuzz_host.py --only hls --seed 42
 ```
 
 `big_file_test.py` 是慢速大文件测试（默认不纳入 `run_all.py`），跑到 120 秒超时是预期的。
+
+**变异测试和单元测试的分工**：`test/` 里的用例是「正常路径 + 我们真踩过的坑」，确定、快、进 CI；
+`tools/fuzz_host.py` 是「大量随机/结构化畸形输入」，只断言不变量（长度、字符集、绝对地址、不崩、幂等），
+不确定但能找到「没想过的情况」。它已经挖出过三条真缺陷：`sanitize` 超长扩展名返回 301 字符、
+`_safe_name` 截断后留下尾随空格、带 BOM 的 m3u8 把首行当成片地址。CI 里跑固定 seed 的 2000 轮当门禁。
 
 推送到 GitHub 时 `tests.yml` 会自动跑上面这些：JS 套件在 Node 18/20/22 上各跑一遍，
 Python 在 Ubuntu + Windows 上跑（`host_merge_test.py` 等需要真 ffmpeg 的套件在没装 ffmpeg 的环境里自动跳过）。

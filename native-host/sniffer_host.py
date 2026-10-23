@@ -196,12 +196,16 @@ def _safe_name(name):
     name = os.path.basename(str(name or "").replace("\\", "/")).strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     name = name.strip(". ")
+    # 截断必须放在收货检查之前：第 150 个字符正好是空格或点时，直接切片会
+    # 留下 "xxx " / "xxx." 这种 Windows 建不出来的名字（实测 x*149 + " .mp4"）。
+    if len(name) > 150:
+        name = name[:150].rstrip(". ")
     if not name:
         name = "media-" + time.strftime("%Y%m%d-%H%M%S")
     stem = os.path.splitext(name)[0].upper()
     if stem in _WIN_RESERVED:
-        name = "_" + name
-    return name[:150]
+        name = ("_" + name)[:150]
+    return name
 
 
 def _unique_path(dirname, name):
