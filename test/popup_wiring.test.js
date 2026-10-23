@@ -68,6 +68,19 @@ check("hideRecorder 仍然保留 B 站 / 小红书的原有判据",
 check("隐录制条目的前提是页面上真有 m3u8（不是无条件隐）",
   JS.indexOf("只认 blob/mN 的站") >= 0);
 
+console.log("[6] 进度条要显示准备期的阶段文案（B21）");
+// 宿主在「拉清单 / 探请求头 / yt-dlp 解析分片」这几段给的是 message、没有 percent。
+// updateJob 以前只拼百分比，宿主写了 message 也看不见 —— 用户看到的就是一根停着的
+// 0% 空槽（真机 2026-10-22：近 2 分钟一动不动）。
+const CSS = fs.readFileSync(path.join(EXT, "popup.css"), "utf8");
+check("updateJob 会渲染 msg.message", /if \(msg\.message\) bits\.push\(msg\.message\)/.test(JS));
+check("没有百分比也没有文案时兜底「下载中」", /if \(!bits\.length\) bits\.push\("下载中"\)/.test(JS));
+check("准备期给进度条挂 wait 类", /classList\.toggle\("wait", !pct && !!msg\.message\)/.test(JS));
+check("结束态要摘掉 wait 类（否则光带一直走）",
+  (JS.match(/classList\.remove\("wait"\)/g) || []).length >= 2);
+check("CSS 有 wait 的动画", /\.job\.wait \.bar i\s*\{[\s\S]{0,120}animation:\s*jobwait/.test(CSS));
+check("CSS 有 jobwait 关键帧", /@keyframes jobwait/.test(CSS));
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

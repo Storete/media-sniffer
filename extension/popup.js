@@ -1007,15 +1007,25 @@ function updateJob(msg) {
   if (msg.action === "progress" || msg.status === "downloading") {
     const pct = Number(msg.percent || 0);
     job.fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
-    const bits = [msg.percent ? pct.toFixed(1) + "%" : "下载中"];
+    // 准备期（percent 还是 0、但宿主给了阶段文案）挂一条来回走的光带：
+    // 拉清单 / 探请求头 / yt-dlp 解析分片这几段确实估不出百分比，一根停着的
+    // 0% 空槽看起来就是卡死。真机 2026-10-22：这三段合计能让界面静止近 2 分钟。
+    job.wrap.classList.toggle("wait", !pct && !!msg.message);
+    const bits = [];
+    // 阶段文案优先显示 —— updateJob 以前只拼百分比，宿主写了 message 也看不见
+    if (msg.message) bits.push(msg.message);
+    if (pct) bits.push(pct.toFixed(1) + "%");
+    if (!bits.length) bits.push("下载中");
     if (msg.speed) bits.push(msg.speed);
     if (msg.eta) bits.push("剩余 " + msg.eta);
     job.label.textContent = job.name + " · " + bits.join(" · ");
   } else if (msg.status === "done" || msg.action === "done") {
+    job.wrap.classList.remove("wait");
     job.fill.style.width = "100%";
     job.wrap.classList.add("done");
     job.label.textContent = "完成 · " + (msg.file || job.name);
   } else if (msg.status === "error" || msg.action === "error") {
+    job.wrap.classList.remove("wait");
     job.wrap.classList.add("err");
     job.label.textContent = "失败 · " + (msg.message || "未知错误");
   }

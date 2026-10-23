@@ -10,6 +10,66 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-040 · 2026-10-23 · 准备期不再是死寂：阶段文案 + 会走的进度条
+
+修 B21。用户原话：「为什么要等很久，才会开始下载，为什么不做成图二（Chrome 下载气泡）的样式」。
+
+**先把「等」量出来**：真机 `dl-1792678232528-m20cx` —— 22:10:33 写 `percent=0`，
+**22:12:21** 才第一次跳到 93.9%，**近 2 分钟界面一动不动**，之后 50 秒跑完。
+不是卡死，是两段**纯等待**：
+
+1. `run_hls_self` 自己试一遍：拉主清单 → 有子清单再拉一次 → 查 `EXT-X-KEY`/BYTERANGE
+   → 第一片当探针，最多试 **4 档请求头组合**，每档一次真实 HTTP
+2. 交回 `run_ytdlp`：它还要拉清单、把几百个分片的表建好，进度行要
+   **真正开下第一片**才出现
+
+**为什么不能改成像 Chrome 下载气泡那样**（这条也写进了 DEVELOPMENT.md B21）：
+那是 **Chrome 自己的下载管理 UI**，只能表达「一个 URL → 一个文件」。
+HLS 是几百个请求拼一个文件，`chrome.downloads.download({url: m3u8})` 只会把
+**播放列表文本**存下来（d-031 那个 38.5KB「视频」就是浏览器版的原样复现）。
+原生气泡还完全不可定制：显示不了「第 30/178 片」「地址过期已刷新重下」「转 mp4 失败：…」，
+取消按钮也管不到我们的 Python 子进程（1.3.34 改完能在 5 秒内真停）。
+
+**修法**
+
+1. `native-host/downloader.py` 新增 `Phase`：写一句「在干什么」，每 2 秒补
+   「（已等 N 秒）」。
+   **关键设计是自限**：ticker 每次写之前先读状态，发现 `message` 已经被别人改掉
+   （`write_progress` 清空 / 写了 done/error）就自己退出。所以调用方**不需要**在
+   每条 `return` 前记得 stop —— 忘了停就是 d-034 的翻版：整场下载全程挂着
+   「解析播放列表」。测试里 T2/T3 就是钉这件事的。
+2. 三个落点：`run_hls_self` 的「解析播放列表」→「探测分片请求头（最多 4 档）」；
+   `run_ytdlp` 开头加「交给 yt-dlp 解析清单（分片多时要等一会儿）」，第一条
+   `MSPROG|` 进来就停。
+3. `extension/popup.js` 的 `updateJob` **以前只拼百分比，宿主写的 message 根本
+   看不见**（截图里那行永远是「… · 下载中」）。改成 message 优先显示。
+4. `popup.css` 加 `.job.wait`：percent 还是 0 但有阶段文案时，进度条变成一条
+   来回走的光带（`@keyframes jobwait`）。这不是假进度，是明确表达「在忙，但还估不出百分比」。
+5. done / error 分支显式 `classList.remove("wait")`，否则光带会一直走下去。
+
+**测试**：新建 `test/host_phase_test.py`，**先红 4 条**（Phase 不存在 / 解析期无文案）
+→ **10/10 全绿**。覆盖：建立即写文案；计时器补「已等」；`write_progress` 之后文案必须停
+且不把 percent 写回 0；写完 done 后不许被覆盖；`run_ytdlp` 解析期必须有文案、
+跑完 message 为空、状态仍是 done。
+`test/popup_wiring.test.js` 加 `[6]` 六条静态检查（渲染 message / 兜底「下载中」/
+挂 wait 类 / 结束摘 wait 类 / CSS 有动画和关键帧）。
+
+**回归**：Python **15 套**全绿（34.6s）、JS **10 套**全绿、`node --check` 通过。版本 1.3.36。
+
+**教训**
+
+1. **「没有进度」和「没有事情发生」是两回事，但用户只看得见前者。** 估不出百分比时
+   该给的不是一个假百分比，而是**正在做什么 + 已经做了多久**。
+2. **后台写了不等于用户看得见。** 宿主一直在推 `message`（`poll_job` 的 snapshot 里
+   就有它、变了就推），但 `updateJob` 只拼 percent —— 整条链路是通的，只有最后
+   三行渲染把它丢了。改 UI 前先确认「数据到底有没有到」，别把传不过去的东西算成没写。
+
+**涉及文件**：`native-host/downloader.py`（`Phase` 新增、`run_ytdlp` / `run_hls_self` 接入）、
+`extension/popup.js`（`updateJob`）、`extension/popup.css`（`.job.wait` / `@keyframes jobwait`）、
+`test/host_phase_test.py`（新增）、`test/popup_wiring.test.js`（+6）、`extension/manifest.json`（1.3.36）
+
+---
+
 ## d-039 · 2026-10-23 · `done` 的判据从「谁说自己成功」换成「目录里有没有真视频」
 
 修 d-037 记下的 B19。**d-037 当时把根因猜偏了一半**——以为是「取产物取了错的那个」，

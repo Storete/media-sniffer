@@ -152,6 +152,57 @@ def write_progress(job_id, percent, speed="", eta=""):
                  speed=speed, eta=eta, message="")
 
 
+PHASE_TICK = 2.0     # 阶段提示的刷新节拍（秒）；测试里会调小
+
+
+class Phase:
+    """「正在干什么」的可见提示，附带自动累加的「已等 N 秒」。
+
+    为什么需要：从点下载到第一片落地，中间有两段**纯等待**，都不产生进度事件 ——
+    ① `run_hls_self` 自己试一遍（拉主清单、有子清单再拉一次、查加密、第一片当探针
+    最多试 4 档请求头，每档一次真实 HTTP）；② 交回 `run_ytdlp` 后它还要拉清单、
+    解析几百个分片。真机（2026-10-22 51cg1）：22:10:33 写 `percent=0`，
+    **22:12:21** 才第一次跳到 93.9% —— 近 2 分钟界面一动不动，用户以为卡死。
+    这两段确实估不出百分比，但「还在动」是能给的，所以给一句会走的文案。
+
+    **自限**：每次写之前先读状态，发现 message 已经被别人改掉（`write_progress`
+    清空 / 写了 done/error）就自己退出。这样调用方不需要在每条 `return` 前记得
+    停它 —— 忘了停就是 d-034 那个 bug 的翻版：整场下载全程挂着「解析播放列表」。
+    也正因为自限，它可以放心地挂在 `run_ytdlp` 那条长流程上。
+    """
+
+    def __init__(self, job_id, text):
+        self.job_id = job_id
+        self.text = text
+        self._mine = text
+        self._stop = threading.Event()
+        self._t0 = time.time()
+        write_status(job_id, status="downloading", message=text)
+        self._th = threading.Thread(target=self._run, daemon=True)
+        self._th.start()
+
+    def _run(self):
+        while not self._stop.wait(PHASE_TICK):
+            cur = (read_status(self.job_id).get("message") or "")
+            if cur != self._mine:
+                return               # 别人接管了 message（进度/结束态），闭嘴
+            try:
+                self._mine = "%s（已等 %d 秒）" % (self.text, int(time.time() - self._t0))
+                write_status(self.job_id, message=self._mine)
+            except Exception:
+                return
+
+    def done(self):
+        self._stop.set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.done()
+        return False
+
+
 def read_status(job_id):
     """读状态文件，读不到/坏 JSON 一律返回空 dict（调用方用 .get 就不会炸）"""
     try:
@@ -446,6 +497,9 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         # 音频不能写 m4a，所以音频也保持原样（不传这个参数）。
 
     write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
+    # 解析期提示：yt-dlp 要把清单拉下来、分片表建好才吐第一行进度，这段可能几十秒
+    # 到几分钟（视分片数）。没有它，界面就是一根停着的 0% 空槽。
+    phase = Phase(job_id, "交给 yt-dlp 解析清单（分片多时要等一会儿）")
 
     proc = subprocess.Popen(
         cmd,
@@ -467,6 +521,9 @@ def run_ytdlp(job, ytdlp, ffmpeg):
             if not line:
                 continue
             if line.startswith("MSPROG|"):
+                # 第一行进度到了 = 解析结束，阶段提示让位（它的自限也能兜住，
+                # 但显式停一下更干净，省掉一次多余的读盘）
+                phase.done()
                 parts = line[len("MSPROG|"):].split("|")
                 if len(parts) >= 3:
                     pct_raw = parts[0].replace("%", "").strip()
@@ -926,8 +983,9 @@ def run_hls_self(job, quiet=False):
             write_status(job_id, status="error", message=_short(msg, 300))
         return take_over
 
-    write_status(job_id, status="downloading", percent=0, speed="", eta="",
-                 file="", message="解析播放列表")
+    # 阶段提示：拉清单 + 解析分片期间界面本来什么都没有（真机 51cg1 现场
+    # 这一段之后还要探 4 档请求头，合计能到十几秒）。
+    phase = Phase(job_id, "解析播放列表")
 
     try:
         text = _hls_get(job["url"], headers).decode("utf-8", "replace")
@@ -981,6 +1039,10 @@ def run_hls_self(job, quiet=False):
     # 所以按 _header_variants 的顺序一档档试，试通哪档整单沿用。
     first_data = None
     first_err = None
+    # 探针是最容易被误认为「卡死」的一段：每一档都是一次真实 HTTP，四档串起来
+    # 加上服务器慢的时候能到十几秒。换个文案让用户知道现在在试请求头。
+    phase.done()
+    phase = Phase(job_id, "探测分片请求头（最多 4 档）")
     for hv in _header_variants(headers):
         try:
             first_data = strip_masquerade(_hls_get(segs[0], hv))
@@ -992,6 +1054,7 @@ def run_hls_self(job, quiet=False):
     if first_data is None:
         return bail("下载分片失败（0/%d 已下）：%s。该站地址有时效，刷新页面后重试"
                     % (total, first_err))
+    phase.done()   # 探测结束，后面就由逐片进度接管
 
     # 滑动窗口：线程池负责下载，主线程严格按 index 顺序取结果写盘。
     # 不把整片下载到内存再拼（514×2.7MB ≈ 1.4GB），也不落成几百个临时文件

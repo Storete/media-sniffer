@@ -297,6 +297,17 @@ footer {
 .job.done .bar i { background: var(--ok); }
 .job.err .bar i { background: var(--err); }
 
+/* 准备期（估不出百分比）：一条来回走的光带，比一根停着的 0% 空槽诚实。
+   宿主在「拉清单 / 探请求头 / yt-dlp 解析分片」这几段只会给阶段文案、不给百分比。 */
+.job.wait .bar i {
+  width: 34% !important;
+  animation: jobwait 1.2s ease-in-out infinite;
+}
+@keyframes jobwait {
+  0%   { margin-left: -34%; }
+  100% { margin-left: 100%; }
+}
+
 /* 预览浮层 */
 .preview {
   position: fixed;
