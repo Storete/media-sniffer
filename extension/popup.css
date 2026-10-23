@@ -120,6 +120,22 @@ h1 { margin: 0; font-size: 14px; font-weight: 600; }
 }
 .item:hover { border-color: #c7d7fe; }
 
+/* 行号：这条在当前列表里的位置（1 起，随筛选/排序变）。
+   为什么要它（2026-10-23 用户 51cg1 截图）：同一个视频会出现两条 ——
+   页面钩子上报的（带站点标题）和 webRequest 抓的（无标题），两条都叫
+   「HLS 流（视频）」，看不出哪个是哪个，点错了下到的是另一路流。
+   和名字里的 ①②③ 不是一套：那是「这条消息里的第几张」，这是「列表第几行」。
+   定宽 + 等宽数字，否则 9→10、99→100 时名字列会左右跳。 */
+.no {
+  flex: 0 0 20px;
+  text-align: right;
+  font-size: 11px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  user-select: none;
+}
+
 .badge {
   width: 26px; height: 26px; flex: 0 0 26px;
   display: grid; place-items: center;
@@ -296,6 +312,17 @@ footer {
 .job .bar i { display: block; height: 100%; width: 0; background: var(--brand); transition: width .25s; }
 .job.done .bar i { background: var(--ok); }
 .job.err .bar i { background: var(--err); }
+
+/* 准备期（估不出百分比）：一条来回走的光带，比一根停着的 0% 空槽诚实。
+   宿主在「拉清单 / 探请求头 / yt-dlp 解析分片」这几段只会给阶段文案、不给百分比。 */
+.job.wait .bar i {
+  width: 34% !important;
+  animation: jobwait 1.2s ease-in-out infinite;
+}
+@keyframes jobwait {
+  0%   { margin-left: -34%; }
+  100% { margin-left: 100%; }
+}
 
 /* 预览浮层 */
 .preview {

@@ -132,9 +132,13 @@ function isRecorderItem(it) {
  *  B 站：播放器走 MSE，同时提供可完整下载的 DASH 流 → 隐掉录制条目。
  *  小红书（2026-10-18）：正文视频的 <video src> 同样是 blob:，而真实 mp4 地址
  *  已由页面侧从 __INITIAL_STATE__ 换成直链上报；录制条目留着只会和它并列成
- *  两条「页面视频（录制中）」，用户点了存下来是坏的。 */
+ *  两条「页面视频（录制中）」，用户点了存下来是坏的。
+ *  HLS 站（2026-10-21）：artplayer/hls.js 一边请求 m3u8 一边往 MSE 塞分片，
+ *  于是同一条视频在列表里出现三份（m3u8 清单、blob: 录制、m1/m2 分片）。
+ *  **必须先确认页面上真有 m3u8 才隐**——只认 blob/mN 的站（有 MSE 没有清单）
+ *  一旦也隐掉，用户就什么都看不到了。 */
 function hideRecorder() {
-  return isBiliSite() || isXhsDetailPage();
+  return isBiliSite() || isXhsDetailPage() || allItems.some(isHlsItem);
 }
 
 /**
@@ -456,11 +460,41 @@ function visibleItems() {
   else list = list.filter((it) => it.k === filter);
 
   const order = ["video", "audio", "doc", "image", "font", "other", "seg"];
+
+  // 先判断「两条是不是同一编号组」。判据必须与 background 的分组键一致
+  // （见 renumberImages）：**mid 优先，其次标题**。
+  //   ① 两个都有 mid            → 比 mid（一条消息一个池）
+  //   ② 都没有 mid              → 比标题（普通网站 / 抓不到消息号）
+  //   ③ 一个有 mid 一个没有     → 不是同一组
+  // 同组且都编了号时，**序号必须压过 kind**。
+  //
+  // 为什么（2026-10-20 真机，问题①的最后一环）：
+  // 同一条消息里视频和图片共用一个序号池（①~⑳），background 按
+  // 「组内 ord」编好。但这里原来第一行就是 `if (ka !== kb) return ka - kb;`，
+  // 把所有 video 提到所有 image 前面，于是拿到的顺序是
+  //   ②④⑥⑧…（video）在前，①③⑤⑦…（image）在后
+  // —— 用户看到「序号和内容对不上、跳号」。序号本来就是「阅读顺序」，
+  // kind 只是「同序号时的兜底排序」，不能反过来压过它。
+  //
+  // 2026-10-22 改：这里原来只认标题（v3），与 background 的「mid 优先」不一致
+  // 会让同一条消息的条目被判成不同组、退回按体积排 —— 编号对了但顺序乱。
+  const sameGroup = (a, b) => {
+    const ma = a.mid || "", mb = b.mid || "";
+    if (ma && mb) return ma === mb;
+    if (!ma && !mb) return (a.title || "").trim() === (b.title || "").trim();
+    return false;
+  };
+
   return list.slice().sort((a, b) => {
+    // 同一组里编了 ①②③ 的条目，**序号就是阅读顺序**，必须压过 kind 排序。
+    // 顺序很关键：后台按 mid → ord 编好号后，若先按 kind 分块（所有 video
+    // 提到所有 image 前面），用户看到的就是 ②④⑥… 在前、①③⑤… 在后
+    // —— 真机 m14306「序号和内容对不上」的另一半原因就在这里。
+    if (sameGroup(a, b) && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
     if (ka !== kb) return ka - kb;
-    // 同一组里编了 ①②③ 的条目，按序号从上到下排（用户要求 m03360），
-    // 否则默认按大小排，序号会乱掉看不出顺序。
+    // 不同组之间才按 kind 分块；同组但没编号（如未登录的 Telegram 会话）再退回
+    // 按大小、时间排。
     //
     // 「是不是同一组」这个判断改过两次，两版都是错的，记下来：
     //   v1 只看 mid —— 小红书的正文图没有消息号（mid 为空），编号是 background
@@ -470,10 +504,6 @@ function visibleItems() {
     //      而同标题的媒体常横跨好几条消息（同一个标题发了好几组图），mid 各不相同，
     //      于是同组成员被拆散开，用户在列表里看到「⑪ 在最上面、下面才是 ①②③」
     //      —— 用户 m13684 就是拿这张图来问的。
-    //
-    // 现在的判据直接对齐 background 的分组键：**两个都有标题且标题相同**就是同组
-    // （这正是 background 现在的 gk = "t:" + title）；都没标题时退回比 mid。
-    // 小红书详情页所有条目共用一个标题或都没标题，两种情形都能落到同一组。
     const ta = (a.title || "").trim(), tb = (b.title || "").trim();
     if (ta && tb && ta === tb && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
     const ma = a.mid || "", mb = b.mid || "";
@@ -528,8 +558,8 @@ function renderList() {
     return;
   }
 
-  for (const it of items) {
-    box.append(renderItem(it));
+  for (let i = 0; i < items.length; i++) {
+    box.append(renderItem(items[i], i + 1));
   }
 }
 
@@ -588,13 +618,31 @@ function canPreviewSrc(it) {
   return /^(https?|blob|data):/i.test(u);
 }
 
-function renderItem(it) {
+/**
+ * 渲染一条。
+ *
+ * @param {object} it 条目
+ * @param {number} [no] 行号 = 它在**当前列表**里的位置（1 起）。
+ *
+ * 为什么要有行号（2026-10-23 用户 51cg1 截图）：同一个视频在列表里出现两条，
+ * 一条是页面钩子上报的（带站点标题）、一条是 webRequest 抓的（无标题），
+ * 两条都叫「HLS 流（视频）」，用户的原话是「无法区分哪个是哪个」——
+ * 点错了下到的是另一路流。行号让人能说「第 2 条」，也让截图能对上号。
+ *
+ * 与 ①②③（it.mark）**不是一套东西**，别混：
+ *   · ①②③ 由 background 按「消息/标题」分组编，表达「这是这条消息里的第几张」，
+ *     写在名字里，跟着标题一起被截断；
+ *   · 行号是「列表里的第几行」，随筛选/排序变，表达位置而不表达归属。
+ * 所以行号单独占一列，在类型徽标左边。
+ */
+function renderItem(it, no) {
   const row = el("div", "item");
   const isPage = !!it.page;
 
   // 批量选择只对 page=1 的条目开放：这类数据必须由页面自己取（和「保存」同一条
   // 链路），直链条目的批量下载另有语义，混在一起容易下出一堆意外文件。
-  if (selecting && isPage) {
+  // HLS 也要排除：它必须走本地下载器，混进「保存所选」等于批量下一堆清单文本。
+  if (selecting && isPage && !isHlsItem(it)) {
     const box = document.createElement("input");
     box.type = "checkbox";
     box.className = "sel-box";
@@ -615,6 +663,11 @@ function renderItem(it) {
     row.append(box);
   }
 
+  // 行号放在勾选框**右边**：批量模式下勾选框占最左，是全局一致的约定；
+  // 行号紧贴类型徽标，两种模式下都落在同一列，不会左右跳。
+  const noEl = el("div", "no", no ? String(no) : "");
+  row.append(noEl);
+
   const badge = el("div", "badge " + it.k, KIND_ICON[it.k] || "?");
   badge.title = (isPage ? "页面内捕获 · " : "") + (KIND_LABEL[it.k] || it.k);
   row.append(badge);
@@ -630,7 +683,12 @@ function renderItem(it) {
   meta.append(name);
 
   const bits = [];
-  if (isPage) {
+  if (isHlsItem(it)) {
+    // m3u8 的大小是**播放列表文本**的大小（几 KB），不是视频大小。
+    // 不写清楚的话用户看到「视频 29 KB」会以为下到了个坏文件。
+    bits.push("HLS 流 · 分片清单");
+    bits.push("点下载自动拼成完整视频");
+  } else if (isPage) {
     if (it.mid) bits.push("消息 " + it.mid);
     else bits.push("页面捕获");
     if (!it.mid && hostOf(it.i)) bits.push(hostOf(it.i));
@@ -659,7 +717,17 @@ function renderItem(it) {
 
   const ops = el("div", "ops");
 
-  if (isPage) {
+  // HLS 条目**一律走本地下载器**，不管它是页面钩子上报的还是 webRequest 抓的。
+  //
+  // 真机（2026-10-22 51cg1，用户截图）：DPlayer 页面的 `data-config` 里读出来的那条
+  // m3u8 带站点标题，看着最像「该点的那一条」，可它 page=1 → 走下面的页面分支 →
+  // 只有「预览 / 保存」。而「保存」这条链路是给 Telegram（blob 地址、要在页面里
+  // 带 Range、512KB 限制）和 B 站（`__playinfo__`）设计的：点下去页面会去 Range 拉
+  // 那个 m3u8，拿到的是 **38.5KB 的清单文本**，不是视频 —— 用户的原话就是
+  // 「上面那个用不了，下面那个能用」。
+  // m3u8 只有「几百个分片拼一个文件」这一种下法，宿主才会拼，所以按类型分派，
+  // 不按来源分派。
+  if (isPage && !isHlsItem(it)) {
     // 预览：判据见 canPreviewSrc() 的注释（blob: 也放行，Telegram 靠它）。
     //
     // 为什么不给 MSE（u 就是 "m1"/"m2"）：那是录制的合成条目，扩展页拼不出
@@ -699,7 +767,9 @@ function renderItem(it) {
   open.addEventListener("click", () => chrome.tabs.create({ url: it.u }));
   ops.append(open);
 
-  if (canPreviewSrc(it)) {
+  if (canPreviewSrc(it) && !isHlsItem(it)) {
+    // m3u8 不挂预览：Chrome 的 <video> 不会放 HLS（扩展页更没有 hls.js），
+    // 点开必然「预览加载失败」，比没有按钮更让人困惑。
     const pv = el("button", "btn", "预览");
     pv.addEventListener("click", () => showPreview(it));
     ops.append(pv);
@@ -746,12 +816,31 @@ function pageTitle(it) {
  */
 function displayName(it, isPage) {
   let base;
+  if (isHlsItem(it)) {
+    // HLS 列表的文件名多半是「8ffa39d4da7087210f1292376e7b39f3.m3u8」这种哈希，
+    // 对用户毫无意义。统一叫「HLS 流（视频）」，真名在下载时按站点标题取。
+    base = (it.title ? shortTitle(it.title) + " · " : "") + "HLS 流（视频）";
+    if (it.mark) return it.mark + " " + base;
+    return base;
+  }
   if (isPage) base = pageTitle(it);
   else if (it.title) base = it.title;
   else base = it.f || it.u || "";
   base = shortTitle(base);
   if (it.mark) return it.mark + " " + base;
   return base;
+}
+
+/**
+ * 是不是 HLS 播放列表条目（background 在 sniff:get 里打的 hint="hls"）。
+ *
+ * 退回 URL 后缀再判一次：hint 是后加的，用户没重载扩展时老 state 里没有这个
+ * 字段，只靠 hint 会漏。
+ */
+function isHlsItem(it) {
+  if (!it) return false;
+  if (it.hint === "hls") return true;
+  return /\.m3u8$/i.test(String(it.u || "").split("?")[0]);
 }
 
 /**
@@ -904,9 +993,14 @@ async function startDownload(it, btn) {
     type: "native:download",
     url: it.u,
     kind: it.k,
-    filename: it.f,
+    // 页面钩子上报的条目没有 it.f（那是 webRequest 侧按 URL 推出来的名字），
+    // 但通常**有标题**。不给名字的话落盘就是 `d41c6e6e…11260.mp4` 这种哈希，
+    // 用户下完根本认不出是哪一集（真机 2026-10-22 的现场就是这个文件名）。
+    filename: it.f || (it.title ? shortTitle(it.title) : ""),
     referer: it.i || tabUrl,
     tabUrl,
+    // background 需要它才能在「地址过期」时刷新对应标签页重取 m3u8
+    tabId,
     // 抓取时实际发出的请求头（referer/origin/accept/accept-language/user-agent）。
     // 只带 referer 时，不少 CDN 会因为没有 Origin 或 Accept 直接 403。
     headers: it.hdr || null,
@@ -951,15 +1045,25 @@ function updateJob(msg) {
   if (msg.action === "progress" || msg.status === "downloading") {
     const pct = Number(msg.percent || 0);
     job.fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
-    const bits = [msg.percent ? pct.toFixed(1) + "%" : "下载中"];
+    // 准备期（percent 还是 0、但宿主给了阶段文案）挂一条来回走的光带：
+    // 拉清单 / 探请求头 / yt-dlp 解析分片这几段确实估不出百分比，一根停着的
+    // 0% 空槽看起来就是卡死。真机 2026-10-22：这三段合计能让界面静止近 2 分钟。
+    job.wrap.classList.toggle("wait", !pct && !!msg.message);
+    const bits = [];
+    // 阶段文案优先显示 —— updateJob 以前只拼百分比，宿主写了 message 也看不见
+    if (msg.message) bits.push(msg.message);
+    if (pct) bits.push(pct.toFixed(1) + "%");
+    if (!bits.length) bits.push("下载中");
     if (msg.speed) bits.push(msg.speed);
     if (msg.eta) bits.push("剩余 " + msg.eta);
     job.label.textContent = job.name + " · " + bits.join(" · ");
   } else if (msg.status === "done" || msg.action === "done") {
+    job.wrap.classList.remove("wait");
     job.fill.style.width = "100%";
     job.wrap.classList.add("done");
     job.label.textContent = "完成 · " + (msg.file || job.name);
   } else if (msg.status === "error" || msg.action === "error") {
+    job.wrap.classList.remove("wait");
     job.wrap.classList.add("err");
     job.label.textContent = "失败 · " + (msg.message || "未知错误");
   }

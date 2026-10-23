@@ -301,6 +301,8 @@ function record(d) {
     if (hdr && !existed.hdr) existed.hdr = hdr;
     confirmPageItem(existed);
     flushSoon(d.tabId);
+    // 已存在的条目也可能是「刷新后重新上报的新地址」，这里也要接一次
+    maybeUseRetriedHls(d.tabId, { key: d.url });
     return;
   }
 
@@ -321,6 +323,10 @@ function record(d) {
   rec.items.get(d.url).f = fileNameOf(d.url);
   flushSoon(d.tabId);
   bumpBadge(d.tabId, kind, rec);
+  // 「地址过期自动重取」必须在这里也接一次：4kvm 这类站的 m3u8 **只由 webRequest
+  // 抓到**（页面侧只有 og:title 那条页面条目），只挂在 ms:page 的 found 分支上
+  // 会永远等不到新地址（2026-10-22 真机就是这个原因才没自动恢复）。
+  maybeUseRetriedHls(d.tabId, { key: d.url });
 }
 
 /**
@@ -584,6 +590,185 @@ function recordPageMedia(tabId, pageUrl, p) {
 // 的是 DOM 上下文（imgctx 报上来的有消息归属 = 用户内容；webRequest-only 的
 // 小图没有 = 页面装饰），以及非 Telegram 站的 CDN 缩略图 URL 特征。
 const ICON_MAX = 96;
+
+// ---------------------------------------------------------------- 视频封面白名单
+// 用户 m15108：「默认情况下，不会获取视频封面作为一张图片，有需要再做特殊处理，
+// 代码里留有改动的余地。目前来看只获取 B 站、小红书视频封面当作一张图片」。
+//
+// 所以**默认行为是不收**：任何站点抓到的「视频封面」都不当图片展示。只有
+// VIDEO_COVER_SITES 里列出的站点才保留。以后要加/去站点，**只改这一张表**：
+//   · 加站点 → 往数组里加一个域名（写成主域即可，子域自动跟随）
+//   · 去掉站点 → 从数组里删掉；数组清空 = 全网都不收封面（回到最严格的默认）
+//
+// 判定顺序（coversForSite）：URL 上带封面 hint → 一律按 hint 走，不再看域名。
+// 之后由页面侧/background 按站点决定要不要收，见 inject-main 的 xhs/bili 分支。
+const VIDEO_COVER_SITES = ["bilibili.com", "xiaohongshu.com"];
+
+/**
+ * 这个站点允不允许把视频封面当图片收下来。
+ * 匹配规则：与白名单某一项**完全相等**，或以 `.那一项` 结尾（子域跟随）；
+ * 左右都补 `.` 再比，避免 `fakebilibili.com` / `bilibili.com.evil.net` 误命中。
+ * @param {string} host 宿主名，可带端口大小写不一
+ * @returns {boolean}
+ */
+function coverAllowed(host) {
+  const h = "." + String(host || "").trim().toLowerCase().replace(/^\.+/, "") + ".";
+  if (h === "..") return false;
+  return VIDEO_COVER_SITES.some((site) => h.endsWith("." + site.toLowerCase() + "."));
+}
+
+/**
+ * B 站「单个视频」页面：只留这一集的封面，其它图片一律不显示。
+ *
+ * 为什么藏在 background 而不是页面侧（用户真机 2026-10-21：banner 泄漏）：
+ * 页面侧 isImageOnly 只挡得住 DOM 扫描。真机 state 里 33 条图片**全部来自
+ * webRequest** —— banner、活动图、UP 主头像、推荐位封面、loading 图，
+ * webRequest 根本不经过页面，只能在出列表时再筛一次。
+ *
+ * 判据只看 URL 是不是视频页 + 有没有 bili-cover 条目：
+ *   · 视频页且已有封面 → 只留 hint=bili-cover
+ *   · 视频页但还没拿到封面 → 一张图都不留（宁可空也不放 banner 进去，
+ *     进去了就进 state，之后规则再改也清不掉）
+ *   · 非视频页（首页/动态/搜索）→ 原样返回，用户在那儿就是要看一堆封面
+ *
+ * @param {Array<any>} items
+ * @param {string} tabUrl
+ * @returns {Array<any>}
+ */
+function preferBiliCover(items, tabUrl) {
+  if (!Array.isArray(items) || !items.length) return items;
+  let isVideoPage = false;
+  try {
+    const host = new URL(String(tabUrl || "")).hostname.toLowerCase();
+    if (!/(^|\.)bilibili\.com$/.test(host)) return items;
+    const p = new URL(String(tabUrl)).pathname;
+    isVideoPage = /^\/video\/(BV[0-9A-Za-z]+|av\d+)/i.test(p)
+      || /^\/(bangumi|cheese)\/play\/(ep|ss)\d+/i.test(p);
+  } catch (e) {
+    return items;
+  }
+  if (!isVideoPage) return items;
+  return items.filter((it) => it.k !== "image" || it.hint === "bili-cover");
+}
+
+/** 从完整 URL 取宿主名；取不到返回 ""（解析失败时按「非白名单」处理，宁可少收） */
+/**
+ * 是不是 HLS 播放列表（.m3u8）。
+ *
+ * 为什么值得单独认：m3u8 是**文本清单**，里面一行一个 .ts / .m4s 分片地址，
+ * 真正占几百 MB 的是那些分片。把它和 mp4 一样显示成「视频 29 KB」有两个坏处：
+ * ①用户以为下到的就是视频，点下载得到一个几百行的文本；
+ * ②有的站（51cg1）播放器压根没初始化，浏览器一次都没请求过 .m3u8，
+ *  扩展只能从 DOM 的 data-config 里读到它 —— 那种条目更要有醒目的说明。
+ *
+ * 只按路径后缀判，不看 query：站方常把播放列表挂在 `?url=xxx.m3u8` 这类
+ * 跳转后面，那种我们抓到的本来就是跳转前的地址，判成 HLS 反而不对。
+ */
+function isHlsUrl(u) {
+  try {
+    return /\.m3u8$/i.test(new URL(String(u || "")).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function hostOfUrl(u) {
+  try {
+    return new URL(String(u || "")).hostname;
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
+ * 把「页面标题条目」的标题借给同 tab 下真正的 m3u8 条目，并就地删掉页面条目。
+ *
+ * 背景（用户 m16052，4kvm）：artplayer + hls.js 的站，页面上 <video src> 是 blob:，
+ * 真实 m3u8 只有 webRequest 抓得到 —— 可它没有标题；页面侧能读到 og:title，
+ * 却读不到 hls.js 内部的 m3u8 地址。两边各持有一半信息，只能在这里合。
+ *
+ * 判定「页面标题条目」：hint === "hls" 但 URL 的 pathname 不是 .m3u8
+ * （页面侧上报的就是 location.href）。真 m3u8 条目：isHlsUrl 为真。
+ *
+ * 只在**同时存在真 m3u8 条目**时才借标题并删页面条目。若页面上只有那条
+ * 页面条目（m3u8 还没请求出来），就原样留着 —— 至少让用户看到标题。
+ *
+ * 返回 true 表示列表被改过（调用方据此决定是否 flush）。
+ */
+function applyHlsPageTitle(items) {
+  const pageItems = [];
+  const hlsItems = [];
+  for (const it of items) {
+    if (!it) continue;
+    if (isHlsUrl(it.u)) hlsItems.push(it);
+    else if (it.hint === "hls") pageItems.push(it);
+  }
+  if (!pageItems.length || !hlsItems.length) return false;
+  // 取最新的那条页面标题（SPA 切集时标题会变）
+  let title = "";
+  for (const p of pageItems) {
+    const t = (p.title || "").trim();
+    if (t) title = t;
+  }
+  if (title) {
+    const want = title.slice(0, 90);
+    for (const h of hlsItems) {
+      // 已经有更具体标题的（比如页面 <video> 挂了 messageId 那种）不覆盖
+      if (!(h.title || "").trim()) h.title = want;
+    }
+  }
+  // 删掉页面条目：它的 URL 是网页地址，点下载只会把 HTML 存下来
+  const drop = new Set(pageItems);
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (drop.has(items[i])) items.splice(i, 1);
+  }
+  return true;
+}
+
+
+// Telegram 视频封面在页面结构里的特征（站点针对，不在通用层判断）。
+// 真机证据（2026-10-21）：封面 URL 和尺寸跟真照片完全一样（320×180 / 179×320），
+// 唯一区别是 DOM 结构——
+//   ① 消息内：.media-inner 里 <video class="full-media"> 和 <img class="thumbnail"> 同容器
+//   ② 左栏列表：.media-preview 里 <img class="media-preview--image"> 配 <i class="icon icon-play">
+//   真照片是 <img class="media">，没有 video 兄弟。
+// 页面侧 scanImages 已经用 site.isDecorImg 挡住了**新**扫描；但 Telegram 的封面是
+// blob: URL，每轮刷新都换一个，旧地址的条目留在 state 里没人删。
+// 这里按 hint/class 特征做一次「按当前判定重算」，把这批陈旧条目清掉。
+const TG_COVER_HINT = /media-preview--image|media-preview\b/i;
+const TG_THUMB_HINT = /(?:^|\s)thumbnail(?:\s|$)/i;
+
+/**
+ * 清掉 rec 里「按当前判定不该显示」的图片条目，返回清掉的条数。
+ *
+ * 为什么需要它：过滤只在入口（record / scanImages）做，一旦条目已经进了 state，
+ * 规则后来变严（或页面上报的临时地址已经失效）就永远清不掉。定期按最新规则重算一次，
+ * 让 state 自然收敛到「规则认可的样子」。
+ *
+ * 只动 k === "image" 的条目：
+ *   · 非白名单站点的封面（hint 含 cover）—— 默认策略（用户 m15108）
+ *   · Telegram 的两类视频封面 —— 见上面的真机证据
+ * 视频/音频/其它一律不碰：它们不参与这套判定，误删代价远大于收益。
+ *
+ * @param {{items: Map<string, any>, url: string}|null} rec
+ * @returns {number} 清掉的条数（0 表示什么都没动，调用方据此决定要不要 flush）
+ */
+function pruneStaleImages(rec) {
+  if (!rec || !rec.items || typeof rec.items.delete !== "function") return 0;
+  const coverOK = coverAllowed(hostOfUrl(rec.url || ""));
+  let dropped = 0;
+  for (const [key, it] of [...rec.items]) {
+    if (!it || it.k !== "image") continue;
+    const hint = String(it.hint || "");
+    let stale = false;
+    if (!coverOK && hint.indexOf("cover") >= 0) stale = true;              // 默认策略
+    else if (TG_COVER_HINT.test(hint)) stale = true;                       // 左栏列表预览
+    else if (TG_THUMB_HINT.test(hint) && /web\.telegram\.org/i.test(String(it.u || ""))) stale = true;
+    if (stale) { rec.items.delete(key); dropped++; }
+  }
+  return dropped;
+}
+
 const THUMB_HINT = /\/file\/|thumb|avatar|emoji|\/icons?\/|img-apple-64|\/assets\//i;
 // B 站等站的图片 CDN 域名特征（只用于加严，不用于豁免 —— Telegram 的教训）
 const CDN_HINT = /hdslb\.com|alicdn\.com|bdstatic\.com|gtimg\.cn|byteimg\.com|360buyimg\.com/i;
@@ -862,7 +1047,7 @@ function renumberImages(rec) {
     // MSE 条目拿到 (26)，用户看到的「①」根本对不上。
     if (xhsDetail) {
       if (/^m\d+$/.test(it.u || "")) continue;
-      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      const real = it.hint === "xhs-note" || it.hint === "xhs-cover" || (it.title || "").trim();
       if (!real) continue;
     }
     // ref 也进分组键：Telegram 相册里「视频 + 图片」横排时，两个 <video> 的
@@ -880,11 +1065,14 @@ function renumberImages(rec) {
     // 会额外给 album/viewer 两种 ref，拆得最碎，所以最先暴露。
     //
     // 新的键顺序（越靠前越优先）：
-    //   1. 有标题 → 用标题。标题就是「同一条内容」最接近的标识，也是用户
-    //      肉眼分组时依据的东西；跨消息、跨 ref、跨 kind 都并到一起。
-    //      为什么连 kind 也不分：用户说的就是「视频或图片放在一起」。
-    //   2. 没标题但有 mid（Telegram 的相册里偶尔抓不到标题文字）→ 退回
-    //      原来的 `kind+mid+ref`，至少同一格的还能排上序。
+    //   1. 有 mid → 用 mid。**一条消息就是一个编号单元**：消息内的图片/视频
+    //      共用一个 ①~Ⓝ 池子，不同消息各自从 ① 起。
+    //      2026-10-22 调整（原来是「有标题就用标题、跨消息合并连号」）：
+    //      真机上跨消息连号会让用户以为「第 12 张」还在他打开的那一条里；
+    //      而且焦点收窄是**按消息**过滤的，编号若按标题、焦点按消息，一收窄
+    //      就出现序号错位 —— 两者必须是同一粒度。
+    //   2. 没 mid 但有标题（普通网站、抓不到消息号的 Telegram 相册）→ 用标题，
+    //      跨 kind 合并（用户说的就是「视频或图片放在一起」）。
     //   3. 都没有 → 调用方已经 continue 掉了，走不到这里。
     //
     // 小红书详情页仍然是整页一个池子（"xhs"），首页 feed 仍然整段跳过，
@@ -892,20 +1080,19 @@ function renumberImages(rec) {
     const titleKey = (it.title || "").trim();
     const gk = xhsDetail
       ? "xhs"
-      : titleKey
-        ? "t:" + titleKey
-        : it.k + "|" + (it.mid ? "m:" + it.mid : "") + "|" + (it.ref || "");
+      : it.mid
+        ? "m:" + it.mid
+        : titleKey
+          ? "t:" + titleKey
+          : it.k + "|" + (it.ref || "");
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(it);
   }
 
   for (const list of groups.values()) {
-    list.sort((a, b) => {
-      const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
-      const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
-      if (oa !== ob) return oa - ob;
-      return (a.t || 0) - (b.t || 0);
-    });
+    // 两处（renumberImages / numberShown）原本各写一份一模一样的 sort，
+    // 改一处漏一处迟早出事，统一走 compareWithinGroup（见 DEVLOG d-023）。
+    list.sort(compareWithinGroup);
   }
   // 只记分组结果，**不写 idx/mark** —— 真正发出去的序号由 numberShown 在
   // icon 过滤 + 去重之后统一编（否则被剔掉的条目会占掉序号，见 numberShown 注释）。
@@ -913,9 +1100,39 @@ function renumberImages(rec) {
 }
 
 /**
+ * 组内排序：**先按消息分组（mid 升序），消息内部再按 ord**。
+ *
+ * 为什么不能只比 ord（2026-10-20 真机事故，用户 m14306「序号和内容对不上」）：
+ * Telegram 同一标题下常常散在**多条消息**里，而 `ord` 是「消息内的第几个」，
+ * 每条消息都从 0 重新开始。真机数据「编号：#CC0385」：
+ *
+ *   mid=7497 → 1 张图 ord=0
+ *   mid=7498 → 5 图 + 7 视频，ord=0..9（其中一条 ref=viewer 的 ord 也是 0）
+ *   mid=7508 → 1 张图 ord=0
+ *
+ * 旧代码只比 ord，三个 0 并列后只能退到 `t`（抓取时间）。抓取时间是异步到达的，
+ * 等于随机，于是列表里出现 ①⑥②③④⑤ 这种「跳号 + 对不上内容」。
+ *
+ * mid 是字符串型的消息编号，序号在同频道里单调递增，所以按**数值**升序就是
+ * 「消息在聊天里的先后」。拿不到 mid（普通网站、小红书的正文图）时退回纯 ord。
+ */
+function compareWithinGroup(a, b) {
+  const ma = Number(a.mid), mb = Number(b.mid);
+  const aHasMid = (a.mid != null && a.mid !== "" && Number.isFinite(ma));
+  const bHasMid = (b.mid != null && b.mid !== "" && Number.isFinite(mb));
+  if (aHasMid && bHasMid && ma !== mb) return ma - mb;
+  // 有 mid 的排在没有 mid 的前面：同标题下「真实消息」比「猜出来的图」可信
+  if (aHasMid !== bHasMid) return aHasMid ? -1 : 1;
+  const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+  const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+  if (oa !== ob) return oa - ob;
+  return (a.t || 0) - (b.t || 0);
+}
+
+/**
  * 在「真正要显示的条目」上编号。
  *
- * 与 renumberImages 共用同一套分组规则（标题优先），区别只有两个：
+ * 与 renumberImages 共用同一套分组规则（mid 优先，其次标题），区别只有两个：
  *   1. 只处理传进来的这批条目（已经过 icon 过滤 + 去重），所以序号一定连续；
  *   2. 编号顺序用「标题分组 + 组内 DOM 顺序」，与 popup 的排序判据一致，
  *      用户看到的 ①②③ 就是从上到下。
@@ -935,7 +1152,7 @@ function numberShown(items, tabUrl) {
     if (xhsDetail) {
       // 详情页整帖共用一个序号池；MSE 录制条目（u 是 "m1"）绝不参与
       if (/^m\d+$/.test(it.u || "")) continue;
-      const real = it.hint === "xhs-note" || (it.title || "").trim();
+      const real = it.hint === "xhs-note" || it.hint === "xhs-cover" || (it.title || "").trim();
       if (!real) continue;
     } else if (isXhsHostUrl(tabUrl || "") && (it.title || "").trim()) {
       // 小红书首页信息流：每张封面属于不同帖子，标题各不相同，不编号（用户 m06550）
@@ -947,19 +1164,16 @@ function numberShown(items, tabUrl) {
     const titleKey = (it.title || "").trim();
     const gk = xhsDetail
       ? "xhs"
-      : titleKey
-        ? "t:" + titleKey
-        : it.k + "|" + (it.mid ? "m:" + it.mid : "") + "|" + (it.ref || "");
+      : it.mid
+        ? "m:" + it.mid
+        : titleKey
+          ? "t:" + titleKey
+          : it.k + "|" + (it.ref || "");
     if (!groups.has(gk)) groups.set(gk, []);
     groups.get(gk).push(it);
   }
   for (const list of groups.values()) {
-    list.sort((a, b) => {
-      const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
-      const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
-      if (oa !== ob) return oa - ob;
-      return (a.t || 0) - (b.t || 0);
-    });
+    list.sort(compareWithinGroup);
   }
   numberDisplayed(groups);
 
@@ -1096,11 +1310,17 @@ function dedupeXhsNoteImages(items) {
  * 原样返回 —— 宁可多几条噪声，也不能让列表整个空掉。
  */
 function preferXhsNoteList(items) {
-  const direct = items.filter((it) => String(it.hint || "") === "xhs-note");
+  // 两种直读 hint：图文帖的正文图 xhs-note、视频帖的封面 xhs-cover（本轮新增）。
+  // 封面也算「页面直读」，否则视频帖会被判成「没直读过」而退回全量噪声。
+  const isDirect = (it) => {
+    const h = String(it.hint || "");
+    return h === "xhs-note" || h === "xhs-cover";
+  };
+  const direct = items.filter(isDirect);
   if (!direct.length) return items;
   return items.filter((it) => {
     // 直读条目本身
-    if (String(it.hint || "") === "xhs-note") return true;
+    if (isDirect(it)) return true;
     // 视频/音频不受影响：它们本来就该由 webRequest + 页面 hook 抓
     if (it.k === "video" || it.k === "audio") return true;
     return false;
@@ -1303,7 +1523,132 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
 // ---------------------------------------------------------------- Native Host
 
 let nativePort = null;
-const downloads = new Map(); // id -> {url, status}
+const downloads = new Map(); // id -> {url, status, tabId, hls, kind, filename, referer, headers}
+
+// ---------------------------------------------------------------- HLS 地址过期自动重取
+//
+// 2026-10-22 真机（4kvm）：m3u8 地址是「播放一次生成一个」的 —— 重载页面就换成
+// 新的 32 位 hex，旧地址实测 5 分钟内就 404。用户在列表里看到的条目往往已经放了
+// 一会儿，于是「点下载 → 报错」变成常态，主观上就是「这个站下不了」。
+//
+// 处理：宿主报「地址有时效 / 404」时，自动 reload 这个标签页，等页面重新上报一条
+// **新的** m3u8，再用新地址重下（只重试一次，避免刷新风暴）。用户看到的是页面闪
+// 一下，进度条接着走。
+const pendingHlsRetry = new Map(); // tabId -> {oldUrl, kind, filename, referer, headers, deadline}
+
+/** 发起一次本地下载。popup 点「下载」和「过期自动重下」都走这里 */
+async function startNativeDownload(o) {
+  const settings = await getSettings();
+  const cookie = settings.useCookies ? await buildCookieHeader(o.url) : "";
+  const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+  downloads.set(id, {
+    url: o.url,
+    status: "starting",
+    tabId: o.tabId == null ? null : o.tabId,
+    hls: isHlsUrl(o.url),
+    kind: o.kind || "other",
+    filename: o.filename || "",
+    referer: o.referer || "",
+    headers: o.headers || {},
+  });
+  postNative({
+    action: "download",
+    id,
+    url: o.url,
+    kind: o.kind || "other",
+    filename: o.filename || "",
+    referer: o.referer || "",
+    tabUrl: o.tabUrl || "",
+    cookie,
+    // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
+    // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
+    headers: o.headers || {},
+    concurrency: settings.concurrency || 16,
+    outdir: settings.outdir || "",
+  });
+  return { id };
+}
+
+/**
+ * 这单要不要「刷新页面重取地址」？
+ *
+ * 抽成纯函数是为了能单测：真实触发路径要 chrome.tabs.reload + 宿主重启，跑不起来。
+ * 判据三条缺一不可：是 m3u8、还没重试过、错因确实是地址过期/404。
+ * 别的错误（403 防盗链、磁盘满、ffmpeg 失败）刷新页面没用，只会白刷一次。
+ */
+function shouldRetryHls(job, message) {
+  if (!job || !job.hls || job.retried || job.tabId == null) return false;
+  return /时效|过期|\b404\b/.test(String(message || ""));
+}
+
+/** 宿主报错时判断要不要刷新页面重取地址。只在 m3u8 + 时效类报错上触发一次 */
+function maybeStartHlsRetry(msg) {
+  const isErr = msg && (msg.action === "error" || msg.status === "error");
+  if (!isErr || !msg.id) return;
+  const job = downloads.get(msg.id);
+  if (!shouldRetryHls(job, msg.message)) return;
+  job.retried = true;
+  pendingHlsRetry.set(job.tabId, {
+    oldUrl: job.url,
+    kind: job.kind,
+    filename: job.filename,
+    referer: job.referer,
+    headers: job.headers,
+    // 120 秒而不是 25：页面 reload + 重新拉流实测要 10~20 秒，慢网络或
+    // 站方延迟初始化播放器时更久。等不到就白刷一次页面，不如等久点。
+    deadline: Date.now() + 120000,
+  });
+  try {
+    chrome.tabs.reload(job.tabId);
+  } catch (e) {
+    pendingHlsRetry.delete(job.tabId);
+  }
+}
+
+/**
+ * 页面重新上报某条目时，判断它是不是我们要等的「新 m3u8」。
+ * 返回可用的新地址；返回空串表示继续等（或已经过期）。
+ *
+ * 必须排除 oldUrl：reload 之后页面可能先重放一遍**缓存里的旧地址**，拿它重下
+ * 只会再 404 一次，而重试机会只有一次。
+ */
+function retriedHlsUrl(pend, key, now) {
+  if (!pend) return "";
+  if (now > pend.deadline) return "";
+  const u = String(key || "");
+  if (!isHlsUrl(u) || u === pend.oldUrl) return "";
+  return u;
+}
+
+/** 页面重新上报条目时，出现「新的」m3u8 就用它重下一次 */
+function maybeUseRetriedHls(tabId, p) {
+  const pend = pendingHlsRetry.get(tabId);
+  if (!pend) return;
+  const u = retriedHlsUrl(pend, p && p.key, Date.now());
+  if (!u) {
+    // 超时的清掉，避免一直挂着一个永远不会兑现的等待
+    if (Date.now() > pend.deadline) pendingHlsRetry.delete(tabId);
+    return;
+  }
+  pendingHlsRetry.delete(tabId);
+  startNativeDownload({
+    url: u,
+    kind: pend.kind,
+    filename: pend.filename,
+    referer: pend.referer,
+    headers: pend.headers,
+    tabId,
+    tabUrl: "",
+  }).then((r) => {
+    chrome.runtime.sendMessage({
+      type: "native:progress",
+      msg: {
+        id: r.id, action: "progress", status: "downloading", percent: 0,
+        message: "视频地址已过期，已刷新页面重新开始",
+      },
+    }).catch(() => {});
+  }).catch(() => { /* 宿主没起来时 popup 自己会报连接失败 */ });
+}
 
 function connectNative() {
   if (nativePort) return nativePort;
@@ -1331,6 +1676,8 @@ function connectNative() {
       const job = downloads.get(msg.id) || {};
       Object.assign(job, msg);
       downloads.set(msg.id, job);
+      // 地址过期（m3u8 一次性）时自动刷新页面重取 —— 见 maybeStartHlsRetry 的注释
+      maybeStartHlsRetry(msg);
     }
     chrome.runtime.sendMessage({ type: "native:progress", msg }).catch(() => {});
   });
@@ -1556,6 +1903,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "sniff:get": {
         await loadPromise;
         const rec = state.get(msg.tabId);
+        // 先把「按当前规则已经不该存在」的陈旧图片清掉（默认策略 / Telegram 封面）。
+        // 必须在取 items 快照**之前**，否则这一轮还是会带出去。
+        if (rec && pruneStaleImages(rec)) flushSoon(msg.tabId);
         const items = rec ? [...rec.items.values()] : [];
         let tabUrl = rec ? rec.url : "";
         // 小红书是单页应用：从信息流点开帖子常常不触发 main_frame，rec.url 还停在
@@ -1584,18 +1934,39 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 用户要求「图标彻底不要」：图标（emoji/头像/UI 素材/贴纸占位等站方自带小图）
         // 不进 popup，直接从返回列表里过滤掉。判定仍在 state 里做（保证图片栏干净），
         // 只是不再发给 popup 显示。
-        const visible = items.filter((it) => it.k !== "icon");
+        //
+        // 视频封面（hint=bili-cover / xhs-cover）同理：默认不当图片收，
+        // 只在 VIDEO_COVER_SITES 白名单里的站点保留（用户 m15108）。放在这里
+        // 而不是 record() 里，是因为 tabUrl 可能是 SPA 修正过的地址，只有这里才准。
+        const curHost = hostOfUrl(tabUrl);
+        const coverOK = coverAllowed(curHost);
+        const visible = items.filter((it) => it.k !== "icon"
+          && !(!coverOK && String(it.hint || "").indexOf("cover") >= 0));
         // 小红书详情页：同一张图被页面用不同尺寸/裁切后缀引用多次（封面最容易中招），
         // 按「内容身份」只留体量最大的一条，避免列表里一张图出现两次。
         // 再叠一层「页面直读优先」：imageList 已经给出完整清单时，webRequest 抓到的
         // 缩略图/雪碧图/别的帖子封面全是噪声（详见 preferXhsNoteList 的注释）。
         const shown = isXhsDetailUrl(tabUrl)
           ? preferXhsNoteList(dedupeXhsNoteImages(visible))
-          : dedupeImagesByIdentity(visible);
+          : preferBiliCover(dedupeImagesByIdentity(visible), tabUrl);
         // 焦点收窄（用户 m13863）：页面在「查看器/灯箱」打开时上报当前焦点内容，
         // 这里只留那条内容的条目。**放在去重之后**：去重可能合掉条目，
         // 先收窄再合会让「命中条数」判断失真。
         const focused = applyFocusFilter(shown, rec ? rec.focus : null);
+        // HLS 播放列表要单独标一下（用户 m16052：51cg1 / 4kvm「不起作用」）。
+        // webRequest 抓到的 .m3u8 只是**文本播放列表**（几 KB~几十 KB），
+        // 真视频在它列出的成百上千个 .ts 分片里。以前它和普通 mp4 一样显示成
+        // 「视频 29KB」，用户点下载以为在下视频，其实下的是一个文本文件。
+        // 这里只打标记，不改 k（下载分派还靠 k=video 走 yt-dlp）。
+        for (const it of focused) {
+          if (isHlsUrl(it.u)) it.hint = "hls";
+        }
+        // artplayer 站（4kvm 这类）：页面侧另报了一条 `hint:"hls"` 的「页面标题条目」，
+        // 它的 key 是**页面地址**（页面拿不到真实 m3u8），所以和上面那条跑不到一起。
+        // 这里把页面条目的标题「借」给同 tab 下真正指向 m3u8 的条目，然后把页面条目丢掉。
+        // 为什么这么绕：页面侧只有 DOM（能读到 og:title，读不到 hls.js 内部地址），
+        // 后台侧只有 webRequest（能读到 m3u8，读不到标题）——两边各有一半。
+        applyHlsPageTitle(focused, tabUrl);
         // 编号必须在**所有滤网之后**做（用户 m13975：序号超出内容数量、和内容对不上）。
         // 先编号再过滤的话，被剔掉的 icon / 被去重合并的缩略图照样占掉一个号，
         // 于是 6 条内容出现 ⑨、真图从 ③ 直接跳到 ⑥。
@@ -1673,6 +2044,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         if (p.cmd === "found" || p.cmd === "progress") {
           recordPageMedia(tid, (sender.tab && sender.tab.url) || "", p);
+          // 上一轮下载因「地址过期」触发了 reload，这里接住页面重新上报的新 m3u8
+          if (p.cmd === "found") maybeUseRetriedHls(tid, p);
         } else if (p.cmd === "saved") {
           // 页面保存的成败都落进 host.log：失败以前只显示在页面右下角的进度卡里，
           // 用户一关页面就什么证据都不剩，排障无从下手（Telegram 首次真机排查就栽在这）
@@ -1765,26 +2138,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "native:download": {
         try {
-          const settings = await getSettings();
-          const cookie = settings.useCookies ? await buildCookieHeader(msg.url) : "";
-          const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
-          downloads.set(id, { url: msg.url, status: "starting" });
-          postNative({
-            action: "download",
-            id,
+          const r = await startNativeDownload({
             url: msg.url,
-            kind: msg.kind || "other",
-            filename: msg.filename || "",
-            referer: msg.referer || "",
-            tabUrl: msg.tabUrl || "",
-            cookie,
-            // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
-            // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
-            headers: msg.headers || {},
-            concurrency: settings.concurrency || 16,
-            outdir: settings.outdir || "",
+            kind: msg.kind,
+            filename: msg.filename,
+            referer: msg.referer,
+            tabUrl: msg.tabUrl,
+            headers: msg.headers,
+            tabId: msg.tabId,
           });
-          sendResponse({ ok: true, id });
+          sendResponse({ ok: true, id: r.id });
         } catch (e) {
           sendResponse({ ok: false, error: String(e.message || e) + "（是否已运行安装脚本？）" });
         }

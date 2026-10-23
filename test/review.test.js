@@ -47,6 +47,9 @@ module.exports = function runReviewTests(check) {
         return tabs.get(tid);
       },
       flushSoon() {}, bumpBadge() {}, confirmPageItem() {},
+      // record 末尾会尝试「地址过期自动重取」的接续（4kvm 的 m3u8 只由 webRequest
+      // 抓到，所以接续点也放在 record 里）。这些用例不验那个行为，给空实现即可。
+      maybeUseRetriedHls() {},
       headersOf: () => undefined,
       // content-length 必须真读：体量门槛测试全靠它
       headerValue: (headers, name) => {
@@ -183,6 +186,9 @@ module.exports = function runReviewTests(check) {
         return tabs.get(tid);
       },
       flushSoon() {}, bumpBadge() {}, confirmPageItem() {},
+      // record 末尾会尝试「地址过期自动重取」的接续（4kvm 的 m3u8 只由 webRequest
+      // 抓到，所以接续点也放在 record 里）。这些用例不验那个行为，给空实现即可。
+      maybeUseRetriedHls() {},
       fileNameOf: (u) => String(u).split("/").pop() || "",
     });
     const rpmSrc = extractFn(bg, "recordPageMedia");
@@ -248,6 +254,9 @@ module.exports = function runReviewTests(check) {
         return tabs.get(tid);
       },
       flushSoon() {}, bumpBadge() {}, confirmPageItem() {},
+      // record 末尾会尝试「地址过期自动重取」的接续（4kvm 的 m3u8 只由 webRequest
+      // 抓到，所以接续点也放在 record 里）。这些用例不验那个行为，给空实现即可。
+      maybeUseRetriedHls() {},
       fileNameOf: (u) => String(u).split("/").pop() || "",
     });
     const rpmSrc = extractFn(bg, "recordPageMedia");

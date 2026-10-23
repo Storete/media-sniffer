@@ -44,7 +44,7 @@ def job(**kw):
 # 1) 相对地址 → 直接失败，且提示去页面保存，绝不进 yt-dlp
 path = os.path.join(TMP, "rel.job.json")
 json.dump(job(id="rel", url="document6208389833551777399"), open(path, "w", encoding="utf-8"))
-called = {"ytdlp": 0, "urllib": 0}
+called = {"ytdlp": 0, "urllib": 0, "hls": 0}
 D.run_ytdlp = lambda *a, **k: called.__setitem__("ytdlp", called["ytdlp"] + 1)
 D.run_urllib = lambda *a, **k: called.__setitem__("urllib", called["urllib"] + 1)
 D.run_urllib = D.run_urllib
@@ -55,11 +55,11 @@ orig_urllib = D.run_urllib
 D.run_urllib = lambda j: called.__setitem__("urllib", called["urllib"] + 1)
 D.main()
 st = json.load(open(os.path.join(TMP, "rel.json"), encoding="utf-8"))
-check("相对地址不进任何下载器", called == {"ytdlp": 0, "urllib": 0}, called)
+check("相对地址不进任何下载器", called == {"ytdlp": 0, "urllib": 0, "hls": 0}, called)
 check("相对地址给出可读错误", st.get("status") == "error" and "页面" in (st.get("message") or ""), st)
 
 # 2) 直链媒体 → 不经过 yt-dlp，直接 urllib
-called.update(ytdlp=0, urllib=0)
+called.update(ytdlp=0, urllib=0, hls=0)
 path2 = os.path.join(TMP, "direct.job.json")
 json.dump(job(id="direct", url="https://web.telegram.org/a/progressive/document123"), open(path2, "w", encoding="utf-8"))
 sys.argv = ["downloader.py", path2]
@@ -77,13 +77,27 @@ def fake_ytdlp_fail(j, ytdlp, ffmpeg):
 
 D.run_ytdlp = fake_ytdlp_fail
 D.run_urllib = lambda j: called.__setitem__("urllib", called["urllib"] + 1)
+
+
+# 2026-10-22 新增第三条路：伪装分片的 m3u8（分片是「图片壳 + TS」）自己下。
+# 这里必须一起打桩，否则测试会真的去连 example.invalid（走系统代理要好几秒）。
+def fake_hls_fail(j, quiet=False):
+    called["hls"] += 1
+    D.write_status(j["id"], status="error", message="拉取播放列表失败：HTTP 404 Not Found")
+    return True
+
+
+D.run_hls_self = fake_hls_fail
 path3 = os.path.join(TMP, "hls.job.json")
 json.dump(job(id="hls3", url="https://example.invalid/live/index.m3u8"), open(path3, "w", encoding="utf-8"))
 sys.argv = ["downloader.py", path3]
 # 先清掉：上面「直链」那次也计进了 urllib，不清就分不清这一轮的归属
-called.update(ytdlp=0, urllib=0)
+called.update(ytdlp=0, urllib=0, hls=0)
 D.main()
-check("m3u8 先走 yt-dlp", called["ytdlp"] == 1, called)
+# 2026-10-22 起顺序是「自实现 HLS → yt-dlp → 直连」：分片是不是「图片壳 + TS」
+# 只有下第一片才知道，而 yt-dlp 遇到壳会一路重试到超时（4kvm 实测几分钟还停在 0%）。
+check("m3u8 先走自实现 HLS（不等 yt-dlp 重试到超时）", called["hls"] == 1, called)
+check("自实现 HLS 搞不定时交给 yt-dlp", called["ytdlp"] == 1, called)
 check("yt-dlp 302 后自动兜底直连", called["urllib"] == 1, called)
 
 # 4) 两者都失败 → 错误里同时保留两条信息
@@ -99,6 +113,8 @@ D.main()
 st4 = json.load(open(os.path.join(TMP, "both4.json"), encoding="utf-8"))
 check("双失败时两条原因都保留",
       st4.get("status") == "error" and "yt-dlp" in st4.get("message", "") and "直连" in st4.get("message", ""), st4)
+check("三路全失败时自实现 HLS 的原因也保留（不然用户只看到 yt-dlp 的 404）",
+      "自实现 HLS" in st4.get("message", ""), st4)
 
 print("RESULT: " + ("ALL PASS" if all(results) else "FAILED %d" % results.count(False)))
 sys.exit(0 if all(results) else 1)

@@ -185,6 +185,14 @@
     if (ascii(b, 0, 4) === "OggS") return ".ogg";
     if (ascii(b, 0, 4) === "fLaC") return ".flac";
     if (b[0] === 0x47 && b[188] === 0x47) return ".ts";
+    // 图片魔数：Telegram 的图片是 blob:（类型只挂 image/jpeg 这类 MIME），
+    // 而旧逻辑只认音视频，一路兜到 ".mp4" —— 真机存出来是「真机测试图.mp4」，
+    // 十六进制却是 ffd8ffe0（JPEG）。按内容定扩展名，别信调用方给的键名。
+    if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return ".jpg";
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return ".png";
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return ".gif";
+    if (ascii(b, 0, 4) === "RIFF" && ascii(b, 8, 4) === "WEBP") return ".webp";
+    if (b[0] === 0x42 && b[1] === 0x4d) return ".bmp";
     return null;
   }
 
@@ -234,22 +242,71 @@
 
   // ------------------------------------------------------------ 2. 媒体元素发现（三种触发 + 轮询兜底）
 
-  /** 媒体所在消息的 id / 引用（Telegram 的 data-message-id 在 .Message 上） */
+  /**
+   * 媒体所在的「消息容器」元素（一条消息 = 一个编号单元）。
+   *
+   * 为什么要单独抽一层（2026-10-22 真机）：Telegram 有两套前端，消息号挂在
+   * 不同属性上 ——
+   *   · Web A（`web.telegram.org/a/`）：`.Message[data-message-id]`
+   *   · Web K（`web.telegram.org/k/`）：`.bubble[data-mid]`，
+   *     而 `data-message-id` **一个都没有**（实测整页 0 个，`data-mid` 37 个）
+   * 只读前者时 K 版的 mid 恒为空，background 认为「既没 mid 也没标题」，
+   * 整批条目不编号；焦点反查也找不到元素，查看器打开时列表不收窄。
+   *
+   * 取**最外层**带注解的祖先，而不是最近一层：同一条消息里的相册项自己也带
+   * `data-mid` 且各不相同（实测一条消息的三个相册项是 868/869/870，气泡是
+   * 868）。取最近一层会把一条消息拆成三条、每条只剩一张图，序号全落空。
+   *
+   * 站点钩子优先，通用层只认 `data-message-id` —— 站点私有属性不进通用逻辑，
+   * 免得误伤其他恰好也用 `data-mid` 的站点。
+   */
+  function msgBoxOf(el) {
+    try {
+      const site = activeSite();
+      if (site && site.msgBox) {
+        const box = site.msgBox(el);
+        if (box) return box;
+      }
+      let n = el, depth = 0;
+      while (n && n.nodeType === 1 && depth < 22) {
+        if (n.getAttribute && n.getAttribute("data-message-id")) return n;
+        n = n.parentElement;
+        depth++;
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 消息容器上的消息号；站点可以自定义读法（Telegram K 版是 data-mid）。 */
+  function msgIdOf(box) {
+    try {
+      const site = activeSite();
+      if (site && site.msgId) {
+        const v = site.msgId(box);
+        if (v) return String(v);
+      }
+      if (box && box.getAttribute) return box.getAttribute("data-message-id") || "";
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  /** 媒体所在消息的 id / 引用 */
   function mediaContext(el) {
     const out = { mid: "", ref: "" };
     try {
+      // 消息号先交给站点定位容器，再读号（两套 Telegram 前端的属性名不同）
+      const box = msgBoxOf(el);
+      if (box) out.mid = msgIdOf(box);
+      // ref 表示「这个媒体是怎么呈现的」（相册里 / 查看器里），取**最近**一层：
+      // 相册项比外层气泡更靠近媒体，先遇到哪个就是哪个。
       let n = el, depth = 0;
       while (n && n.nodeType === 1 && depth < 22) {
         const cn = String(n.className || "");
-        if (!out.mid && n.getAttribute) out.mid = n.getAttribute("data-message-id") || "";
-        if (!out.ref) {
-          if (/MediaViewerSlide/.test(cn) || /is-for-video/.test(cn)) out.ref = "viewer";
-          // `^Album\b` 只认得 Telegram 旧版的 `Album` 类名；WebZ 现在发的是
-          // 哈希类名 + `album-item`，所以补上 album-item（实测 8928 的
-          // 两个 video 都挂在 div.AOksc2b1.Q1Cqmt5K.album-item 里）。
-          else if (/^Album\b|album-item/.test(cn)) out.ref = "album";
-        }
-        if (out.mid && out.ref) break;
+        if (/MediaViewerSlide/.test(cn) || /is-for-video/.test(cn)) { out.ref = "viewer"; break; }
+        // `^Album\b` 只认得 Telegram 旧版的 `Album` 类名；WebZ 现在发的是
+        // 哈希类名 + `album-item`，所以补上 album-item（实测 8928 的
+        // 两个 video 都挂在 div.AOksc2b1.Q1Cqmt5K.album-item 里）。
+        else if (/^Album\b|album-item/.test(cn)) { out.ref = "album"; break; }
         n = n.parentElement;
         depth++;
       }
@@ -267,14 +324,16 @@
   function ordOfMedia(el) {
     try {
       if (!el || !el.parentElement) return -1;
-      // 找消息容器：有 data-message-id 的祖先；没有就退回父节点
-      let box = el.parentElement;
-      let n = el, depth = 0;
-      while (n && n.nodeType === 1 && depth < 22) {
-        if (n.getAttribute && n.getAttribute("data-message-id")) { box = n; break; }
-        n = n.parentElement;
-        depth++;
-      }
+      // 首选「视频+图片共用一个池」的统一序号（orderMediaInMessage）。
+      // 这里必须复用同一个函数：如果视频还按「只跟 video 比」算，
+      // 同一条消息里 video 会得到 0..6、image 得到 0..18，两组 ord 撞车，
+      // background 的 compareWithinGroup 只能退到抓取时间去排 —— 表现就是
+      // 「①图②视频③图④视频」这种完全对不上的编号（用户 m15907 反馈的问题）。
+      const unified = orderMediaInMessage(el);
+      if (unified >= 0) return unified;
+      // 兜底：容器里找不到 video/img 混排（比如音频独立面板），退回同族比较
+      // 找消息容器：站点的消息容器优先；没有就退回父节点
+      let box = msgBoxOf(el) || el.parentElement;
       if (!box || !box.querySelectorAll) return -1;
       // 只跟同一种媒体比：消息里一条视频 + 一条音频时各自从 ① 起
       const tag = el.tagName === "AUDIO" ? "audio" : "video";
@@ -292,6 +351,51 @@
         if (Math.abs(ro.top - r.top) > 8 ? ro.top < r.top : ro.left < r.left) before++;
       }
       return before;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  /**
+   * 同一条消息里**所有**媒体的统一阅读序号（0 起），视频/音频/图片共用一列。
+   *
+   * 为什么需要它（2026-10-21 用户 m15907「序号完全对不上」）：
+   * 旧代码视频走 `ordOfMedia()`（只跟同族 video 比），图片走 scanImages 里的
+   * 列表下标 i（只跟图片比）——**两条计数流各自从 0 起**。Telegram 消息 8848
+   * 就是这样：视频 ord=0..6、图片 ord=0..3，background 按 mid+ord 排序时
+   * 两边的 0 并列，只能退到抓取时间（异步到达=随机），列表于是出现
+   * ①图 ②视频 ③图 ④视频 ⑤图 ⑥视频 这种交替错号。
+   *
+   * 判据用「消息容器里的 DOM 顺序 + 坐标」：同一行（top 差 ≤8px）从左到右，
+   * 不同行从上到下。只把**真正参与编号**的元素放进来，占位 div 不算。
+   *
+   * @returns {number} 统一序号；拿不到返回 -1
+   */
+  function orderMediaInMessage(el) {
+    try {
+      if (!el || !el.parentElement) return -1;
+      // 消息容器由站点给出（见 msgBoxOf）：Web K 的相册项各自带 data-mid，
+      // 必须爬到外层气泡，否则每个相册项里只有 1 个媒体、序号全从 0 起。
+      const box = msgBoxOf(el) || el.parentElement;
+      if (!box || !box.querySelectorAll) return -1;
+      const nodes = [...box.querySelectorAll("video,audio,img")];
+      if (nodes.length <= 1) return 0;
+
+      // 给每个元素取一个 (行, 列) 位置：先按 top 分行，行内再按 left。
+      // 取不到 rect 的元素（display:none / 还没布局）排到最后，但保持 DOM 相对顺序。
+      const items = nodes.map((node, domIdx) => {
+        let r = null;
+        try { r = node.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+        return { node, domIdx, top: r ? r.top : 1e9, left: r ? r.left : 1e9 };
+      });
+      items.sort((a, b) => {
+        const sameRow = Math.abs(a.top - b.top) <= 8;
+        if (sameRow && Math.abs(a.left - b.left) > 1) return a.left - b.left;
+        if (a.top !== b.top) return a.top - b.top;
+        return a.domIdx - b.domIdx;
+      });
+      const at = items.findIndex((x) => x.node === el);
+      return at;
     } catch (e) {
       return -1;
     }
@@ -1223,6 +1327,59 @@
    * 两条都拿不到就返回 ""，也就是「不设焦点、显示全量」——
    * 宁可多显示，也不能因为猜错把列表清空。
    */
+  /**
+   * 取一个媒体元素的「可比对标识」：优先 currentSrc（blob 或 progressive 都算），
+   * 其次 src 属性。两者都空时返回 ""。
+   */
+  function tgMediaKey(el) {
+    if (!el) return "";
+    const s = el.currentSrc || el.src || el.getAttribute("src") || "";
+    return String(s).trim();
+  }
+
+  /**
+   * 从「查看器里正在看的那张/那条」反查它属于哪条消息（问题②，方案 B）。
+   *
+   * 为什么需要反查（2026-10-20 真机实测）：Telegram 的 `#MediaViewer` 打开后，
+   * DOM 里**没有任何消息标识**——`.MediaViewerSlide` 只有 class/style，
+   * 上溯链 `MediaViewerSlide--active → MediaViewerSlides → DIALOG#MediaViewer
+   * → .opacity-transition → .Transition → BODY` 全无 `data-message-id`，
+   * `.message.highlighted/.selected` 也是空的（TG 的点击跳转用滚动定位，不加类）。
+   * 唯一还能对上的是**媒体地址本身**：查看器里的 `<video src=".../document4999…">`
+   * 与聊天里那条消息里的同一个地址。
+   *
+   * 所以做法是：拿查看器里激活那张的 src，去聊天里找 src 相同的媒体元素，
+   * 再往上找它所属的 `[data-message-id]`。blob: 地址在同一页面里是同一个字符串
+   * （TG 用的是同一个 objectURL），所以比对能命中。
+   *
+   * 找不到返回 ""，绝不猜一个——猜错会让列表显示错误的内容，
+   * 比「不收窄」更糟（用户会以为抓漏了）。
+   */
+  function tgFocusByMedia() {
+    try {
+      // 只认「当前可见的那一页」。MediaViewer 里所有 slide 都渲染了，
+      // 必须用 --active 挑出真正展示的那张，否则会拿到邻张。
+      const slides = document.querySelectorAll(".MediaViewerSlide--active, .MediaViewer .MediaViewerSlide--active");
+      const viewer = slides.length ? slides[slides.length - 1] : document.querySelector(".MediaViewerSlide");
+      const vMedia = viewer ? viewer.querySelector("img, video") : null;
+      const vKey = tgMediaKey(vMedia);
+      if (!vKey) return "";
+      // 在聊天消息里找同地址的媒体元素
+      const all = document.querySelectorAll("[data-message-id] img, [data-message-id] video");
+      for (const m of all) {
+        if (tgMediaKey(m) !== vKey) continue;
+        let n = m, depth = 0;
+        while (n && n.nodeType === 1 && depth < 22) {
+          const id = n.getAttribute && n.getAttribute("data-message-id");
+          if (id) return String(id).trim();
+          n = n.parentElement;
+          depth++;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
   function tgFocus() {
     try {
       // 只在 Telegram 主界面里找，避免第三方嵌入页面误判
@@ -1230,7 +1387,7 @@
       const viewerSel = ".MediaViewer, .MediaViewerSlide, [class*='MediaViewer'], [class*='is-for-video']";
       const viewers = document.querySelectorAll(viewerSel);
       for (const v of viewers) {
-        // ① 容器自己带消息号
+        // ① 容器自己带消息号（目前实测没有，留着以防 TG 改版加回来）
         const own = v.getAttribute && v.getAttribute("data-message-id");
         if (own) return String(own).trim();
         // ② 容器里的媒体元素往上找
@@ -1245,29 +1402,45 @@
           }
         }
       }
+      // ③ 兜底（方案 B）：拿查看器里激活那张的媒体地址，回聊天里反查
+      return tgFocusByMedia();
     } catch (e) { /* 忽略 */ }
     return "";
   }
 
   /**
-   * 焦点变化时向后台上报一次（没变化就不发，避免每 600ms 刷一条消息）。
+   * 焦点变化时向后台上报（没变化就不发，避免每 600ms 刷一条消息）。
    *
    * 难点是「通用层要认识站点」——但按 A0 模块化，通用层不认识任何站点，
    * 所以这一层只做「问一遍 activeSite().focus()」：
    *   · 小红书返回 ""（URL 已收窄，不需要）
    *   · Telegram 由下面 push 进去的对象返回 tgFocus()
    * 拿不到 focus 钩子的站点一律视为「没有焦点」。
+   *
+   * 为什么还要「隔一段时间强制重发」（2026-10-20 真机踩到）：
+   * 只按变化发有个致命副作用——**一次上报丢掉就永久失效**。
+   * 实测现象：查看器刚打开那一瞬间，`post` 发出去了，但 content script 转发时
+   * service worker 正在启动（或 tab 记录还没建），后台没收到；可 `lastFocus`
+   * 已经被设成 "7498"，之后每一轮都判定「没变化」直接 return，
+   * 于是用户看到「明明打开了查看器，列表还是全量」。
+   * 现在改成：值有变化立即发；没变化也每 FOCUS_RESEND_MS 补发一次，
+   * 让后台最终一致。补发只是一条几十字节的消息，代价可以忽略。
    */
+  const FOCUS_RESEND_MS = 5000;
   let lastFocus = "";
-  function reportFocus() {
+  let lastFocusAt = 0;
+  function reportFocus(force) {
     try {
       const site = activeSite();
       let id = "";
       if (site && site.focus) {
         try { id = String(site.focus() || ""); } catch (e) { id = ""; }
       }
-      if (id === lastFocus) return;
+      const now = Date.now();
+      const changed = id !== lastFocus;
+      if (!changed && !force && now - lastFocusAt < FOCUS_RESEND_MS) return;
       lastFocus = id;
+      lastFocusAt = now;
       post({ cmd: "focus", kind: id ? "mid" : "", id });
     } catch (e) { /* 忽略 */ }
   }
@@ -1278,6 +1451,13 @@
       // 用户切回来时下一轮（≤600ms）就会补齐。
       if (document.hidden) return;
       reportFocus();   // 焦点是「看哪条」，跟扫描同频检查（内部已按变化去重）
+      // 站点接管整个媒体扫描（目前只有「播放器没起来的 DPlayer 站」用这个，
+      // 它们的地址在 DOM 属性里，页面上根本没有 <video> 可扫）。
+      // 返回 true 表示本轮已处理完，不再走通用逻辑。
+      const scanSite = activeSite();
+      if (scanSite && scanSite.onScanMedia) {
+        try { if (scanSite.onScanMedia()) return; } catch (e) { /* 站点钩子出错不影响通用逻辑 */ }
+      }
       const els = document.querySelectorAll("video, audio");
       for (const el of els) {
         let src = "";
@@ -1448,21 +1628,27 @@
     // 所以这里给封面统一 +1 的偏移（视频侧扫到后用 ord 0 占位）。
     // 不用 type 判断也行，但纯图文帖里 imageList[0] 就是第一张正文图，
     // 加了偏移会出现「①」空号，所以必须按 type 区分。
-    const coverOffset = xhsNoteType() === "video" ? 1 : 0;
+    const isVideoNote = xhsNoteType() === "video";
+    const coverOffset = isVideoNote ? 1 : 0;
     for (let i = 0; i < noteImgs.length; i++) {
       const im = noteImgs[i];
       const src = im.url;
       const ord = i + coverOffset;
+      // 视频帖这一条是「视频封面」，不是用户要保存的图片。打上 xhs-cover 让
+      // background 能识别出来：默认站点不收，只有白名单（本行）才留
+      // —— 用户 m15108「默认不获取视频封面作为一张图片，有需要再特殊处理」。
+      // 图文帖仍是正文图，保持 xhs-note，不能误伤。
+      const hint = isVideoNote ? "xhs-cover" : "xhs-note";
       const prev = imgCtx.get(src);
       const w = im.w || 0, h = im.h || 0;
       // 只在内容真的变了才上报，避免每 1.2s 重复 post 一条相同载荷
       if (prev && prev.ord === ord && prev.title === title && prev.w === w && prev.h === h
-        && prev.hint === "xhs-note") continue;
-      imgCtx.set(src, { mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false });
+        && prev.hint === hint) continue;
+      imgCtx.set(src, { mid: "", title, ord, w, h, hint, inChrome: false });
       if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
       post({
         cmd: "found", source: "imgctx", key: src, mime: "image/*", size: 0,
-        mid: "", title, ord, w, h, hint: "xhs-note", inChrome: false,
+        mid: "", title, ord, w, h, hint, inChrome: false,
       });
     }
   }
@@ -1522,6 +1708,12 @@
         list.sort((a, b) => cmpReadingOrder(a.row, b.row));
         for (let i = 0; i < list.length; i++) {
           const { row, src, ctx } = list[i];
+          // 用「消息内所有媒体的统一序号」而不是图片自己的下标 i：
+          // 同一条 Telegram 消息里视频和图片必须落进同一列序号，否则两边各自的
+          // 0/1/2 会并列，排序只能退回抓取时间，表现为 ①图 ②视频 ③图 循环错号。
+          // 拿不到统一序（不在消息容器里 / 单元素）才退回 i。
+          const uOrd = orderMediaInMessage(row.el);
+          const ord = uOrd >= 0 ? uOrd : i;
           const el = row.el;
           let w = 0, h = 0;
           try {
@@ -1541,11 +1733,11 @@
           const mime = (rec && rec.type) || "image/*";
           const size = (rec && rec.size) || 0;
           const prev = imgCtx.get(src);
-          if (!prev || prev.ord !== i || prev.title !== title || prev.w !== w || prev.h !== h
+          if (!prev || prev.ord !== ord || prev.title !== title || prev.w !== w || prev.h !== h
             || prev.hint !== hint || prev.inChrome !== inChrome) {
-            imgCtx.set(src, { mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+            imgCtx.set(src, { mid: ctx.mid, title, ord, w, h, hint, inChrome });
             if (imgCtx.size > MAX_IMG_CTX) imgCtx.delete(imgCtx.keys().next().value);
-            post({ cmd: "found", source: "imgctx", key: src, mime, size, mid: ctx.mid, title, ord: i, w, h, hint, inChrome });
+            post({ cmd: "found", source: "imgctx", key: src, mime, size, mid: ctx.mid, title, ord, w, h, hint, inChrome });
           }
         }
       }
@@ -1553,6 +1745,7 @@
   }
   setInterval(scanImages, 1200);
   window.__msImgScan = scanImages; // 供调试/测试手动触发
+  window.__msOrderInMessage = orderMediaInMessage; // 统一序号（视频/图共用一个池）
 
   // ------------------------------------------------------------ 3. 原生媒体请求（fetch / XHR）
 
@@ -2092,13 +2285,9 @@
     log(`读取媒体信息 ${key}`);
     const probeLabel = ctx.kind === "audio" ? "正在读取音频信息…" : "正在读取媒体信息…";
     stage(probeLabel);
-    // 首段可能要等 CORS 预检 + 首字节；超过 PROBE_HINT_AFTER 还没回来就补一句
-    // 「仍在连接…」，配合下面的超时，用户至少知道它没死、也能点取消。
-    const probeHintAt = Date.now();
-    const probeHintTimer = setInterval(() => {
-      const s = Math.round((Date.now() - probeHintAt) / 1000);
-      if (s >= PROBE_HINT_AFTER / 1000) stage(`${probeLabel}（已等 ${s}s，仍在连接，可点取消）`);
-    }, 1000);
+    // 首段可能要等 CORS 预检 + 首字节。这期间的「已等 N 秒 / 仍在连接，可点取消」
+    // 由进度卡自己的心跳统一报（见 uiTick）：以前这里另起一个 1 秒定时器往
+    // 阶段行里写「已等 Ns」，和心跳抢同一块屏幕，卡片上会出现两处不同的计时。
     let probe = null;
     try {
       // 注意 fetchRange 的 end 是**包含式**的：要 cb 个字节就得到 cb-1。
@@ -2128,7 +2317,6 @@
         return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename: name };
       }
     } finally {
-      clearInterval(probeHintTimer);
       stage(probeLabel);
     }
     if (!first) first = probe;
@@ -2169,7 +2357,7 @@
       const res = await fetchWithTimeout(key, { credentials: "include", signal }, FETCH_TIMEOUT_CHUNK);
       if (!res.ok) throw new Error("HTTP " + res.status);
       const buf = await res.arrayBuffer();
-      const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || ".mp4";
+      const ext = sniffExt(new Uint8Array(buf.slice(0, 16))) || guessExtFromType(ctx.ct) || "";
       const filename = finishName(name, key, ext);
       fireProgress(onProgress, buf.byteLength, buf.byteLength, 0);
       return { ok: true, total: buf.byteLength, received: buf.byteLength, bytes: buf, filename };
@@ -2177,7 +2365,8 @@
 
     // ---- 2) 文件名：从字节头判断扩展名；Telegram 的引用（album/viewer）防重名
     let head = new Uint8Array(probe.buf.slice(0, Math.min(got, 64)));
-    const ext = sniffExt(head) || guessExtFromType(ctx.ct) || ".mp4";
+    // 兜底不再写 ".mp4"：认不出来时宁可没扩展名，也别把一个 JPEG 存成 .mp4
+    const ext = sniffExt(head) || guessExtFromType(ctx.ct) || "";
     const filename = finishName(name, key, ext);
     log(`开始下载 ${filename}（${fmtBytes(total)}，分段 ${fmtBytes(cb)}，${parallel} 并发）`);
 
@@ -2700,12 +2889,14 @@
     const base = withPart(wanted || safeFileName(stripExt(fileNameTitle(biliTitle() || ""))) || "bilibili");
     const res = [];
 
-    onStage && onStage("正在下载视频流（完整流，与播放进度无关）…", 0);
+    // 阶段行只说「在做什么」。「（完整流，与播放进度无关）」是解释实现，用户看不懂，
+    // 而且这句说明在点保存前的浮层（站点 saveHint）里已经讲过一次了。
+    onStage && onStage("正在下载完整视频流", 0);
     const v = await biliFetchStream(picked.video, `${base}-video`, onProgress, signal);
     res.push(v);
     let a = null;
     if (picked.audio && !(signal && signal.aborted)) {
-      onStage && onStage("正在下载音频流…", 0);
+      onStage && onStage("正在下载音频流", 0);
       a = await biliFetchStream(picked.audio, `${base}-audio`, onProgress, signal);
       res.push(a);
     }
@@ -2713,13 +2904,13 @@
 
     if (a && v.filename && a.filename && !(signal && signal.aborted)) {
       try {
-        onStage && onStage("合并音视频…", 0);
+        onStage && onStage("合并音视频", 0);
         const ack = await hostRequest(
           { action: "msfile_merge", video: v.filename, audio: a.filename, out: base },
           signal, 45000);
         if (!ack || ack.ok === false) throw new Error((ack && ack.error) || "本地下载器无法开始合并");
         const fin = await hostWaitJob(ack.id, {
-          onProgress: (pct) => onStage && onStage(`合并音视频… ${Math.round(pct)}%`, pct),
+          onProgress: (pct) => onStage && onStage(`正在合并 ${Math.round(pct)}%`, pct),
           signal,
         });
         return {
@@ -2859,6 +3050,29 @@
     try { return /(^|\.)bilibili\.com$/i.test(location.hostname); } catch (e) { return false; }
   }
 
+  /**
+   * 当前是不是 B 站的「单个视频」页面（投稿 / 番剧 / 课程）。
+   *
+   * 为什么不能拿 biliPlayinfo() 当这个判据（用户真机 2026-10-21 报 banner 泄漏）：
+   *   ① `__playinfo__` 是首页 JS 异步写入的，首屏那几百毫秒里是 undefined。
+   *      DOM 扫描不会等它，于是这段窗口里页面被判成「非视频页」→ 全放行 →
+   *      banner/活动图/推荐位封面全进列表，而且进了 state 就再也不走。
+   *   ② 番剧/课程页的播放清单根本不在 `__playinfo__`（在 `__INITIAL_STATE__.epInfo`），
+   *      这类页面**永远**被判成非视频页，等于完全没有过滤。
+   * URL 是同步可读的、不会闪，所以「是不是视频页」只看 URL；
+   * 「这一集的封面是哪张」才去问 state（见 biliCoverImage）。
+   */
+  function biliIsVideoPage() {
+    try {
+      const p = location.pathname || "";
+      // /video/BVxxx | av123 | /bangumi/play/ep123456 | /cheese/play/ep123456
+      return /^\/video\/(BV[0-9A-Za-z]+|av\d+)/i.test(p)
+        || /^\/(bangumi|cheese)\/play\/(ep|ss)\d+/i.test(p);
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ---- B 站站点对象（下载层钩子）----
   //
   // 以前 `startMediaDownload` 里写死 `const useBili = isBiliHost() && biliPlayinfo()`、
@@ -2886,8 +3100,8 @@
 
     // 浮层底部说明：B 站是音视频分开落盘、需要 ffmpeg 合并
     saveHint: () => (biliPlayinfo()
-      ? "B 站走完整流抓取（视频流 + 音频流分开落盘），与播放进度无关。"
-        + "下载完成后会用 bin/ 目录自带的 ffmpeg 自动合并成单文件。"
+      ? "保存的是整段视频（不是只存正在播的那一段）：视频和音频分开抓，"
+        + "下载完自动用 bin 目录里的 ffmpeg 合成一个文件。"
       : ""),
 
     // 每次开始保存前清空上报签名：否则 SPA 换集后签名不变，popup 标题停在旧集
@@ -2899,17 +3113,17 @@
 
     // A2 用户诉求：「B 站的图片获取我想改为仅获取所点开视频的封面」。
     //
-    // 视频页（有 __playinfo__）上 DOM 里的 <img> 全是噪声：UP 主头像、推荐位
-    // 封面、广告位、番剧卡片。它们的 class 会随改版变，唯一稳的判据是
+    // 视频页上 DOM 里的 <img> 全是噪声：UP 主头像、推荐位封面、广告位、番剧卡片，
+    // 还有 banner/活动图。它们的 class 会随改版变，唯一稳的判据是
     // 「这张图是不是 __INITIAL_STATE__ 里那个 cover」。
     //
     // 返回 true 表示「这轮 B 站自己报完了，通用 DOM 扫描不用跑了」；
-    // 返回 false（拿不到封面，比如首页/动态页/state 还没就绪）就走通用逻辑，
-    // 宁可多抓也不漏抓——用户报「抓不到」比「多了几张」更难处理。
+    // 返回 false 走通用逻辑。**判视频页必须用 biliIsVideoPage() 而不是
+    // biliPlayinfo()** —— 后者首屏异步、番剧页永远为空，见该函数注释。
     onScanImages: () => {
-      if (!biliPlayinfo()) return false;   // 不是视频页，不接管
+      if (!biliIsVideoPage()) return false;   // 不是视频页，不接管
       const cover = biliCoverImage();
-      if (!cover.url) return false;        // state 没就绪，退回 DOM 扫描
+      if (!cover.url) return false;        // state 还没就绪，退回 DOM 扫描
       // 只报封面这一张。source 用 httpmedia（与 webRequest 记下的条目同源合并），
       // hint 不带 xhs-note，避免被小红书那套「分片让位」规则误伤。
       post({
@@ -2927,12 +3141,16 @@
       return true;
     },
 
-    // 视频页的图片只认封面（onScanImages 已接管；这里是兜底，防 onScanImages
-    // 因 state 未就绪返回 false 之后 DOM 扫描又把一堆推荐图放进来）
+    // 视频页的图片只认封面（onScanImages 已接管；这里是兜底，防 state 未就绪时
+    // onScanImages 返回 false 之后，DOM 扫描又把 banner/推荐图放进来）。
+    //
+    // 视频页拿不到封面时**不能放行**：宁可这一轮一张图都不报，也不能让 banner
+    // 混进去——混进去就进了 state，之后规则再改也清不掉（见 background 的
+    // pruneStaleImages 与 1.3.21 的教训）。非视频页（首页/动态/搜索）不受限制。
     isImageOnly: (el, src) => {
-      if (!biliPlayinfo()) return true;    // 非视频页不限制
+      if (!biliIsVideoPage()) return true; // 非视频页不限制
       const cover = biliCoverImage();
-      if (!cover.url) return true;         // 拿不到封面就不过滤（宁可多抓）
+      if (!cover.url) return false;        // 视频页但拿不到封面：本轮一张图都不报
       return biliIsCoverSrc(src, cover.url);
     },
   });
@@ -2949,6 +3167,8 @@
   // 钩子清单（通用层只认这几个名字，不认识具体站点）：
   //   match()            是否属于本站
   //   focus()            当前焦点（查看器打开时返回内容 id，否则 ""）
+  //   msgBox(el)         媒体所在的消息容器（决定「谁和谁算同一条消息」）
+  //   msgId(box)         从消息容器上读消息号（不同前端属性名不同）
   //   isDecorImg()       是否装饰图（头像/图标）
   //   isImageOnly()      只允许 <img> 上的某张图
   //   isDecorVideo()     是否装饰视频（贴纸/占位）
@@ -2961,10 +3181,214 @@
     name: "telegram",
     match: () => /(^|\.)telegram\.(org|me|dog)$/i.test(location.hostname || ""),
     focus: () => tgFocus(),
+
+    // 消息容器 + 消息号（2026-10-22：Web K 完全不认 data-message-id）
+    //
+    // Web K 把消息号放在 `data-mid` 上，而且**每一层都放**：一条消息的
+    // `.bubble` 是 868，里面三个 `.album-item` 却是 868/869/870。所以只能取
+    // 最外层命中的那个，取最近一层会把一条消息拆成三条。
+    // 同一元素上两个属性都有的情况（过渡期）以 `data-mid` 为准。
+    msgBox: (el) => {
+      try {
+        let n = el, depth = 0, found = null;
+        while (n && n.nodeType === 1 && depth < 22) {
+          if (n.getAttribute) {
+            const v = n.getAttribute("data-mid") || n.getAttribute("data-message-id");
+            // 继续往上走：最后一个命中的才是最外层的消息容器
+            if (v) found = n;
+          }
+          n = n.parentElement;
+          depth++;
+        }
+        return found;
+      } catch (e) { return null; }
+    },
+    msgId: (box) => {
+      try {
+        if (!box || !box.getAttribute) return "";
+        return box.getAttribute("data-mid") || box.getAttribute("data-message-id") || "";
+      } catch (e) { return ""; }
+    },
+
+    // 视频封面不是照片（用户 m15279「telegram 没有按照默认策略吗，为什么还把封面
+    // 当作图片」）。TG 把封面塞在两个地方，都只能从 DOM 结构认，URL 和尺寸完全
+    // 和真照片一样（实测 320×180 / 179×320），没有别的信号：
+    //   ① 消息内：<div class="media-inner"> 里同时挂 <video class="full-media">
+    //      和 <img class="thumbnail …">——img 是加载期占位，视频起播后也不移除。
+    //   ② 左栏列表预览：.media-preview 里 <img class="media-preview--image">
+    //      配 <i class="icon icon-play">，代表「这条是视频」。
+    // 反过来，真照片的容器是 <img class="media">，**没有** video 兄弟节点，
+    // 所以判据收得很窄：只看「同一个父容器里有没有 <video>」。
+    // 注意不能上溯太深——相册的 .Album 容器里视频和照片是混在一起的，
+    // 上溯到 Album 会把整组照片一起误杀。
+    isDecorImg: (el) => {
+      try {
+        const p = el && el.parentElement;
+        if (!p || !p.querySelector) return false;
+        if (p.querySelector("video")) return true;          // ① 消息内封面
+        const wrap = el.closest && el.closest(".media-preview");
+        if (wrap && wrap.querySelector(".icon-play")) return true;  // ② 列表预览
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
   });
 
+  // ---- 51cg1 这类「播放器没起来」的站（用户 m16052）
+  //
+  // 现象：视频列表全空。查下来不是我们漏抓，是**浏览器一次都没请求过视频**。
+  // 这类站用 DPlayer + hls.js，如果 hls.js 加载失败/被拦，播放器会一直停在
+  // 「播放器加载中...」，从不发 .m3u8 请求，webRequest 自然什么都看不见。
+  //
+  // 但视频地址其实就摆在 DOM 上：`<div class="dplayer" data-config="{...}">`
+  // 里的 config.video.url 就是完整 HLS 地址（实测 hls.weagdnz.cn/...m3u8?auth_key=...）。
+  // 所以这里直接把它读出来上报，绕开播放器。
+  //
+  // 为什么不做成通用逻辑：这个 data-config 是 DPlayer 插件（usr/plugins/DPlayer）
+  // 的私有约定，不是通用播放器规范；别的站哪怕也用 DPlayer，属性名和结构也不一定一样。
+  /** 读 DPlayer 容器上的 data-config，取出 HLS/视频地址。找不到返回 ""。 */
+  function dplayerConfigUrl() {
+    try {
+      const nodes = document.querySelectorAll(".dplayer[data-config], #dplayer[data-config]");
+      for (const n of nodes) {
+        const raw = n.getAttribute("data-config") || "";
+        if (!raw) continue;
+        let cfg = null;
+        try { cfg = JSON.parse(raw); } catch (e) { continue; }
+        // video.url 是主地址；video_h265.url 是备用编码，优先主地址
+        const cand = [cfg && cfg.video && cfg.video.url, cfg && cfg.video_h265 && cfg.video_h265.url];
+        for (const u of cand) {
+          if (typeof u === "string" && /^https?:\/\//i.test(u)) return u;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return "";
+  }
+
+  // 4kvm 这类站：artplayer + hls.js，播放器能起来，m3u8 由 webRequest 抓到了，
+  // 但**条目没有标题**（页面上没有 <video> 可挂 messageId，也没有 __INITIAL_STATE__）。
+  // 用户看到一条光秃秃的「HLS 流（视频）」，不知道这是哪一集。
+  //
+  // 标题来源按可靠度排：og:title（干净、站点自己填的）> <title>（常带「-4k影视」尾巴）。
+  // 判据用「页面上有 artplayer 容器」——这是 artplayer 的固定类名 `.art-video-player`，
+  // 是它对外承诺的公共样式钩子，不像 data-config 那样是站点私有约定。
+  /** 给「没有标题的 HLS 条目」找一个页面级标题。找不到返回 ""。 */
+  function sitePageTitle() {
+    try {
+      const og = document.querySelector('meta[property="og:title"], meta[name="og:title"]');
+      let t = (og && og.getAttribute("content")) || "";
+      if (!t) t = document.title || "";
+      t = String(t).replace(/\s+/g, " ").trim();
+      // 站点名尾巴：`挑情丑闻 - 第1集 -4k影视` -> `挑情丑闻 - 第1集`
+      // 只在「最后一段明显是站点名」时才砍：站点名通常没有「第N集/第N话/EPn」
+      // 这类集数标记，长度也短。早期写成「任何 1~10 字的尾巴都砍」，
+      // 结果把 `- 第1集` 一起砍掉了（真机 4kvm：标题变成光秃秃的「挑情丑闻」）。
+      const m = /\s*[-|_–—]\s*([^-|_–—]{1,12})\s*$/.exec(t);
+      if (m) {
+        const tail = m[1].trim();
+        const looksLikeEpisode = /^(第\s*[0-9一二三四五六七八九十百]+\s*[集话話期回部]|EP?\s*\d+|S\d+\s*E\d+)/i.test(tail);
+        const stripped = t.slice(0, m.index).trim();
+        if (!looksLikeEpisode && stripped.length >= 4) t = stripped;
+      }
+      return sanitize(t.slice(0, 90));
+    } catch (e) { return ""; }
+  }
+
+  SITES.push({
+    name: "artplayer",
+    // artplayer + hls.js 的站：播放器能起来，<video src> 是 blob:，
+    // 真正的 m3u8 只有 webRequest 看得见（扩展后台抓得到，但没标题）。
+    // 这里接管媒体扫描：把页面上"唯一那个播放器视频"用页面标题补一条带标题的、
+    // hint 标成 hls 的条目上报——后台会把同地址的 webRequest 条目合并到它上面，
+    // 用户就能看到「挑情丑闻 - 第1集 · HLS 流（视频）」而不是一条光秃秃的链接。
+    //
+    // 只补标题、不代理地址：m3u8 的真实 URL 依然由 webRequest 抓（页面侧拿不到
+    // hls.js 的内部 state，硬猜容易抓到广告位或预加载地址）。
+    match: () => !!document.querySelector(".art-video-player, artplayer, .artplayer"),
+    title: () => sitePageTitle(),
+    onScanMedia: () => {
+      // 页面上没有 <video> 时什么也不做，交回通用逻辑
+      const v = document.querySelector(".art-video-player video, artplayer video, .artplayer video");
+      if (!v) return false;
+      const t = sitePageTitle();
+      if (!t) return true;   // 有播放器但取不到标题 -> 不报，免得制造无标题噪声
+      // 每页只报一次（DOM 每 600ms 扫一轮）；标题变了要重报，让后台更新
+      if (artSeenTitle === t) return true;
+      artSeenTitle = t;
+      post({
+        cmd: "found", source: "httpmedia", key: location.href, size: 0,
+        mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+        title: t, mid: "", ord: 0, ref: "", hint: "hls",
+      });
+      return true;
+    },
+  });
+
+  let artSeenTitle = "";   // 上次上报过的 artplayer 页面标题
+
+  SITES.push({
+    name: "dplayer",
+    // 只在「用 DPlayer 且数据在 data-config 里」的页面接管。
+    // 判据放宽到整个 .dplayer 容器存在就注册，但下面 onScanImages 会再确认
+    // 真的读到了地址才上报 —— 读不到就走通用逻辑，不影响别的站。
+    match: () => !!document.querySelector(".dplayer[data-config], #dplayer[data-config]"),
+
+    focus: () => "",
+
+    // 玩家没起来时 DOM 里一个 <video> 都没有，通用 scanMedia 无事可做。
+    // 这里接管媒体扫描：直接把 data-config 里的地址当一条视频上报。
+    onScanMedia: () => {
+      const url = dplayerConfigUrl();
+      if (!url) return false;   // 读不到 -> 交回通用逻辑
+      // 标题优先用容器上的 data-video_title（站点把标题挂在属性里），
+      // 没有就退回页面 <title>
+      let title = "";
+      try {
+        const n = document.querySelector(".dplayer[data-video_title], #dplayer[data-video_title]");
+        title = (n && n.getAttribute("data-video_title")) || "";
+      } catch (e) { /* 忽略 */ }
+      if (!title) title = document.title || "";
+      title = sanitize(String(title).slice(0, 90));
+      // 同一地址每轮都会读到，靠 dplayerSeen 去重（地址里的 auth_key 会过期刷新，
+      // 所以还要按「去掉 query 的路径」再挡一层，避免同一个视频反复出现）。
+      const bare = url.split("?")[0];
+      if (dplayerSeen.has(bare)) {
+        // 地址刷新了（新的 auth_key）就把旧条目换成新地址，否则点下载会 403
+        const old = dplayerSeen.get(bare);
+        if (old !== url) {
+          dplayerSeen.set(bare, url);
+          post({
+            cmd: "found", source: "httpmedia", key: url, size: 0,
+            mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+            title, mid: "", ord: 0, ref: "", hint: "dplayer",
+          });
+        }
+        return true;
+      }
+      dplayerSeen.set(bare, url);
+      if (dplayerSeen.size > 20) dplayerSeen.delete(dplayerSeen.keys().next().value);
+      post({
+        cmd: "found", source: "httpmedia", key: url, size: 0,
+        mime: "video/mp4", ext: ".m3u8", w: 0, h: 0, dur: 0,
+        title, mid: "", ord: 0, ref: "", hint: "dplayer",
+      });
+      return true;
+    },
+  });
+
+  const dplayerSeen = new Map();  // 去 query 的路径 -> 当前地址
+
+  const IMG_MIME_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/pjpeg": ".jpg",
+    "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+    "image/bmp": ".bmp", "image/avif": ".avif", "image/svg+xml": ".svg",
+    "image/heic": ".heic",
+  };
+
+  /** 从 Content-Type 推扩展名。音视频 + 图片都要覆盖：
+   *  旧版只认音视频，`image/jpeg` 落成 null，最终兜到 ".mp4"（真机踩过）。 */
   function guessExtFromType(ct) {
-    const m = (ct || "").toLowerCase();
+    const m = (ct || "").toLowerCase().split(";")[0].trim();
+    if (IMG_MIME_EXT[m]) return IMG_MIME_EXT[m];
     if (m.startsWith("audio/")) return extOf(m) === ".bin" ? ".m4a" : extOf(m);
     if (m.startsWith("video/")) return extOf(m) === ".bin" ? ".mp4" : extOf(m);
     return null;
@@ -3046,7 +3470,21 @@
 
   // ------------------------------------------------------------ 下载进度卡（页面内悬浮 UI）
 
-  const UI = { root: null, bar: null, text: null, btn: null, job: null, stage: "", lastFile: "" };
+  // 进度条的填充色。抽成常量是因为失败态会把 background 改成红色、下一次开始时
+  // 要复原——写成字面量散在两处，迟早有一处忘同步（真机就翻过：复原时写成了
+  // `""`，整条进度条变成透明，光带扫过去屏幕上什么都看不见）。
+  const UI_BAR_FILL = "linear-gradient(90deg,#3b82f6,#22c55e)";
+
+  const UI = {
+    root: null, bar: null, text: null, btn: null, stage: null, revealBtn: null,
+    job: null, lastFile: "",
+    barAnim: null,   // 不确定进度的光带动画（Web Animations）
+    waiting: false,  // 当前是否处于「不知道还要多久」状态
+    hasBytes: false, // 有没有真实字节数可报——决定进度行归进度回调还是计时器写
+    hasTotal: false, // 有没有拿到总长——拿到就该显示真实百分比
+    t0: 0,           // 本次任务开始时刻，用来报「已等 N 秒」
+    tick: null,      // 心跳计时器句柄
+  };
 
   function uiEnsure() {
     if (UI.root && document.documentElement.contains(UI.root)) return UI.root;
@@ -3076,7 +3514,7 @@
       const barWrap = document.createElement("div");
       barWrap.style.cssText = "height:6px;border-radius:3px;background:rgba(255,255,255,.16);margin:8px 0;overflow:hidden";
       const bar = document.createElement("i");
-      bar.style.cssText = "display:block;height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#22c55e);transition:width .25s";
+      bar.style.cssText = "display:block;height:100%;width:0;transition:width .25s;background:" + UI_BAR_FILL;
       barWrap.append(bar);
       // 按钮行：取消/关闭在左，「打开所在文件夹」在右（下载完才出现）
       const actions = document.createElement("div");
@@ -3103,82 +3541,156 @@
     }
   }
 
+  /** 打开卡片，并把上一条任务留下的痕迹清干净。 */
   function uiShow(name) {
     const root = uiEnsure();
     if (!root) return;
-    UI.text.textContent = "准备中… " + (name || "");
-    UI.text.title = "";
-    UI.bar.style.width = "0%";
+    UI.text.textContent = "";
+    UI.text.title = name || "";
     UI.btn.textContent = "取消";
     UI.btn.disabled = false;
     UI.stage.textContent = "";
     UI.stage.style.display = "none";
     UI.revealBtn.style.display = "none";
+    // 上一次失败留下的红条要复原。注意是复原成渐变、不是清空——清空等于把
+    // 进度条变成透明，光带扫过去屏幕上什么都没有。
+    UI.bar.style.background = UI_BAR_FILL;
+    UI.hasBytes = false;
+    UI.hasTotal = false;
+    UI.t0 = Date.now();
+    // 一开始就不知道要多久（连总长都还没问出来），直接让光带走起来。
+    // 原来这里写 bar.width = 0% 就不管了，整条流跑几十秒到几分钟，
+    // 用户看到的就是一条永远不动的灰槽。
+    // 先硬复位：卡片可能是上一轮被强行关掉后重建的，此时 UI.waiting 还停在
+    // true，uiSetWaiting 会因为「状态没变」直接返回，进度条就留在 0%。
+    UI.waiting = false;
+    UI.barAnim = null;
+    uiSetWaiting(true);
+    uiStartTick();
+  }
+
+  /**
+   * 不确定进度：进度条里跑一条来回扫的光带。
+   *
+   * 用 Web Animations 而不是注入 <style> + @keyframes：这是页面主世界的脚本，
+   * 往用户页面 <head> 里塞全局样式容易和站点自己的 CSS 打架，而且结束时要能
+   * 精确 cancel——内联 animation-name 得靠改 style 才能撤，容易残留。
+   */
+  function uiSetWaiting(on) {
+    if (!UI.bar) return;
+    if (!!on === UI.waiting) return;
+    UI.waiting = !!on;
+    if (!on) {
+      if (UI.barAnim) { try { UI.barAnim.cancel(); } catch (e) { /* 忽略 */ } UI.barAnim = null; }
+      UI.bar.style.marginLeft = "";
+      return;
+    }
+    UI.bar.style.width = "34%";
+    try {
+      UI.barAnim = UI.bar.animate(
+        [{ marginLeft: "-34%" }, { marginLeft: "100%" }],
+        { duration: 1200, iterations: Infinity, easing: "ease-in-out" }
+      );
+    } catch (e) {
+      // 老内核没有 Web Animations：退化成半宽的静态条，至少不是 0% 空槽
+      UI.barAnim = null;
+    }
   }
 
   function uiProgress(got, total, speed, name) {
     const root = uiEnsure();
     if (!root) return;
     lastUiAt = Date.now();
-    const pct = total ? (got / total) * 100 : 0;
-    UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
-    const parts = total > 0
-      ? [`${pct.toFixed(1)}%  ${fmtBytes(got)} / ${fmtBytes(total)}`]
-      : [fmtBytes(got)];
-    if (speed) parts.push(fmtBytes(speed) + "/s");
-    // 有阶段名时保留阶段标签行，数字行只放进度，避免两种信息互相覆盖
-    if (UI.stage && UI.stage.style.display !== "none" && UI.stage.textContent) {
+    UI.hasBytes = true;
+    if (total > 0) {
+      UI.hasTotal = true;
+      uiSetWaiting(false);
+      const pct = (got / total) * 100;
+      UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      const parts = [`${pct.toFixed(1)}%  ${fmtBytes(got)} / ${fmtBytes(total)}`];
+      if (speed) parts.push(fmtBytes(speed) + "/s");
       UI.text.textContent = parts.join("  ·  ");
     } else {
-      UI.text.textContent = parts.join("  ·  ") + (name ? "  ·  " + name : "");
+      // 总长未知（Telegram 的单段流、B 站整条流刚开始）：光带继续跑，只报已收
+      const parts = [fmtBytes(got)];
+      if (speed) parts.push(fmtBytes(speed) + "/s");
+      UI.text.textContent = parts.join("  ·  ");
     }
     UI.text.title = name || "";
   }
 
-  // 心跳：上一次真正拿到新字节的时间。Telegram 的单段要 1-6 秒才回来，
-  // 那期间进度条完全不动，用户会以为卡死（真机反馈「卡到 17%」就是这么来的）。
-  // 超过 1.2 秒没新字节就补一行「等待数据…」，让人知道还在跑。
+  // 进度行的心跳。
+  //
+  // 两种「看着像卡死」原因不同，说的话也不一样：
+  //   - 还没有任何字节（首段要等 CORS 预检、服务器迟迟不回）→ 报「已等 N 秒」
+  //   - 有字节但 1.2 秒没新进展（Telegram 单段要 1-6 秒才回来）→ 补「等待数据…」
+  // 计时**只在这里做**：以前 runRangeDownload 自己带一个 probeHintTimer 往阶段行
+  // 写「已等 Ns」，和这里抢同一句话，卡片上就出现两处不同的计时。
+  const UI_TICK = 500;
   let lastUiAt = 0;
-  let uiHeartbeat = null;
-  function startUiHeartbeat() {
-    stopUiHeartbeat();
-    lastUiAt = Date.now();
-    uiHeartbeat = setInterval(() => {
-      if (!UI.root) return;
-      const idle = Date.now() - lastUiAt;
-      if (idle < 1200) return;
-      const base = UI.text.textContent.replace(/\s*·\s*等待数据…$/, "");
+
+  function uiTick() {
+    if (!UI.root) { uiStopTick(); return; }
+    const now = Date.now();
+    if (!UI.hasBytes) {
+      const secs = Math.floor((now - UI.t0) / 1000);
+      if (secs < 3) return;  // 刚开始那两秒别闪
+      let s = `已等 ${secs} 秒`;
+      if (now - UI.t0 >= PROBE_HINT_AFTER) s += "  ·  仍在连接，可点取消";
+      UI.text.textContent = s;
+      return;
+    }
+    if (UI.hasTotal) {
+      if (now - lastUiAt < 1200) return;
+      const base = String(UI.text.textContent || "").replace(/\s*·\s*等待数据…$/, "");
       UI.text.textContent = base + "  ·  等待数据…";
-    }, 600);
-  }
-  function stopUiHeartbeat() {
-    if (uiHeartbeat) { clearInterval(uiHeartbeat); uiHeartbeat = null; }
+    }
   }
 
+  function uiStartTick() {
+    uiStopTick();
+    lastUiAt = Date.now();
+    UI.tick = setInterval(uiTick, UI_TICK);
+  }
+
+  function uiStopTick() {
+    if (UI.tick) { clearInterval(UI.tick); UI.tick = null; }
+  }
+
+  function startUiHeartbeat() { uiStartTick(); }
+  function stopUiHeartbeat() { uiStopTick(); }
+
   /**
-   * 阶段提示（下载视频流 / 音频流 / 合并中）。
+   * 阶段行：只说「正在做什么」。
    *
-   * 第 3 点要求：下载视频时提示「正在下载视频」，下载音频时提示「正在下载音频」。
-   * 做法是把阶段名放进独立的 stage 标签行（蓝色小字），并让它**优先于**
-   * uiProgress 的纯数字行——否则每 400ms 一次进度回调就会把阶段名冲掉。
-   * 当前阶段同时记在 UI.stage，供 uiProgress 拼前缀。
+   * 这里**不再写进度行**。真机图二里那两行一模一样，就是因为本函数最后还有
+   * 一句 `UI.text.textContent = t`——同一句话被写进了两个元素，一上一下重复。
+   * 现在分工是死的：阶段行进阶段行，数字/耗时进进度行，谁也不碰对方。
    */
   function uiStage(text, pct) {
     const root = uiEnsure();
     if (!root) return;
-    if (typeof pct === "number") UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
     if (!text) return;
     const t = String(text).trim();
-    // 合并阶段不属于「下载视频/音频」，也让标签行如实反映
     UI.stage.textContent = t;
-    UI.stage.style.display = t ? "block" : "none";
-    UI.text.textContent = t;
+    UI.stage.style.display = "block";
+    if (typeof pct === "number" && pct > 0) {
+      // 有真实百分比（合并音视频会报）：切回确定进度
+      UI.hasTotal = true;
+      uiSetWaiting(false);
+      UI.bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    } else if (!UI.hasBytes) {
+      // 还没开始收字节：光带跑起来，别给一条 0% 的死槽
+      uiSetWaiting(true);
+    }
   }
 
   function uiDone(ok, msg, file) {
     const root = uiEnsure();
     if (!root) return;
     stopUiHeartbeat();
+    // 结束态必须是「确定的」：光带还在扫、进度条还在半路，都没有意义
+    uiSetWaiting(false);
     UI.stage.style.display = "none";
     UI.text.textContent = ok ? "完成 · " + msg : "失败 · " + msg;
     UI.text.title = msg || "";
@@ -3214,6 +3726,10 @@
       }
       // 成功自动消失：原来固定 6s，现在有「打开文件夹」按钮，给足 12s
       setTimeout(() => { try { if (UI.root) { UI.root.remove(); UI.root = null; } } catch (e) { /* 忽略 */ } }, 12000);
+    } else {
+      // 失败时别把条丢在半路：铺满并转红，用户一眼就知道「这条没下完」
+      UI.bar.style.width = "100%";
+      UI.bar.style.background = "#ef4444";
     }
   }
 
@@ -3353,7 +3869,14 @@
       }
       if (/^blob:/i.test(it.key)) {
         overlayClose();
-        doSaveBlob(it.key, it.name);
+        // blob: 不再走 doSaveBlob 的 <a download>。真机（Telegram，2026-10-21）证据：
+        //   __msRangeDownload → D:/…/文件存放处/tg-probe.mp4  72796 字节 ✅
+        //   <a download>      → C:/Users/l/Downloads/test-tg.jfif 72796 字节 ⚠️
+        // 数据其实都下下来了，但 <a download> 落在 **Chrome 默认下载目录**、
+        // 扩展名被 MIME 改写成 .jfif，用户在「文件存放处」找不到 → 看起来就是「下载失败」。
+        // 页面侧 fetch 读 blob: 完全可用（probeTotal 实测 72796 与 DOM 一致），
+        // 所以统一走 Range + Native Host，落到插件配置的目录、扩展名由内容嗅探决定。
+        startMediaDownload(it.key, it.name, {}, () => {});
         return;
       }
       if (/^m\d+$/.test(it.key)) {
@@ -3648,6 +4171,9 @@
   window.__msBiliCurrentCid = biliCurrentCid; // 供真机排查
   window.__msParseSidxTotal = parseSidxTotal;
   window.__msStartMediaDownload = startMediaDownload;
+  // 页面内进度卡的显示层（测试要直接断言「阶段行/进度行各写什么」）
+  window.__msUiCard = () => UI;
+  window.__msUiApi = { show: uiShow, progress: uiProgress, stage: uiStage, done: uiDone, tick: uiTick };
   window.__msNativeMedia = () => [...mediaSeen.entries()].map(([u, v]) => ({ url: u, ...v }));
   window.__msFileNameTitle = fileNameTitle; // 文件名截断规则（测试要直接断言）
   window.__msSafeFileName = safeFileName;   // 文件名清洗（百分号解码 / 首尾点 / 非法字符）

@@ -214,15 +214,50 @@ if (fnSrc) {
 console.log("\n[3] 图片 / 图标 / 序号（纯逻辑抽出来单跑）");
 // 这三块逻辑只依赖条目对象，不碰 chrome API，抽出来在干净的 ctx 里跑最稳
 const pureCtx = vm.createContext({ console, Map, Set, String, Number, Math, JSON, URL, RegExp });
+// 切片包含「图标判定区 → 序号 → 小红书规则」三段纯逻辑：
+// 起点是 const ICON_MAX（顺带把紧跟其后的 VIDEO_COVER_SITES / coverAllowed 包进来），
+// 终点是小红书规则块的收尾注释 —— 这是「监听」注释之前最后一次出现的分节线，
+// 不能用 indexOf("---- 监听")：那样会漏掉小红书那段，dedupeXhsNoteImages 就找不到。
 const rulesStart = bgCode.indexOf("const ICON_MAX");
-const rulesEnd = bgCode.indexOf("// ---------------------------------------------------------------- 监听", rulesStart);
+const listenMark = bgCode.indexOf("// ---------------------------------------------------------------- 监听", rulesStart);
+const rulesEnd = bgCode.lastIndexOf("// ----------------------------------------------------------------", listenMark > 0 ? listenMark : bgCode.length);
 vm.runInContext(bgCode.slice(rulesStart, rulesEnd), pureCtx, { filename: "img-rules" });
 // const 声明在 vm 里不进沙箱 global，用一个表达式把它们导出来
 const rules = vm.runInContext(
-  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE })", pureCtx, { filename: "img-rules-export" });
-const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE } = rules;
+  "({ looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES, isHlsUrl })", pureCtx, { filename: "img-rules-export" });
+const { looksLikeIcon, renumberImages, numberShown, markOf, ICON_MAX, CIRCLE, coverAllowed, VIDEO_COVER_SITES, isHlsUrl } = rules;
 
 check("ICON_MAX 是 96", ICON_MAX === 96, ICON_MAX);
+
+// ---------------------------------------------------------------- 视频封面白名单
+// 用户 m15108：「默认情况下不会获取视频封面作为一张图片，有需要再做特殊处理」，
+// 但同时点名「目前来看只获取 B 站、小红书视频封面当作一张图片」。
+// 于是做成「默认不收、白名单站点才收」，白名单只有一张表，加站点只改那里。
+check("[COVER] 白名单默认只含 B 站和小红书",
+  VIDEO_COVER_SITES.length === 2
+  && VIDEO_COVER_SITES.includes("bilibili.com")
+  && VIDEO_COVER_SITES.includes("xiaohongshu.com"),
+  VIDEO_COVER_SITES);
+check("[COVER] 小红书视频帖封面允许（用户点名要）",
+  coverAllowed("xiaohongshu.com") === true, coverAllowed("xiaohongshu.com"));
+check("[COVER] B 站视频页封面允许（用户点名要）",
+  coverAllowed("bilibili.com") === true, coverAllowed("bilibili.com"));
+check("[COVER] 其它站点默认不收封面",
+  coverAllowed("example.com") === false && coverAllowed("") === false,
+  [coverAllowed("example.com"), coverAllowed("")]);
+check("[COVER] 子域名跟随主域（www./m./space.）",
+  coverAllowed("www.bilibili.com") === true
+  && coverAllowed("m.bilibili.com") === true
+  && coverAllowed("www.xiaohongshu.com") === true,
+  [coverAllowed("www.bilibili.com"), coverAllowed("m.bilibili.com")]);
+check("[COVER] 相似但不相同的域不算（防 biliapi.net 之类误命中）",
+  coverAllowed("fakebilibili.com") === false
+  && coverAllowed("bilibili.com.evil.net") === false
+  && coverAllowed("notxiaohongshu.com") === false,
+  [coverAllowed("fakebilibili.com"), coverAllowed("bilibili.com.evil.net")]);
+check("[COVER] 大小写和首尾空格容错",
+  coverAllowed("WWW.Bilibili.COM") === true && coverAllowed(" xiaohongshu.com ") === true,
+  [coverAllowed("WWW.Bilibili.COM"), coverAllowed(" xiaohongshu.com ")]);
 check("序号表从 ① 开始", CIRCLE[0] === "①" && CIRCLE[1] === "②" && CIRCLE[2] === "③");
 check("markOf(1) = ①", markOf(1) === "①");
 check("markOf(21) 退回括号数字", markOf(21) === "(21)", markOf(21));
@@ -360,7 +395,12 @@ const rec3 = mkRec([{ u: "solo", k: "image", mid: "1", ord: 0, t: 1 }]);
 numberRec(rec3);
 check("组里只有一张不加序号", rec3.items.get("solo").mark === "", rec3.items.get("solo").mark);
 
-// 视频也编号，而且和图片分开排
+// 视频也编号，而且和图片**共用一个序号池**
+//
+// 2026-10-22 改：这条原本断言「图片和视频各自从 ① 起」，那是旧语义。真机上
+// 用户看到的同一条消息是 ①图 ②视频 ③图 ④视频 连续往下走（d-029 已把页面侧
+// 的 ord 统一成「整条消息一条数列」），编号却还按 kind 拆成两个池子，于是
+// 列表里出现两个 ①，用户没法判断谁先谁后 —— 这正是 A6「图视频错位」的另一半。
 const rec4 = mkRec([
   { u: "i1", k: "image", mid: "9", ord: 0, t: 1 },
   { u: "i2", k: "image", mid: "9", ord: 1, t: 2 },
@@ -368,9 +408,54 @@ const rec4 = mkRec([
   { u: "v2", k: "video", mid: "9", ord: 1, t: 4 },
 ]);
 numberRec(rec4);
-check("图片和视频各自从 ① 起",
-  rec4.items.get("i1").mark === "①" && rec4.items.get("v1").mark === "①",
-  [...rec4.items.values()].map((x) => [x.k, x.u, x.mark]));
+check("[TGK] 同一消息里图片和视频不再各自从 ① 起（共用一个池）",
+  rec4.items.get("i1").mark === "①" && rec4.items.get("v1").mark === "②"
+    && rec4.items.get("i2").mark === "③" && rec4.items.get("v2").mark === "④",
+  [...rec4.items.values()].map((x) => [x.k, x.u, x.ord, x.mark]));
+
+// 真机形态：一条消息里 3 图 + 2 视频，ord 已经是整条消息的统一序（0..4），
+// 期望列表从上到下就是 ①②③④⑤，而不是「图 ①②③ + 视频 ①②」。
+const recTGK1 = mkRec([
+  { u: "m0", k: "image", mid: "7498", ord: 0, t: 1 },
+  { u: "m1", k: "video", mid: "7498", ord: 1, t: 2 },
+  { u: "m2", k: "image", mid: "7498", ord: 2, t: 3 },
+  { u: "m3", k: "video", mid: "7498", ord: 3, t: 4 },
+  { u: "m4", k: "image", mid: "7498", ord: 4, t: 5 },
+]);
+numberRec(recTGK1);
+check("[TGK] 同一消息 3 图 + 2 视频编号 ①②③④⑤ 连续",
+  ["①", "②", "③", "④", "⑤"].every((mk, i) => recTGK1.items.get("m" + i).mark === mk),
+  [...recTGK1.items.values()].map((x) => [x.k, x.ord, x.mark]).sort((a, b) => a[1] - b[1]));
+
+// 两条消息各自独立：A 的 3 条 ①②③，B 的 2 条 ①②，不会连成 ①…⑤
+const recTGK2 = mkRec([
+  { u: "a0", k: "image", mid: "7498", ord: 0, t: 1 },
+  { u: "a1", k: "video", mid: "7498", ord: 1, t: 2 },
+  { u: "a2", k: "image", mid: "7498", ord: 2, t: 3 },
+  { u: "b0", k: "image", mid: "7500", ord: 0, t: 4 },
+  { u: "b1", k: "video", mid: "7500", ord: 1, t: 5 },
+]);
+numberRec(recTGK2);
+check("[TGK] 两条消息各自从 ① 起（图视频混排也一样）",
+  recTGK2.items.get("a0").mark === "①" && recTGK2.items.get("a1").mark === "②"
+    && recTGK2.items.get("a2").mark === "③" && recTGK2.items.get("b0").mark === "①"
+    && recTGK2.items.get("b1").mark === "②",
+  [...recTGK2.items.values()].map((x) => [x.mid, x.u, x.mark]));
+
+// 有 mid 时以「消息」为分组单位：同一个标题发在多条消息里，各自从 ① 起。
+// 这是对 B6「同标题跨消息合并连号」的**有意替换** —— 消息才是 Telegram 的
+// 内容单元，跨消息连号会让用户以为「第 12 张」还在这一条里。
+const recTGK3 = mkRec([
+  { u: "s0", k: "image", mid: "7498", title: "编号：#CC0385", ord: 0, t: 1 },
+  { u: "s1", k: "image", mid: "7498", title: "编号：#CC0385", ord: 1, t: 2 },
+  { u: "s2", k: "image", mid: "7500", title: "编号：#CC0385", ord: 0, t: 3 },
+  { u: "s3", k: "image", mid: "7500", title: "编号：#CC0385", ord: 1, t: 4 },
+]);
+numberRec(recTGK3);
+check("[TGK] 有 mid 时同标题不跨消息合号（各消息各自 ①②）",
+  recTGK3.items.get("s0").mark === "①" && recTGK3.items.get("s1").mark === "②"
+    && recTGK3.items.get("s2").mark === "①" && recTGK3.items.get("s3").mark === "②",
+  [...recTGK3.items.values()].map((x) => [x.mid, x.u, x.mark]));
 
 // ord 缺失时退回按抓到时间排
 const rec5 = mkRec([
@@ -867,6 +952,205 @@ require("./group_key.test.js")(check);
 
 // ---- 用户 m13863 追加：[F1] 焦点过滤、[F2] focus() 钩子、[F3] popup 提示条
 require("./focus_scope.test.js")(check);
+
+
+// ---------------------------------------------------------------- [TGORD] 消息内视频+图片共用一个序号池
+// 用户 2026-10-21 m15907：「序号完全对不上」。真机消息 8848：
+//   视频 mid=8848 ord=0..6（7 个）、图片 mid=8848 ord=0..3（4 张）。
+// 两条编号流各自从 0 起，compareWithinGroup 里 ord 相同就只能退到抓取时间（异步=随机），
+// 于是列表出现 ①图 ②视频 ③图 ④视频 ⑤图 ⑥视频 的交替错号。
+console.log("\n[TGORD] 同一条 Telegram 消息里的视频和图片共用一个 ord 序");
+
+{
+  // 直接用源码里的 compareWithinGroup 跑真实数据形态
+  const cmpSrc = bgCode.slice(
+    bgCode.indexOf("function compareWithinGroup"),
+    bgCode.indexOf("function ", bgCode.indexOf("function compareWithinGroup") + 10));
+  const cmpCtx = { __cmp: null };
+  vm.createContext(cmpCtx);
+  vm.runInContext(cmpSrc + "\nthis.__cmp = compareWithinGroup;", cmpCtx, { filename: "cmp" });
+  const cmp = cmpCtx.__cmp;
+
+  // 修复后：同消息里媒体按统一 ord 交错，mid 相同 → 必须按 ord 单调
+  const unified = [
+    { mid: "8848", ord: 0, k: "image", t: 100 },   // 统一序号 0 = 图
+    { mid: "8848", ord: 1, k: "video", t: 200 },   // 统一序号 1 = 视频
+    { mid: "8848", ord: 2, k: "image", t: 300 },
+    { mid: "8848", ord: 3, k: "video", t: 400 },
+    { mid: "8848", ord: 4, k: "image", t: 500 },
+    { mid: "8848", ord: 5, k: "video", t: 600 },
+    { mid: "8848", ord: 6, k: "video", t: 700 },
+    { mid: "8848", ord: 7, k: "image", t: 800 },
+    { mid: "8848", ord: 8, k: "video", t: 900 },
+    { mid: "8848", ord: 9, k: "video", t: 1000 },
+  ];
+  const sorted = unified.slice().sort(cmp);
+  const ords = sorted.map((x) => x.ord);
+  check("[TGORD] 统一 ord 后整条消息严格按阅读顺序",
+    JSON.stringify(ords) === JSON.stringify([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    JSON.stringify(ords));
+
+  // 反例：如果不统一（视频和图片各从 0 起），抓取时间会把顺序打乱
+  const split = [
+    { mid: "8848", ord: 0, k: "video", t: 900 },
+    { mid: "8848", ord: 0, k: "image", t: 100 },
+    { mid: "8848", ord: 1, k: "video", t: 800 },
+    { mid: "8848", ord: 1, k: "image", t: 200 },
+  ];
+  const s2 = split.slice().sort(cmp);
+  check("[TGORD] 两条独立计数流会产生交错（这就是 bug 形态）",
+    !(s2[0].k === "video" && s2[1].k === "video"),
+    JSON.stringify(s2.map((x) => x.k + x.ord)));
+
+  // 跨消息仍然按 mid 升序
+  const cross = [
+    { mid: "8848", ord: 0, t: 100 },
+    { mid: "8842", ord: 9, t: 200 },
+    { mid: "8848", ord: 1, t: 300 },
+  ];
+  const s3 = cross.slice().sort(cmp);
+  check("[TGORD] 跨消息仍按 mid 升序",
+    s3[0].mid === "8842" && s3[1].mid === "8848" && s3[1].ord === 0 && s3[2].ord === 1,
+    JSON.stringify(s3.map((x) => x.mid + ":" + x.ord)));
+}
+
+console.log("\n[HLSU] isHlsUrl：认得出 m3u8 播放列表");
+
+// 用户 m16052：51cg1 / 4kvm「不起作用」。两个站都是 HLS，webRequest 抓到的
+// .m3u8 只是几 KB 的文本清单，以前和 mp4 一样显示成「视频 29KB」，
+// 用户点下载以为在下视频。这里先保证判定本身准确。
+check("[HLSU] 普通 m3u8 地址认得出来",
+  isHlsUrl("https://oss.douyinbit.com/m3u8/8ffa39d4da7087210f1292376e7b39f3.m3u8") === true);
+check("[HLSU] 带 query 的 m3u8（auth_key 那种）仍认得出来",
+  isHlsUrl("https://hls.weagdnz.cn/videos5/aaa/bbb.m3u8?auth_key=1792585246-6ad8ae1e3c113-0-a75597717e") === true);
+check("[HLSU] 大小写混写也认",
+  isHlsUrl("https://a.com/x.M3U8") === true);
+check("[HLSU] 普通 mp4 不是 HLS",
+  isHlsUrl("https://a.com/x.mp4") === false);
+check("[HLSU] ts 分片不是 HLS 清单",
+  isHlsUrl("https://a.com/x.ts") === false);
+// 站方常把播放列表挂在 ?url= 这类跳转后面，抓到的是跳转前的地址，
+// 判成 HLS 反而会误导用户。所以只认 pathname 后缀。
+check("[HLSU] query 里出现 .m3u8 不算（只认路径后缀）",
+  isHlsUrl("https://a.com/redirect?url=https://b.com/x.m3u8") === false);
+check("[HLSU] 空值 / 非法地址不抛错",
+  isHlsUrl("") === false && isHlsUrl(null) === false && isHlsUrl("not a url") === false);
+
+console.log("\n[HLSP] applyHlsPageTitle：把页面标题借给真 m3u8 条目");
+
+// 用户 m16052（4kvm）：页面侧只能读到 og:title，后台侧只能读到 m3u8 地址。
+// 两边各持一半，必须在出列表前合起来，否则用户看到一条光秃秃的
+//「HLS 流（视频）」——不知道是哪一集。
+{
+  const bgsrc = fs.readFileSync(BG, "utf8");
+  check("[HLSP] 有 applyHlsPageTitle 函数", /function applyHlsPageTitle\(/.test(bgsrc));
+  check("[HLSP] sniff:get 里调用了它", /applyHlsPageTitle\(focused/.test(bgsrc));
+
+  // 切出函数体在 vm 里跑（大括号配对，函数内有 for/if 嵌套）
+  const a = bgsrc.indexOf("function applyHlsPageTitle(");
+  let d = 0, e = a;
+  for (let i = bgsrc.indexOf("{", a); i < bgsrc.length; i++) {
+    if (bgsrc[i] === "{") d++;
+    else if (bgsrc[i] === "}") { d--; if (!d) { e = i + 1; break; } }
+  }
+  check("[HLSP] 函数体大括号配对成功", e > a);
+  const hctx = vm.createContext({ URL, RegExp, String, Set, Array, console });
+  vm.runInContext(bgsrc.slice(bgsrc.indexOf("function isHlsUrl("), e), hctx, { filename: "hls-page-title" });
+  const apply = vm.runInContext("applyHlsPageTitle", hctx);
+
+  // 真机形态：一条页面条目（location.href）+ 两条 webRequest 抓到的 m3u8
+  const items = [
+    { u: "https://www.4kvm.net/play/ch4l5b3mn", k: "video", hint: "hls", title: "挑情丑闻 - 第1集" },
+    { u: "https://oss.douyinbit.com/m3u8/abe76b0b.m3u8", k: "video", hint: "hls", title: "", s: 29007 },
+    { u: "https://myoss.douyinbit.top/m3u8/abe76b0b.m3u8", k: "video", hint: "hls", title: "", s: 0 },
+  ];
+  const changed = apply(items);
+  check("[HLSP] 有真 m3u8 时返回 true（列表被改过）", changed === true);
+  check("[HLSP] 页面条目被删掉（它的 URL 是网页，下下来是 HTML）",
+    items.filter((x) => x.u.indexOf(".net/play/") > 0).length === 0,
+    JSON.stringify(items.map((x) => x.u)));
+  check("[HLSP] m3u8 条目借到了页面标题",
+    items.length === 2 && items.every((x) => x.title === "挑情丑闻 - 第1集"),
+    JSON.stringify(items.map((x) => x.title)));
+
+  // 已经有标题的 m3u8 不该被覆盖（页面 <video> 挂了 messageId 那种更具体）
+  const keep = [
+    { u: "https://a.com/p", k: "video", hint: "hls", title: "页面大标题" },
+    { u: "https://a.com/x.m3u8", k: "video", hint: "hls", title: "更具体的小标题" },
+  ];
+  apply(keep);
+  check("[HLSP] 已有标题的 m3u8 不被覆盖",
+    keep.length === 1 && keep[0].title === "更具体的小标题", JSON.stringify(keep));
+
+  // 只有页面条目、m3u8 还没请求出来 —— 不能删，否则用户什么都看不到
+  const onlyPage = [{ u: "https://a.com/p", k: "video", hint: "hls", title: "标题" }];
+  check("[HLSP] 没有真 m3u8 时返回 false 且不动列表",
+    apply(onlyPage) === false && onlyPage.length === 1);
+
+  // 只有 m3u8、没有页面条目 —— 保持原样
+  const onlyHls = [{ u: "https://a.com/x.m3u8", k: "video", hint: "hls", title: "" }];
+  check("[HLSP] 没有页面条目时返回 false", apply(onlyHls) === false && onlyHls.length === 1);
+
+  // 普通 mp4 条目不能被当成 m3u8
+  const mixed = [
+    { u: "https://a.com/p", k: "video", hint: "hls", title: "T" },
+    { u: "https://a.com/x.mp4", k: "video", hint: "", title: "" },
+  ];
+  check("[HLSP] mp4 不算 m3u8（页面条目因此保留）",
+    apply(mixed) === false && mixed.length === 2);
+}
+
+// 2026-10-22 真机（4kvm）：m3u8 地址是「播放一次生成一个」的，重载页面就换新 hex，
+// 旧地址 5 分钟就 404。用户在列表里看到的条目往往已经放了一会儿，于是「点下载 →
+// 报错」变成常态。处理是「报错 → reload 页面 → 等新的 m3u8 → 自动重下一次」。
+// 这里测两个纯判定：什么时候该重试、等到的地址算不算数。
+{
+  const bgsrc = fs.readFileSync(BG, "utf8");
+  check("[HRTY] 有 shouldRetryHls / retriedHlsUrl",
+    /function shouldRetryHls\(/.test(bgsrc) && /function retriedHlsUrl\(/.test(bgsrc));
+  check("[HRTY] 报错分支真的会 reload 标签页", /chrome\.tabs\.reload\(job\.tabId\)/.test(bgsrc));
+  check("[HRTY] found 分支接住了刷新后的新 m3u8", /maybeUseRetriedHls\(tid, p\)/.test(bgsrc));
+  // 4kvm 的 m3u8 只由 webRequest 抓到（页面侧只有 og:title），只在 ms:page 分支接
+  // 会永远等不到新地址 —— 真机第一次验证就栽在这（报错后 pending 一直挂着）
+  check("[HRTY] webRequest 抓到的新 m3u8 也能接住",
+    /maybeUseRetriedHls\(d\.tabId, \{ key: d\.url \}\)/.test(bgsrc));
+
+  const code = [
+    extractFn(bgsrc, "isHlsUrl"),
+    extractFn(bgsrc, "shouldRetryHls"),
+    extractFn(bgsrc, "retriedHlsUrl"),
+  ].join("\n");
+  check("[HRTY] 三个函数都能抽出来", code.indexOf("function retriedHlsUrl(") > 0);
+
+  const rctx = vm.createContext({ URL, RegExp, String, Date, console });
+  vm.runInContext(code, rctx, { filename: "hls-retry" });
+  const should = vm.runInContext("shouldRetryHls", rctx);
+  const pick = vm.runInContext("retriedHlsUrl", rctx);
+
+  const okJob = { hls: true, retried: false, tabId: 12 };
+  check("[HRTY] m3u8 + 404 -> 重试", should(okJob, "拉取播放列表失败：HTTP 404 Not Found") === true);
+  check("[HRTY] m3u8 + 「地址有时效」-> 重试", should(okJob, "该站地址有时效，请刷新页面后重试") === true);
+  check("[HRTY] 403 防盗链不重试（刷新页面没用）",
+    should(okJob, "下载分片失败（0/531 已下）：HTTP Error 403: Forbidden") === false);
+  check("[HRTY] 非 m3u8 不重试（mp4 直链失效重试也没意义）",
+    should({ hls: false, retried: false, tabId: 1 }, "HTTP 404") === false);
+  check("[HRTY] 已经重试过的不再重试（避免刷新风暴）",
+    should({ hls: true, retried: true, tabId: 1 }, "HTTP 404") === false);
+  check("[HRTY] 没有 tabId 不重试（不知道刷哪个页）",
+    should({ hls: true, retried: false, tabId: null }, "HTTP 404") === false);
+  check("[HRTY] 空 job 不炸", should(null, "HTTP 404") === false);
+
+  const pend = { oldUrl: "https://oss.example.com/m3u8/111.m3u8", deadline: 1000 };
+  check("[HRTY] 页面重放旧地址时不拿它重下（只会再 404 一次）",
+    pick(pend, "https://oss.example.com/m3u8/111.m3u8", 500) === "");
+  check("[HRTY] 出现新 m3u8 时返回它",
+    pick(pend, "https://oss.example.com/m3u8/222.m3u8", 500) === "https://oss.example.com/m3u8/222.m3u8");
+  check("[HRTY] 超时后不返回（不挂一个永不兑现的等待）",
+    pick(pend, "https://oss.example.com/m3u8/222.m3u8", 2000) === "");
+  check("[HRTY] 新上报的是网页地址（页面条目）不认",
+    pick(pend, "https://www.4kvm.net/play/ch0y0e044", 500) === "");
+  check("[HRTY] 没有等待任务时返回空", pick(undefined, "https://a.com/x.m3u8", 500) === "");
+}
 
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");

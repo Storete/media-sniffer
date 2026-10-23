@@ -10,12 +10,1123 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-043 · 2026-10-23 · 两条「HLS 流（视频）」分不清：给列表加行号
+
+**用户**（贴 51cg1 详情页 popup 截图）：「这两个视频无法区分哪个是哪个，像这种就按出现顺序加上序号吧」。
+
+截图里上面那条叫「HLS 流（视频）」，下面那条叫「抖音洗脑神曲 … 元素 001 · HLS 流（视频）」。
+不是同一条重复出现（d-041 已经确认是两条不同的流），但两条的**类型名和副行一模一样**，
+点错了下到的是另一路。
+
+### 为什么现成的 ①②③ 帮不上
+
+`background.js` 有一套圈码编号（`it.mark`），但它有两道门槛：
+
+- `NUMBERED_KINDS` 只含 `image` / `video`，HLS 条目的 `k` 是 `video`，能进；
+- 接着 `if (!xhsDetail && !it.mid && !(it.title||"").trim()) continue;` ——
+  **51cg1 没有 mid**，第一名 HLS 又**没有标题**，直接被跳过；第二名有标题，
+  于是自己一个人一组，编出「①」，列表里一片「①、①、①」正是 d-0xx 里修过的那类噪声。
+
+也就是说，这套编号表达的是「**你在这一组里的第几个**」，而用户要的是
+「**你在列表里是第几行**」—— 两件事，不能共用一套。
+
+### 改法
+
+`renderList()` 把显示下标传下去，`renderItem(it, no)` 在最左边建一个 `.no` 列：
+
+```js
+for (let i = 0; i < items.length; i++) box.append(renderItem(items[i], i + 1));
+```
+
+- 序号取**当前列表的显示顺序**（过完筛选 + `visibleItems()` 排序之后），
+  所以它永远和屏幕上从上到下一致；切 chip 会重编，这是「出现顺序」的字面含义。
+- 单独占一列，不进 `displayName()` —— 名字可能被 `shortTitle` 截断或 `-webkit-line-clamp`
+  截行，塞进去会被吃掉。
+- `.no { flex: 0 0 20px; text-align: right; font-variant-numeric: tabular-nums }`：
+  定宽 + 等宽数字，否则 9→10、99→100 的时候名字列会左右跳。
+- 位置在**勾选框右边**、类型徽标左边：批量模式下勾选框占最左是全局约定，
+  两种模式下行号都贴着徽标，不跳。
+
+### 验证
+
+- `test/popup_wiring.test.js` 新增 `[8]` 6 条（先红 5 → 47/47）。JS 11 套全绿。
+- 真机：Chrome 156 载入扩展，直接开 `chrome-extension://<id>/popup.html`，用 CDP 调
+  `window.renderItem(it, n)` 塞 7 条假数据（含截图里那两条 HLS）截图。popup.js 是**经典脚本**
+  （`<script src>` 不是 module），所以 `renderItem` / `el` 都挂在 window 上，**不用为了看样式
+  另写一份 HTML 复刻**。
+- 中途虚惊：按 400px 宽度截图时第 2 行标题看着溢出了卡片、右侧按钮也不见了。
+  查几何发现 `html, body { width: 720px }` 是写死的，400px 的视口只是把 720 宽的 body 切掉了
+  ——不是布局缺陷。按 720×580 重截，一切正常。
+
+**教训**：`mark`（圈码）和「行号」是两个语义，前者表达归属、后者表达位置。
+想用一个去顶另一个，就会出现「①、①、①」。
+
+## d-042 · 2026-10-23 · 页面内进度卡：同一句话说两遍、0% 的死槽
+
+用户贴了一张卡片截图问「这个怎么解决」。图里是页面右下角我们自己的「资源嗅探 · 保存」卡片：
+**两行几乎一样的浅蓝/灰字**「正在下载视频流（完整流，与播放进度无关）…」，
+下面一条**灰色的 0% 空槽**，再下面一个「取消」。
+
+### 三处毛病，全是显示层的
+
+1. **同一句说了两遍**。`uiStage()` 最后一句是 `UI.text.textContent = t`，
+   它既写阶段行（蓝色小字）又写进度行（灰字）。两行并排，就成了截图那样。
+2. **0% 死槽**。`uiStage(text, 0)` 把 `bar.style.width` 设成 `0%` 就撒手了。
+   B 站那条整条流要跑几十秒到几分钟，用户看到的是一条永远不动的灰槽 ——
+   这跟 d-040 在 popup 里刚修的是同一个病，页面浮层没跟上。
+3. **文案是写给开发看的**。「（完整流，与播放进度无关）」在解释实现；
+   而且这句解释在**点保存前**的确认浮层（站点 `saveHint`）里已经讲过一遍了。
+
+### 改法
+
+- **职责切开**：阶段行只说「在做什么」，进度行只说「数字/等了多久」。
+  `uiStage` 不再碰 `UI.text`，`uiProgress` 不再拼阶段名（原来 `else` 分支会
+  `parts.join() + " · " + name`，把标题又抄一遍）。
+- **不确定进度用会走的光带**：`uiSetWaiting(on)` 用 Web Animations
+  （`bar.animate`）跑一条 34% 宽的蓝绿带子来回扫，拿到真实百分比就 `cancel()`。
+  没用「注入 `<style>` + `@keyframes`」是因为这是 MAIN world 的脚本，
+  往用户页面 `<head>` 里塞全局样式容易和站点 CSS 打架，且撤销要靠改内联样式。
+- **计时收归一处**：新增 `uiTick`（500ms），没有字节时报「已等 N 秒」，
+  超过 `PROBE_HINT_AFTER`（8s）补「仍在连接，可点取消」；有字节但 1.2s 没新进展
+  才补「等待数据…」。顺手删掉 `runRangeDownload` 里那个自己起的 `probeHintTimer`
+  —— 它往**阶段行**写「已等 Ns」，和心跳抢同一块屏幕，卡片上会出现两处不同的计时。
+- **文案**：「正在下载视频流（完整流，与播放进度无关）…」→「正在下载完整视频流」；
+  `saveHint` 改成「保存的是整段视频（不是只存正在播的那一段）…」。
+- **失败态**：红条铺满。原来失败后进度条停在半路的那一截，看着像「下了一半」。
+
+### 真机验证抓到一个我自己刚写进去的 bug
+
+自动化 33 项全绿之后，我在 Chrome 156 里加载扩展、开本地页、调 `__msUiApi` 截图 ——
+**光带完全看不见**，卡片上还是一条灰槽。读计算样式：
+
+```
+bar: { width: "108.8px", backgroundImage: "none", marginLeft: "105.475px" }
+```
+
+`background: none`。原因是我在 `uiShow()` 里为了防止「上次失败的红条留到下次」写了
+`UI.bar.style.background = ""` —— **把 `uiEnsure()` 里用 cssText 设的渐变一起清掉了**。
+宽 34%、动画在跑、几何采样从 -98 扫到 319（`probe_bar.mjs` 那 10 个采样点），
+一切"正确"，但屏幕上什么都没有。
+
+修法：把填充色抽成常量 `UI_BAR_FILL`，`uiEnsure` 和 `uiShow` 都用它；
+并补了两条测试（`C3` 必须有填充色、`J5` 失败后重开要复原成渐变）。
+
+### 测试
+
+新建 `test/ui_card.test.js`（**39 项**）：自建假 DOM（`style.cssText` 要能解析出
+`width`、元素要能 `animate`）+ 假时钟（`Date.now` 可推进）+ 可控 `setInterval`，
+覆盖「阶段行/进度行各写什么」「光带动画起没起、停没停」「已等 N 秒」「结束态」
+「卡片重建」「红条复原」「文案里不许有术语」。
+
+**回归**：JS **11 套**全绿（新增 1 套）、Python **15 套**全绿、`node --check` 通过。
+真机：Chrome 156，未知总长 → `text="已等 4 秒"` / `bar=34%` / 光带扫动；
+已知总长 → `bar=50%` 且动画 `cancel`；结束 → `100%` + 收起阶段行 + 出「打开所在文件夹」。
+
+### 教训
+
+1. **「状态对了」不等于「看得见」。** 几何、动画、计算样式（除了 fill）全部正确，
+   用户看到的仍是一条灰槽。自动化能断言「有没有动画」，断不了「肉眼能不能看到」——
+   涉及视觉的改动必须真机截一张图。
+2. **清空一个属性，等于把它的来处一起抹掉。** `style.background = ""` 看着像"恢复默认"，
+   实际是"删掉 uiEnsure 里设的那条渐变"。要复原就复原成**那个具体值**，别写空串。
+3. **让同一块屏幕只有一个主人。** 这次三处毛病里有两处（重复文案、两处计时）
+   根子都是「两个函数写同一个元素」：`uiStage` 和 `uiProgress` 都写 `UI.text`，
+   `probeHintTimer` 和心跳都写阶段/计时文案。
+
+**涉及文件**：`extension/inject-main.js`（`UI` 状态、`uiShow`/`uiProgress`/`uiStage`/`uiDone`、
+新增 `uiSetWaiting`/`uiTick`/`uiStartTick`/`uiStopTick`、`UI_BAR_FILL`、
+B 站 stage 文案、`saveHint`、删 `probeHintTimer`、`__msUiApi`/`__msUiCard` 调试出口）、
+`test/ui_card.test.js`（新建，39 项）、`extension/manifest.json`（1.3.38）
+
+---
+
+## d-041 · 2026-10-23 · 带标题的那条 HLS 只能「保存」：按类型分派，不按来源分派
+
+修 B22。用户原话：「上面那个是什么，我测试的时候发现它用不了，下面那个能用」。
+
+**先纠正一个我写待办时的错误判断。** B22 当初记的是「同一条 HLS 出现两次，要去重」——
+**不是**。B20 对照组 dump 出来的两条地址根本不同：
+
+```
+hls.weagdnz.cn/videos5/932dd69d…/932dd69d….m3u8?auth_key…    38.5 KB  ← dplayer 钩子（page=1，带标题）
+hls.weagdnz.cn/m3m/d41c6e6e….m3u8                            4.2 KB   ← webRequest 抓的
+```
+
+路径不同、体积不同，是**两条不同的流**（一条是播放器配置里的主清单，一条是实际在放的子清单），
+所以「去重」这个方案从根上就不成立。真正的毛病只有一个：**按钮按来源分派，而不是按类型分派。**
+
+**根因**：`popup.renderItem` 先看 `it.page`：
+
+```js
+if (isPage) { 预览 / 保存 }            // 数据由页面自己取
+else        { 复制 / 打开 / 预览 / 下载 } // 交给本地下载器
+```
+
+dplayer 钩子从 `.dplayer[data-config]` 读出来的地址是**页面侧上报**的，所以 `page=1`，
+哪怕它明摆着是个 `.m3u8`。而「保存」那条链路是给 Telegram（blob 地址、页面上下文带 Range、
+512KB 限制）和 B 站（`__playinfo__`）设计的 —— 点下去页面会去 Range 拉那个 m3u8，
+拿到 **38.5KB 的清单文本**。用户的感觉就是「上面那条用不了」。
+
+**更讽刺的是文案**：`isHlsItem()` 分支**无条件** push「点下载自动拼成完整视频」，
+可上面那条根本没有「下载」按钮 —— 文案在教用户点一个不存在的按钮。
+
+**修法**（`extension/popup.js`，四处）
+
+1. `if (isPage)` → `if (isPage && !isHlsItem(it))`：HLS 条目落到通用分支，
+   拿到「复制 / 打开 / 下载」，下载走本地下载器。
+2. HLS 不挂「预览」：Chrome 的 `<video>` 不会放 HLS（扩展页更没有 hls.js），
+   点开必然「预览加载失败」，比没有按钮更让人困惑。
+3. HLS 不进批量选择（`selecting && isPage && !isHlsItem(it)`）：
+   否则「保存所选」会批量下一堆清单文本。
+4. `startDownload` 的文件名兜底：页面条目没有 `it.f`（那是 webRequest 侧按 URL 推的），
+   但**有标题**。不给名字，落盘就是 `d41c6e6e…11260.mp4` 这种哈希 ——
+   真机现场的文件名就是这样，用户下完认不出是哪一集。改成 `it.f || shortTitle(it.title)`。
+
+**测试**：`test/popup_wiring.test.js` 加 `[7]` 五条静态检查（页面分支排除 HLS /
+通用分支仍有「下载」/ HLS 不挂预览 / HLS 不进批量 / 有用标题当文件名兜底），
+并把 `[2]` 里原来断言 `if (selecting && isPage)` 的那条同步更新（否则它会被这次改动打破）。
+
+**回归**：JS **10 套**全绿（`popup_wiring` 36→**41** 项）、Python **15 套**全绿、
+`node --check` 通过。版本 1.3.37。
+
+**教训**
+
+1. **待办要写「现象」不要写「方案」。** 我在 B22 里直接写了「同地址去重」，
+   今天一 dump 才发现根本是两条不同的流 —— 如果照着那句待办开工，会去写一个
+   永远不触发的去重逻辑，而真正的问题（按钮分派按来源而不是按类型）原封不动。
+   现象可以猜错原因，方案写进待办就会被当成结论继承下去。
+2. **分派键选错，后面每条规则都会歪。** 这里「数据从哪来」（page vs webRequest）
+   被当成了「该怎么下」。而决定下法的只有一件事：**这条地址是不是分片清单**。
+
+**涉及文件**：`extension/popup.js`（`renderItem` 分派与预览/批量条件、`startDownload` 文件名兜底）、
+`test/popup_wiring.test.js`（+5 条，改 1 条）、`extension/manifest.json`（1.3.37）
+
+---
+
+## d-040 · 2026-10-23 · 准备期不再是死寂：阶段文案 + 会走的进度条
+
+修 B21。用户原话：「为什么要等很久，才会开始下载，为什么不做成图二（Chrome 下载气泡）的样式」。
+
+**先把「等」量出来**：真机 `dl-1792678232528-m20cx` —— 22:10:33 写 `percent=0`，
+**22:12:21** 才第一次跳到 93.9%，**近 2 分钟界面一动不动**，之后 50 秒跑完。
+不是卡死，是两段**纯等待**：
+
+1. `run_hls_self` 自己试一遍：拉主清单 → 有子清单再拉一次 → 查 `EXT-X-KEY`/BYTERANGE
+   → 第一片当探针，最多试 **4 档请求头组合**，每档一次真实 HTTP
+2. 交回 `run_ytdlp`：它还要拉清单、把几百个分片的表建好，进度行要
+   **真正开下第一片**才出现
+
+**为什么不能改成像 Chrome 下载气泡那样**（这条也写进了 DEVELOPMENT.md B21）：
+那是 **Chrome 自己的下载管理 UI**，只能表达「一个 URL → 一个文件」。
+HLS 是几百个请求拼一个文件，`chrome.downloads.download({url: m3u8})` 只会把
+**播放列表文本**存下来（d-031 那个 38.5KB「视频」就是浏览器版的原样复现）。
+原生气泡还完全不可定制：显示不了「第 30/178 片」「地址过期已刷新重下」「转 mp4 失败：…」，
+取消按钮也管不到我们的 Python 子进程（1.3.34 改完能在 5 秒内真停）。
+
+**修法**
+
+1. `native-host/downloader.py` 新增 `Phase`：写一句「在干什么」，每 2 秒补
+   「（已等 N 秒）」。
+   **关键设计是自限**：ticker 每次写之前先读状态，发现 `message` 已经被别人改掉
+   （`write_progress` 清空 / 写了 done/error）就自己退出。所以调用方**不需要**在
+   每条 `return` 前记得 stop —— 忘了停就是 d-034 的翻版：整场下载全程挂着
+   「解析播放列表」。测试里 T2/T3 就是钉这件事的。
+2. 三个落点：`run_hls_self` 的「解析播放列表」→「探测分片请求头（最多 4 档）」；
+   `run_ytdlp` 开头加「交给 yt-dlp 解析清单（分片多时要等一会儿）」，第一条
+   `MSPROG|` 进来就停。
+3. `extension/popup.js` 的 `updateJob` **以前只拼百分比，宿主写的 message 根本
+   看不见**（截图里那行永远是「… · 下载中」）。改成 message 优先显示。
+4. `popup.css` 加 `.job.wait`：percent 还是 0 但有阶段文案时，进度条变成一条
+   来回走的光带（`@keyframes jobwait`）。这不是假进度，是明确表达「在忙，但还估不出百分比」。
+5. done / error 分支显式 `classList.remove("wait")`，否则光带会一直走下去。
+
+**测试**：新建 `test/host_phase_test.py`，**先红 4 条**（Phase 不存在 / 解析期无文案）
+→ **10/10 全绿**。覆盖：建立即写文案；计时器补「已等」；`write_progress` 之后文案必须停
+且不把 percent 写回 0；写完 done 后不许被覆盖；`run_ytdlp` 解析期必须有文案、
+跑完 message 为空、状态仍是 done。
+`test/popup_wiring.test.js` 加 `[6]` 六条静态检查（渲染 message / 兜底「下载中」/
+挂 wait 类 / 结束摘 wait 类 / CSS 有动画和关键帧）。
+
+**回归**：Python **15 套**全绿（34.6s）、JS **10 套**全绿、`node --check` 通过。版本 1.3.36。
+
+**教训**
+
+1. **「没有进度」和「没有事情发生」是两回事，但用户只看得见前者。** 估不出百分比时
+   该给的不是一个假百分比，而是**正在做什么 + 已经做了多久**。
+2. **后台写了不等于用户看得见。** 宿主一直在推 `message`（`poll_job` 的 snapshot 里
+   就有它、变了就推），但 `updateJob` 只拼 percent —— 整条链路是通的，只有最后
+   三行渲染把它丢了。改 UI 前先确认「数据到底有没有到」，别把传不过去的东西算成没写。
+
+**涉及文件**：`native-host/downloader.py`（`Phase` 新增、`run_ytdlp` / `run_hls_self` 接入）、
+`extension/popup.js`（`updateJob`）、`extension/popup.css`（`.job.wait` / `@keyframes jobwait`）、
+`test/host_phase_test.py`（新增）、`test/popup_wiring.test.js`（+6）、`extension/manifest.json`（1.3.36）
+
+---
+
+## d-039 · 2026-10-23 · `done` 的判据从「谁说自己成功」换成「目录里有没有真视频」
+
+修 d-037 记下的 B19。**d-037 当时把根因猜偏了一半**——以为是「取产物取了错的那个」，
+实际是**上游把成功误判成了失败**，然后兜底路径又「成功地」下了一份清单。完整链路是一组三段互锁：
+
+**真机现场**（2026-10-22 23:13，`dl-1792678232528-m20cx`）：
+
+```json
+{"status": "done", "percent": 100,
+ "file": "D:\\…\\d41c6e6e…11260",     // 29,251 B，内容是 #EXTM3U
+ "message": "ERROR:"}                  // 光秃秃一个字面量
+```
+
+同目录里躺着 `<base>.mp4` **170,275,712 B / 首字节 `ftyp iso6`**——真视频。
+
+**三段链路**
+
+| # | 代码位置 | 发生了什么 |
+|---|---|---|
+| 1 | `run_ytdlp` 尾部扫描 | yt-dlp **下成了**（170MB mp4 落地），但 returncode=0 的情况下还打了一行**内容为空的 `ERROR:`**。`post_err` 取到它 → 整单被误判失败 |
+| 2 | `main()` 的兜底 | 看到 `status=="error"` → 调 `run_urllib`，把 **m3u8 地址当普通文件下**，落盘成 `<base>`（29KB 清单） |
+| 3 | `run_urllib` 成功分支 | `write_status(status="done", file=<base>)` **没传 message**，合并式写入把上一步的 `"ERROR:"` 原样留着 |
+
+于是「真视频下好了、界面报 done、但指向清单、还挂着个 `ERROR:`」。
+
+**为什么之前修不掉**：`done` 的判据一路都是**存在性**——「这一路说自己成功」
+（退出码 0 / `final_file` 非空 / `looks_like_playlist` 为假）。从没任何一处问过
+「目录里到底有没有一个**真视频**」。d-033 结尾写的「把 done 提成状态机级硬约束」
+指的就是这件事，这次落实了。
+
+**修法**（`native-host/downloader.py`）
+
+1. `is_real_media(path)` —— 按**魔数**认视频：`ftyp`(mp4/mov)、EBML(mkv/webm)、
+   `RIFF…AVI `、`FLV\x01`、`OggS`、`ID3`/MP3 帧同步、以及 MPEG-TS（`0x47` 起始 + 188 周期连续 5 点）。
+   体积下限只用来挡残片，定在 **64KB**——判是不是视频靠魔数，不靠体积；
+   线画太高（先写了 1MB）会把十几秒的真短片误判成失败。
+2. `find_done_product(outdir, base)` —— 只在 `<base>.*` 里挑**最大的真视频**。
+   裸 `<base>`（清单）和 `job2.mp4`（相近名字）都不会被选中。
+3. `run_ytdlp` 的失败分支：`returncode == 0` 且 `find_done_product` 有货 → 直接 done，
+   那行 ERROR 当噪声丢掉。
+4. `run_urllib` **开头**先 `find_done_product`：目录里已有真视频就直接收工，
+   不再去下清单（这就是第 2 段被掐断的地方）。
+5. `run_urllib` 成功后再验一次内容：`looks_like_playlist` → 删掉刚下的文件、报
+   error「只下到播放列表，请用扩展里的『下载』」，不再报 done。
+6. `cleanup_ytdlp_junk` 增加第四类：**无后缀的 `<base>` 且内容是清单**（yt-dlp 猜不出
+   扩展名时连后缀都不给，旧代码靠后缀认人必漏）。
+7. 所有 `done` 分支显式 `message=""`，不让上一段的提示残留。
+
+**测试**：新建 `test/host_product_test.py`，**先红 10 条**（红得很准：`status=done`、
+`file=…\p4\job`、`message=ERROR:`，和真机一字不差）→ 修完 **19/19 全绿**。
+覆盖：魔数判定（mp4/TS/清单/过小/不存在）、产物挑选（挑真视频、不串任务、只有清单返回空）、
+「m3u8 当文件下完不许报 done」、「已有真视频时兜底必须收成 done 且 file 指向它」、
+「rc=0 + 空 ERROR 行 + 真产物 = done」、「合并写入不许残留 message」、
+「无后缀清单要清掉、真视频和相近名字不许删」。
+
+**回归**：Python **14 套**全绿（50.2s）、JS **10 套**全绿、`node --check` 全部通过。版本 1.3.35。
+
+**教训**
+
+1. **「报错」和「失败」不是一回事。** `ERROR:` 这一行在 yt-dlp 的语境里可能只是
+   「某一片重试了一下」，退出码才是硬信号。反过来，**退出码 0 也不是成功**（d-027）。
+   两头都不可靠时，只能去看**产物本身**。
+2. **兜底路径是缺陷的放大器。** 「A 失败就试 B」的结构里，B 从来不知道 A 到底失败在哪，
+   于是会把 A 的**部分成果**覆盖成一个更糟的结果（这里：用 29KB 清单覆盖 170MB 成片）。
+   设计兜底时第一步该是「先看看 A 是不是其实成功了」。
+3. **判据要选在被观察对象的本质属性上。** 文件是不是视频，答案只能从**文件头**里读，
+   扩展名（谁猜的）、体积（可能被截断）、上游的自我报告（可能是假的）都只是旁证。
+
+**涉及文件**：`native-host/downloader.py`（`is_real_media` / `find_done_product` 新增，
+`run_ytdlp` 失败分支、`run_urllib` 入口与成功分支、`cleanup_ytdlp_junk` 改动）、
+`test/host_product_test.py`（新增）、`extension/manifest.json`（1.3.35）
+
+---
+
+## d-038 · 2026-10-23 · 91rb 测试：抓不到不是扩展的问题，是站方不给游客播放器
+
+> 结论先说：**无法下载，原因在站方的登录墙**。这一条不是缺陷记录，是一次「确认我们没坏」的测试。
+
+**测试对象**：`https://www.91rb.com/videos/321534/2-1149/`（用户 2026-10-22 提出「明天测试一下」）
+
+**第一次启动就踩了环境的坑**：Chrome 打开页面后 `readyState=complete` 但 `url` 是
+`chrome-error://chromewebdata/`、正文是「无法访问此网站…`ERR_CONNECTION_CLOSED`」，扩展抓到 **0 条**。
+
+排查分层：
+
+| 路径 | 结果 |
+|---|---|
+| curl 直连（`--noproxy '*'`） | 超时 15s，`http=000` |
+| curl 走 agent 环境代理 `127.0.0.1:2937` | `CONNECT tunnel failed, response 502` |
+| curl 走本机 Clash `127.0.0.1:7897` | `schannel: failed to receive handshake`（连 google 也一样，说明是 curl 显式 CONNECT 这条路不通） |
+| **Chrome 走系统代理（WinINET = 127.0.0.1:7897）** | **页面正常打开**，标题「…不擦 (1) - 91热爆」 |
+
+**根因**：agent 的 bash 里注入了 `http_proxy/https_proxy=127.0.0.1:2937`（沙箱代理），
+从里面启动的 Chrome 会落到沙箱网络里；必须用「跳过沙箱」的方式启动 Chrome，
+它才会读 Windows 系统代理设置（`HKCU\...\Internet Settings\ProxyServer = 127.0.0.1:7897`，Clash Verge 的 `verge-mihomo`）。
+**以后测这类站，Chrome 一定要在沙箱外启动，否则必然 `ERR_CONNECTION_CLOSED`。**
+
+**页面真身**（沙箱外重测，`htmlLen=126,561`）：
+
+```html
+<div class="player-holder">
+  <div class="no-player" id="limitplayer">
+    <img src=".../321000/321534/preview.jpg">
+    <span class="message">游客试看已达上限<br>登入会员以解锁精彩内容！</span>
+  </div>
+</div>
+<script>var pageContext = { videoId: '321534', loginUrl: 'https://www.91rb.com/login-required/' };</script>
+```
+
+- `<video>` **0 个**、`<iframe>` **0 个**、HTML 里 `.m3u8` / `.mp4` 命中 **0 次**、`video_idHits` 只匹配到变量名本身。
+- 播放器**根本没被创建**（容器是 `no-player` + `#limitplayer`），所以浏览器一次视频请求都没发出去，webRequest 自然什么都看不见。
+
+**扩展侧结果**：26 条 —— `other 11 / image 14 / font 1`，**`video` 0 条、HLS 0 条**。
+唯一沾边的是 `preview.jpg`（封面图，`hint` 里带 `no-player`）。
+
+**对照组（同一次会话、同一个调试 Chrome）**：换成 51cg1 的页面 → **158 条**，
+`video 6 / seg 4 / image 84 / HLS 2 条`（其中一条带站点标题、`page=1`，正是 B22 里那个"只能保存"的条目）。
+**→ 扩展、原生宿主、页面钩子全都正常，91rb 的 0 条是站方行为。**
+
+**结论**：`免登录 → 不能下载`，这一档可以下「浏览器实测通过」的证据，但**不能**说「扩展不支持这个站」。
+要验证登录态下能不能下，得有账号（用户手动登录，或提供 cookie 后由宿主带上）。
+
+**教训**
+
+1. **「抓不到」先分清是"抓不到"还是"没有可抓"。** 这次页面里连一个视频地址都不存在——
+   webRequest 再强也只能看见网络层真的发生过的请求。判断依据要落到「页面有没有创建播放器 / 有没有 `<video>` / HTML 里有没有地址」，
+   而不是「扩展条目数为 0」。
+2. **对照组是最省时间的排查手段。** 同一台机器、同一份扩展、同一次会话里跑一个已知能抓的站（51cg1 158 条），
+   一句话就能把「是不是我们坏了」排除掉，比反复读代码快得多。
+3. **代理要看是哪一层。** 同一个 7897，curl 显式 CONNECT 不通、Chrome 走系统代理却通——
+   说明「本机能不能访问某站」这个问题，用 curl 的结论不能直接套到浏览器上。
+
+**涉及文件**：无（纯测试，未改代码）
+**状态**：已完成（档位：浏览器实测通过；结论为「站方登录墙，未登录不可下载」）
+
+---
+
+## d-037 · 2026-10-22 · 产物是对的，状态是错的：`"ERROR:"` 与一个播放列表冒充视频
+
+> 这条是**观测记录**，不是修复记录。用户 22:13 收工前把这三件事定成「明天做」（`DEVELOPMENT.md` B19），
+> 这里先把真机证据钉住，免得明天重新复现一遍。
+
+**发现过程**：用户在 51cg1 同一页面点了第三次下载（另一集）。收尾巡检时读状态文件：
+
+```json
+{"status": "done", "percent": 100,
+ "file": "...\\d41c6e6e…11260",
+ "message": "ERROR:"}
+```
+
+`done / 100` 看着没问题，但两个字段都很怪：`file` 没有扩展名，`message` 只有一个字面量 `ERROR:`。
+
+**真机证据**（目录实况，两个文件并存）：
+
+| 文件 | 大小 | 头部 | 判定 |
+|---|---|---|---|
+| `<base>` | 29,251 B | `#EXTM3U` / `#EXT-X-MAP:URI="https://mts.hhjd.mobi/yk218/m3u8-v5/83c/…"` | **播放列表正文**，不是视频 |
+| `<base>.mp4` | 170,275,712 B | `ftyp iso6` | **真 MP4**，就是用户要的东西 |
+
+也就是说：**下载本身是成功的**（这一集是 fMP4 切片，yt-dlp 原生 HLS 下载器直接拼出 mp4，
+全程没调 ffmpeg，所以 d-032 那个 remux `Permission denied` 这次根本没触发），
+坏的是**上报层**：`file` 指着播放列表、`message` 指着一个没说内容的错误。
+
+**三个待修的点**（明天动手，先写红测试）：
+
+1. **`message` 是空壳 `"ERROR:"`** —— `run_ytdlp` 扫尾部取含 `ERROR:` 的那一行，
+   而这一行本身没带内容。等于「报了错但不说是什么」，用户只能猜。
+   方向：往后多取几行拼出真原因，或者干脆判 `error` 而不是 `done`。
+2. **`file` 指错产物** —— 取产物那一步选中了无扩展名的 `<base>`。
+   方向：**用魔数校验而不是扩展名校验**（`ftyp` / `0x47` / 图片签名），
+   顺便把 d-033 的教训捡起来：`done` 应该是状态机级硬约束，别散在各分支各判一次。
+3. **垃圾没清** —— `cleanup_ytdlp_junk()` 靠后缀认人，只覆盖 `<base>.m3u8`，
+   认不出 `<base>` 这种「内容是播放列表但没后缀」的形状。
+
+**教训**
+
+1. **「文件存在」和「文件是你要的东西」是两回事。** 前一版修的是「完成但目录里没文件」（B15），
+   这一版是「完成、有文件、但指的那个文件是播放列表」。判据一路都是**存在性**，
+   从没校验过**内容**——这类缺陷会一直换面貌冒出来，直到判据换成魔数。
+2. **能下成功的路径和会失败的路径不是同一条。** 上一集走 `run_hls_self` + remux，撞 ffmpeg；
+   这一集走 yt-dlp 原生 fMP4，碰巧绕开了。所以「上次修好了」不能推断这次也走了同一条路。
+
+**涉及文件**：`native-host/downloader.py`（`run_ytdlp` 尾部扫描、取产物逻辑、`cleanup_ytdlp_junk`、`looks_like_playlist`）
+**状态**：待做（B19，用户定为明天）
+
+---
+
+## d-036 · 2026-10-22 · 点「取消」没作用：换个下载器接着下
+
+**发现过程**：修完 B17 做真机冒烟，取消任务后 3 秒界面显示 `cancelled`，
+但输出目录里又冒出了文件、状态被覆盖回 `downloading / percent 0`。
+一查进程：下载进程还活着，而且在跑 **yt-dlp**。
+
+**根因**：`main()` 的三路分派只把 `done` 当停止条件：
+
+```python
+if run_hls_self(job, quiet=True):
+    st_h = read_status(job_id)
+    if st_h.get("status") == "done":   # ← cancelled 不在这里
+        return
+    hls_msg = ...
+run_ytdlp(job, ytdlp, ffmpeg)          # ← 取消后照样执行
+```
+
+`run_hls_self` 在取消时 `return True`（「我处理了」），但 `main()` 只认 `done`，
+于是取消被当成「这一路没搞成」→ 掉进 yt-dlp 兜底继续下 → 状态被覆盖成
+`downloading`。**用户点取消等于没点，只是换了个下载器。**
+`run_ytdlp` / `run_urllib` 自身也没有任何取消守卫，等于兜底路径完全不设防。
+
+**另一个坑（更容易被误判）**：`sniffer_host.do_cancel()` 会**立刻**回
+`{"action":"cancelled","status":"cancelled"}` 给扩展。也就是说界面上的
+「已取消」只是宿主的**确认回执**，不代表进程真的停了。我第一轮就是被这条
+假信号骗过，以为修好了——直到看见目录里又有文件。
+
+**修法**：
+
+- `main()`：`if st_h.get("status") in ("done", "cancelled"): return`。
+- `run_ytdlp()` / `run_urllib()` 开头各加一道守卫：已有取消标记就直接写
+  `cancelled / 用户取消` 返回，**不 spawn 外部进程**。
+- `_fetch_segment(..., should_stop=...)`：每轮重试前问一次要不要停，命中就抛
+  `_Cancelled`，由主循环既有的分支统一收尾（删 `.part` + 写 cancelled）。
+
+**为什么要加 `should_stop`**：取消真正落地要等在途分片收尾。改动前真机量到
+**70 秒**才停（在途分片正把 3 轮退避跑完，而每轮里还有 `_hls_get` 自己的 3 次
+尝试 + 45 秒 socket 超时）。加了它之后分片在下一轮之前就放弃。
+
+**验证**：
+
+- 新建 `test/host_cancel_test.py`，**先跑红 5 条**：
+  `main()` 取消后仍调 yt-dlp、`run_ytdlp` 无守卫时直接抛 `FileNotFoundError`、
+  `run_urllib` 无守卫时真去连网（`Tunnel connection failed: 502`）。
+  改完 **11/11 全绿**（含「取消能立刻打断分片重试」，断言只跑了 1 轮）。
+- Python **13 套全绿**，JS 642 项不受影响。
+- **真机复验**（4kvm，178 片）：取消后状态 `cancelled / 用户取消`、
+  `.part` 已删、无遗留进程；**收尾用时 5.09 秒**（改动前 70 秒，14 倍）。
+
+**教训**：
+
+1. **「收到确认」不等于「事情做完了」。** 回执是异步的乐观信号，验证必须落到
+   最终状态 + 副作用（进程、文件）上。
+2. **兜底路径最容易漏掉前置条件。** 主路径写了 `if done: return`，兜底路径就
+   顺手被执行了——凡是「失败后换个办法再试」的结构，都要先问一句「这真是失败吗」。
+3. 取消、超时、重试这三类「异常出口」要做成**层层可打断**的，否则一个 45 秒的
+   socket 读就能让用户对着按钮等一分钟。
+
+**涉及文件**：`native-host/downloader.py`（`main()` 的 cancelled 分支 /
+`run_ytdlp` 与 `run_urllib` 的取消守卫 / `_fetch_segment(should_stop=...)`）、
+`test/host_cancel_test.py`（新）。
+
+---
+
+## d-035 · 2026-10-22 · 一个分片断流打死整单：给分片加外层退避重试
+
+**问题**（用户自己的下载现场，属于 51cg1 复验期间顺手撞到的）：
+
+```
+下载分片失败（30/178 已下）：IncompleteRead(528064 bytes read, 1614008 ...
+```
+
+178 片下到第 31 片，服务端把连接掐了；异常一路抛到主循环 → 整单判失败、
+`.part` 删掉 → **前 30 片全白下**。用户手动重试一次（同样的地址、同样的网络）
+立刻成功 —— 说明是**瞬时抖动**，不该等于整单失败。
+
+**为什么原来是这个行为**：`_hls_get` 本来就有 2 次重试，但两次是**紧接着**的
+（间隔 0.6s / 1.2s）。服务端抽风几秒的话，3 次尝试会全部撞在同一个窗口里，
+然后 `raise last` 抛出去；`fetch()` 在 worker 线程里抛，主线程只拿到一个
+光秃秃的 `IncompleteRead`，既不知道是第几片，也没机会补。
+
+**修法**：
+
+- 新增 `_fetch_segment(url, headers, attempts=3, backoff=1.0)`：在 `_hls_get`
+  之外再套一层，退避 **1s → 2s**，合计横跨约 3 秒的抖动窗口；**4xx 立刻返回**
+  （地址过期/防盗链重试一百次还是同样结果，不浪费预算）。
+- 返回 `(data, err)` 而不是抛异常：worker 里抛异常会丢掉「第几片」这层上下文。
+  主线程拿 `None` 就 `raise _SegmentFailed(idx, err)`，由外层统一写提示。
+- 提示从「下载分片失败（30/178 已下）：IncompleteRead(...)」改成
+  「下载分片失败（30/178 已下）：**第 31 片重试 3 轮仍失败**：IncompleteRead(...)。
+  网络抖一下不会这样，多半是这一片在服务端有问题，刷新页面换个地址重试」。
+  **用户得能判断这是「网络抽风」还是「这片真没了」**，否则只会反复点重试。
+
+**验证**（`test/host_segment_retry_test.py` 新建，**先跑红 5 条**）：
+
+- 单片：连续断流 4 次 → 仍能取到，且请求次数 ≥5（证明外层重试真的生效，
+  不是碰巧一次成功）。注意 4 次是**故意**选的：只断 2 次的话 `_hls_get`
+  自己就能救回来，测不出新代码的价值。
+- 单片：一直断 → 返回 `(None, err)` 不抛；`attempts=2` 约束请求轮数。
+- 单片：404 → 快速失败，不重试。
+- 端到端：某片连续断流 4 次 → 任务仍 `done`，**产物大小 = 6 片净长之和**
+  （证明是补齐而不是跳过坏片凑数）。
+- 端到端：某片一直下不来 → `error`，提示里带「第 5 片 / 重试 / 已下 N/M」，
+  且不留 `.part` 残骸。
+- 结果：**17/17 全绿**；Python **12 套**全绿（新套件 19.9s，是除大文件外最慢的
+  一个，因为故意让重试跑满）；JS 642 项不受影响。
+
+**教训**：
+
+1. **「重试」要看间隔，不是看次数。** 3 次紧接着的重试和 3 次跨越 3 秒的重试，
+   对「服务端抽风几秒」是两种完全不同的东西。
+2. **异常要带上「哪一段」的上下文再往上抛。** 原始异常从 worker 线程冒到主线程，
+   信息只剩「读了 528064 字节」，用户和排查的人都看不出严重程度。
+3. 复验一个站的时候，**撞到的别人的报错也要捡起来**——这次 B17 就是 51cg1 复验时
+   在 4kvm 的现场顺手抓到的，比原定的「文案问题」重要得多。
+
+**涉及文件**：`native-host/downloader.py`（`SEG_ATTEMPTS` / `SEG_BACKOFF` /
+`_fetch_segment` / `_SegmentFailed` / `fetch()` / 主循环 / 错误提示）、
+`test/host_segment_retry_test.py`（新）。
+
+---
+
+## d-034 · 2026-10-22 · 51cg1 复验：能抓能下，但界面文案骗人 + 发现分片没有单次重试
+
+**背景**：用户问「https://51cg1.com/archives/279033/ 这个网站的功能实现了吗」。
+A5（1.3.27）当时修的是「抓不到」，这次要回答的是「现在能不能下」。
+
+**真机结论（全新 profile + `Extensions.loadUnpacked`）**：
+
+- **抓取 ✅**：109 条资源，HLS 条目带标题
+  「推特约啪博主 FENDSON 付费新作 …人体艺术001」，`hint=hls`，`k=video`。
+  标题末尾的 `001` **不是我们的 bug**——站点自己在
+  `.dplayer[data-video_title]` 里就这么写的（钩子优先读该属性，退回 `<title>`）。
+- **下载 ✅ 能下**，但走的是 **yt-dlp 兜底**而不是自实现 HLS。原因是**分片是
+  AES-128 加密的**：取一个 `.part-Frag100` 看头部，前四字节 `b6 11 27 d2`，
+  既不是 TS 的 `0x47` 也不是 fMP4 的 `ftyp`，是密文。这是 d-032 里
+  `run_hls_self` 有意为之的 `bail(..., take_over=False)`——我们不解密，
+  yt-dlp 能拉密钥，交给它才是对的。
+- 实测进度：0.2% → 7% → 16% → 27% → 36.5% → **卡 35 秒** → 40% → 55% →
+  61.8% → **87.7% 后停住近 3 分钟**，速度 6~8 MiB/s。
+
+**修的问题：界面上的「解析播放列表」从头挂到尾。**
+
+`write_status` 是合并式的（只更新传入字段）。自实现 HLS 开头写了
+`message="解析播放列表"`，随后清单加密交回 yt-dlp，而 **yt-dlp 分支的进度更新
+只写 percent/speed/eta，不碰 message**——于是从 0% 到 87.7%，界面上一直显示
+「解析播放列表」。用户看到的信号是「卡在解析」，实际一直在下载。
+
+修法：新增 `write_progress(job_id, percent, speed, eta)` 作为**统一进度入口**，
+内部固定 `message=""`；yt-dlp 分支改走它。抽成函数而不是就地加一行 `message=""`，
+是为了让它可被单测覆盖（`host_status_race_test.py` 3 条：percent 更新、
+message 清空、status 仍是 downloading），也避免下次再加一条下载路径时又忘。
+
+**顺手删了一处重复定义**：`downloader.py` 里 `read_status` 定义了两次，
+第二个（无 docstring、在 `__main__` 前）**覆盖**了第一个带说明的版本。
+改谁都生效不了的那一份最容易误导后来人，直接删掉后一份。
+
+**新发现（待办，这次没修）**：复验期间用户自己在 4kvm 上点的下载报出——
+
+```
+下载分片失败（30/178 已下）：IncompleteRead(528064 bytes read, 1614008 ...
+```
+
+意思是**单个分片连接中断就整单失败**，前面 30 片全白下。`run_hls_self` 的分片
+抓取没有「单片重试」，只有 `_hls_get` 里对 5xx/超时的小重试，`IncompleteRead`
+这类半途断流不归它管。这是比文案重要得多的问题，已记成 B17。
+
+**教训**：
+
+1. **「有这个功能」和「用户看得懂现在在干什么」是两件事。** 合并式状态写盘 +
+   多段下载路径 = 上一段的提示会粘在界面上。凡是切换阶段，就得显式清提示。
+2. **加密清单交给 yt-dlp 是对的，不是缺陷。** 复验时要先看清楚「为什么走兜底」，
+   别把设计当 bug 修。
+
+**涉及文件**：`native-host/downloader.py`（`write_progress` / `run_ytdlp` 进度调用 /
+删除重复 `read_status`）、`test/host_status_race_test.py`（3 条新用例）。
+
+---
+
+## d-033 · 2026-10-22 · 「完成」但目录里没有视频（第二次）——状态写盘撞车把真因吞了
+
+**问题**：用户 21:20 点了另一集下载（`ch4q6cqou`），几分钟后目录里只有 31 个
+`<hash>.mp4.part-FragN.part` 和一个 74 KB 的 `.m3u8`，**没有视频**；
+而任务状态是 `status=done, percent=100`，`file` 指向那个 `.m3u8`，
+`message` 是：
+
+```
+读取下载输出失败: [WinError 5] 拒绝访问。:
+  '...\dl-1792675185945-orcp3.json.tmp' -> '...\dl-1792675185945-orcp3.json'
+```
+
+**根因 A（确证）：状态文件的「原子替换」和「0.4 秒轮询」抢同一个句柄。**
+
+`write_status` 写 `<id>.json.tmp` 再 `os.replace` 成 `<id>.json`（这是为了防宿主
+读到半个 JSON）；而宿主 `poll_job` 每 0.4 秒 `json.load(open(...))` 读同一个文件。
+**Windows 下目标文件被别人持有句柄时，MoveFileEx 直接返回
+`ERROR_ACCESS_DENIED`（WinError 5）**。窗口很短，但一个上千分片、跑 30 分钟的任务
+要写几十上百次状态，撞上几乎是必然。
+
+真正致命的不是「少更新一次进度」，而是**这个异常是从 `write_status` 里抛出去的**：
+它恰好发生在 `except` 块「写失败原因」的那一行，于是——
+
+1. 「为什么会失败」这条最重要的话没写进去；
+2. 异常继续往外抛，进程带 traceback 退出；
+3. 状态文件里留着**上一次成功写入的** `done / 100 / file=.m3u8`。
+
+用户看到「完成」，目录里却没有视频。**这是「假成功」的第三种成因**：d-031 是判据
+选错（扫退出码/尾部而不是产物），d-027 是退出码 0 不可信，这一次是**上报通道自己
+把判据吞了**。
+
+**根因 B：yt-dlp 失败后不收拾自己的碎片。** `<base>.mp4.part`、
+`<base>.mp4.part-FragN.part`、`<base>.mp4.ytdl` 全留在输出目录。这次 31 个文件
+共 9.2 MB，看着不多，但本机 safe-delete 一次删 >50 个文件会被拦，用户又不知道
+能不能删 → 「以后再说」等于永远清不掉。
+
+**修法**：
+
+- `_replace_retry(tmp, path)`：`PermissionError` 退避重试 10 次（10ms 起，
+  上限 80ms，总计约 0.5 秒），仍失败则**退化为直接覆写**——宁可宿主读到半个 JSON
+  （它有容错，坏 JSON 当空 dict），也不能让状态彻底写不进去。非权限类的 `OSError`
+  不重试（换卷、路径不存在之类重试没意义）。**`write_status` 从此不抛异常**。
+- `cleanup_ytdlp_junk(outdir, base)`：只认三类——`<base>.*.part*`、`<base>.*.ytdl`、
+  以及**内容确实是播放列表**的 `<base>.m3u8`（`looks_like_playlist` 判定，那是
+  「只下到清单」的残骸，不是视频）。最终成片 `.mp4/.ts/.mkv` 和名字相近的别的任务
+  一律不碰（`base-extra.mp4` 这类靠 `base + "."` 前缀挡掉）。接在 yt-dlp 的两个
+  失败分支上。
+
+**验证**：新增 `test/host_status_race_test.py`，**先跑红 10 条**（不重试、异常抛出、
+碎片没清、函数不存在），改完 **18/18 全绿**；Python 11 套 / JS 642 项全绿。
+
+**没查清的**：这一单**为什么没走自实现 HLS 而回退到 yt-dlp**——原因被根因 A 吞了。
+已排除防盗链：该清单 1017 个分片、无 `EXT-X-KEY`、无 `BYTERANGE`，分片
+`https://cs.wuxiais.com/movie/.../5db400000.ts` 带不带 Referer 都返回 200 / 1,402,104 字节。
+修完 A 之后如果再失败，`message` 里就能看到真实的三路原因；同时该 m3u8 已 404
+（一小时内失效，和 d-032 的一次性地址一致），无法原地复现。
+
+**教训**：
+
+1. **上报失败的代码本身不能成为失败源。** 日志/状态写盘这种人畜无害的收尾动作，
+   一旦会抛，恰好会把「为什么失败」抹掉——排查时看到的现象会指向完全错误的方向。
+2. **「原子替换」在 Windows 上不是无锁操作。** 有另一个进程在读，就得准备重试。
+3. **假成功第三次以不同面貌出现**（退出码 → 判据 → 上报通道）。下一步该把
+   「`done` 必须同时满足 `file` 存在且不是播放列表」做成状态机级别的硬约束，
+   而不是散在各分支里各判一次。已记进待办。
+
+**涉及文件**：`native-host/downloader.py`（`_replace_retry` / `cleanup_ytdlp_junk` /
+`write_status` / `run_ytdlp` 两个失败分支）、`test/host_status_race_test.py`（新）。
+
+---
+
+## d-032 · 2026-10-22 · 4kvm 下载不下来：PNG 壳分片 + 一次性地址
+
+**问题**：用户问「https://www.4kvm.net/ 这个网站的功能实现了吗」。抓取侧完全正常
+（popup 只剩一行「无耻之徒(美版) 第二季 - 第1集 · HLS 流（视频）」），点下载必定失败。
+
+**两条根因，缺一条都解释不了现象**：
+
+1. **地址一次性/短时效**。同一条 m3u8，抓到后放 15 分钟再下就 `HTTP 404`；
+   刷新页面会换成一个全新的 hash 文件名（`93334d…` → `c15a6c…`）。
+   这不是防盗链（防盗链一般是 403），是**签发即作废的一次性签名**。
+2. **分片是伪装的**。把分片下下来看头部：`89 50 4E 47 0D 0A 1A 0A` 是 PNG 签名，
+   跟着 IHDR/pHYs/IDAT/IEND，`IEND` 结束在 **offset 112**，**紧接一个 `0x47`**——
+   之后按 188 字节采样，50/50 命中同步字节。也就是说：**112 字节 PNG 壳 + 真 MPEG-TS**。
+
+**排查中试过但不管用的**：
+
+- `yt-dlp --retries 10 --fragment-retries 10`：514 个分片，每个都重试 10 次，
+  进度卡在 0% 好几分钟——它把壳当数据下，拼出来的 TS 也不对。**分片数一多，
+  重试就成了灾难**：失败一次不是多花几秒，是 ×10。
+- 直接拼 TS（不剥壳）：ffmpeg 认不出流，报一堆 `Packet corrupt`。
+- Referer 方向**和常见站点相反**：4kvm/xhscdn 的分片**带 Referer → 403，
+  不带 → 200**。浏览器侧是 hls.js 用 `referrerPolicy: no-referrer` 发的，
+  所以「把 Referer 补上」这种常规修复在这里是反向操作。
+
+**修法一：自己下 HLS（`native-host/downloader.py`）**
+
+- `strip_masquerade(data)`：在**前 4096 字节**里找「连续 5 个包都是 0x47」的偏移，
+  从那里截断。不看固定 offset 112——站点随时可能改壳长度；也不信 `data[0]==0x47`
+  就早退（真 TS 原样返回，不误伤）。
+- `parse_hls_playlist(text, base_url)`：`urljoin` 补绝对地址；master 清单取
+  **最大 BANDWIDTH** 的子清单；`EXT-X-KEY` 出加密标记、`EXT-X-MAP` 出 init 段、`EXT-X-BYTERANGE` 出分片区间。
+- `run_hls_self(job)`：**先探一片**（4 档请求头依次试：原样 → 去 Referer →
+  去 Referer+Origin → 只留 UA/Cookie），哪档通就整单沿用；然后滑动窗口并发
+  （`Semaphore(workers*2)`）+ **主线按 index 顺序写盘**——不把 1.4 GB 读进内存，
+  也不落成几百个临时文件（本机 safe-delete 一次删 >50 文件会被拦，临时文件根本清不掉）。
+- `main()` 分派改成 **m3u8 先走自实现**，搞不定再 yt-dlp、再直连；
+  失败时三条原因**都保留**（不然用户只看到 yt-dlp 的 404，看不出是自己 HLS 那层先挂的）。
+
+**修法二：地址过期自动重取（`extension/background.js`）**
+
+报错里带「时效/过期/404」且这单是 m3u8、且还没重试过 → 记一条
+`pendingHlsRetry.set(tabId, {oldUrl, deadline})` → `chrome.tabs.reload(tabId)`；
+页面重新上报条目时，若出现**新的** m3u8（必须排除 `oldUrl`，reload 后页面会先重放
+缓存里的旧地址）就用它重下一次，并推一条「视频地址已过期，已刷新页面重新开始」。
+
+两个细节是踩出来的：
+
+- 等待窗口 **25 秒 → 120 秒**。第一次复验失败，SW 里是
+  `pending: [{"left":-63}]` 而新地址其实已经进 state 了——页面 reload + 重新拉流
+  实测要 10~20 秒，慢网络更久。
+- **`record()` 那两处也必须接线**。4kvm 的 m3u8 **只由 webRequest 抓到**，
+  不走 `ms:page` 的 found 分支；只接后者等于没接。
+
+**验证**：
+
+- 真机：`run_hls_self` 2.8% → 84.7%（约 18 MB/s），产物 1.3 GB `.ts`，
+  首字节 `0x47`、无 PNG 签名、大小等于 6 个分片净长之和、末尾对齐 188。
+- 端到端（全新 profile + `Extensions.loadUnpacked`）：拿一条**已过期**的
+  `93334d….m3u8` 发起下载 →
+  `t+6s` 报错「自实现 HLS: 拉取播放列表失败：HTTP 404」、`job.retried=true`、
+  等待表登记成功 → `t+9s` 等待表被消费、**出现新任务**、地址换成 `49d94eb…m3u8`
+  → 百分比 0.9 → 2.8 → 5.6 → … → 47.1%。**整条链路跑通**。
+- 测试：新增 `test/host_masquerade_test.py`（29 项，含本地 mock 服务器，
+  `/seg-*` 故意「带 Referer 一律 403」复刻真机方向）；`test/background.test.js`
+  新增 `[HRTY]` 18 项；`test/host_download_job_test.py` 补「三路全失败时自实现
+  HLS 的原因也保留」。JS 642 项 / Python 10 套全绿。
+
+**已知限制**：
+
+- **remux mp4 在本机一律 `Permission denied`**。试过 `.part` 后缀、`-f mp4` 显式容器、
+  写系统 temp 再 `shutil.move`，全失败；`bin/ffmpeg.exe` 在 WorkBuddy shell 里本身
+  也起不来（rc=3221226505），但**被 Chrome 拉起的宿主里能跑**。判定为本机安全软件
+  限制未签名 exe 写入，不是代码问题。TS 本身可播，所以 done + message 里说明原因。
+- 自动重取**只有一次机会**（`job.retried` 一次）。第二次还 404 就把错误如实抛给用户——
+  再刷页面也拿不到更新的地址，只是消耗站方一次请求。
+
+**教训**：
+
+1. **「下载失败」要分两层看**：能不能下（地址还有效吗）、下的对不对（数据是不是真视频）。
+   这次两条同时坏，只修一条都还是失败。
+2. **重试次数在分片场景是会放大的**。514 片 × retries 10 不是「多等一会」，
+   是把一次失败变成十分钟卡死——先判断分派顺序，别急着调大重试。
+3. **别信「加 Referer 更安全」**。防盗链方向可以是反的，用 4 档请求头探针实测，
+   比照抄经验可靠。
+
+**涉及文件**：`native-host/downloader.py`（`strip_masquerade` / `parse_hls_playlist` /
+`_hls_get` / `_header_variants` / `run_hls_self` / `main` 分派）、
+`extension/background.js`（`pendingHlsRetry` / `shouldRetryHls` / `retriedHlsUrl` /
+`maybeStartHlsRetry` / `maybeUseRetriedHls` / `record` 接线）、
+`extension/popup.js`（`native:download` 补 `tabId`）、`test/host_masquerade_test.py`（新）、
+`test/background.test.js`、`test/host_download_job_test.py`、`test/review.test.js`。
+
+---
+
+## d-031 · 2026-10-22 · HLS 只下到播放列表却报「完成」
+
+**问题**：真机复验 A5 时，51cg1 那条 m3u8 点下载，进度条 0% → 100%、界面显示
+「完成」，落盘却是一个 **38,299 字节的 `.m3u8` 文本**，不是视频。
+
+**根因**：yt-dlp 对这条地址走了 **generic 分支**——没认出是 HLS，于是把清单本身
+当普通文件下载。这种情况退出码是 **0**、尾部也没有 `ERROR:`，而 d-027 那次
+（4kvm ffmpeg 重封装失败）修的正是「退出码 0 不可信，要扫 tail 里的 ERROR」，
+这条恰好两种判据都躲过去了。
+
+**修法**：加 `looks_like_playlist(path)`，判据落在**文件头**而不是扩展名——
+扩展名是 yt-dlp 按响应 content-type 猜的，同一份清单可能存成 `.m3u8` / `.m3u` / `.txt`。
+体积先兜一刀（>256KB 直接当视频，不读头），因为清单只有几 KB。
+done 分支改成先校验产物：命中就报 `error`，文案说清「只下到播放列表，不是视频，
+多半是该站需要 Referer/Cookie 或清单加密」。
+
+**测试**：`test/host_hls_test.py` 新增 8 条（先红 3 条：函数不存在、done 分支没调用、
+文案缺失），覆盖 `#EXTM3U` 文本 / mp4 魔数 / 文件不存在 / 空路径 / 超阈值大文件。
+Python 9 套全通过，JS 625 项不受影响。
+
+**没做的**：`final_file` 为空（yt-dlp 没打 `FILE:`）时仍然直接判 done。
+那种情况拿不到产物路径，只能靠输出目录扫描，代价大于收益，先记着。
+
+**教训**：**「成功」要有产物证据。** 退出码、无 ERROR、进度到 100% 三样齐了
+仍然可能是假成功——用户要的是视频文件，判据就该落在文件本身。
+
+**涉及文件**：`native-host/downloader.py`（`looks_like_playlist` + done 分支）、
+`test/host_hls_test.py`。
+
+---
+
+## d-030 · 2026-10-22 · Telegram 序号与焦点全失效——Web K 换了消息号属性
+
+**问题**：登录态下真机复验 1.3.18 / 1.3.26，发现 Telegram 上**一条序号都编不出来**、
+打开相册查看器列表也不收窄。同一套编号代码在小红书详情页正常（24 条 `①…㉔` 连续）。
+
+**真机 dump（Chrome 156 + 当前 Web K，已登录）**：
+
+| 断言 | 实测 |
+|---|---|
+| `[data-message-id]` 元素 | **0** |
+| `[data-mid]` 元素 | **37**（`.bubble` 14 / `.album-item` 3 / `.grid-item.media-container` 20） |
+| `.text-content` / `.message-text` | **0 / 0** |
+| 抓到的 image/video 条目 | 17 条，`mid` 有值 **0 条**、`mark` 有值 **0 条** |
+| 打开相册后 `__msActiveSite().focus()` | `""` |
+
+**根因**：K 版把消息号从 `data-message-id` 换成了 `data-mid`，而 `mediaContext()`
+只读前者 → `mid` 恒空 → `numberShown` 认为「既没 mid 也没标题」整批 `continue`。
+焦点那两条路径（`tgFocus` / `tgFocusByMedia`）也依赖同一个属性，一起失效。
+
+**层级陷阱**：`data-mid` **每一层都有**，而且值不一样——同一条消息实测
+`.bubble` 是 `4294972868`，里面三个 `.album-item` 是 `…868 / …869 / …870`。
+按「最近的祖先」取会把一条消息拆成三条、每条只剩一张图；必须取**最外层**
+命中的那个。
+
+**一个必须纠正的误判**：我先以为分组键是 `kind + mid + ref`、所以补 `mid` 也
+会图文分池。读代码后确认 `gk` 是**标题优先**（`t:标题` → 才退回 `kind|mid|ref`），
+d-029 真机 `①→⑲` 连续正是因为那 19 条都有标题。所以「图文分池」只发生在
+**抓不到标题**的时候——而 Web K 改了正文类名后标题大面积抓不到（17 条里 14 条
+无标题），补 `mid` 后会重新踩进这个坑。**两件事必须一起改。**
+
+**修法（1.3.28，页面侧 + 后台侧 + 弹窗侧三处）**：
+
+1. `inject-main.js` 新增站点钩子 `msgBox(el)` / `msgId(box)`：Telegram 实现里
+   逐层往上读 `data-mid || data-message-id`，**最后一次命中的**才是消息容器。
+   通用层仍然只认 `data-message-id`，`data-mid` 一个字都没进通用逻辑
+   （避免误伤其他也用这个属性的站点）。
+2. `mediaContext` / `orderMediaInMessage` / `ordOfMedia` 三处统一走 `msgBoxOf()`。
+3. `background.js` 分组键顺序改为 **mid → 标题 → kind|ref**；
+   `popup.js` 的 `sameGroup` 同步（不然编号对了、排序会按体积乱掉）。
+
+**产品语义变更（有意，需记账）**：同上标题的多条消息**不再跨消息连号**，
+每条消息各自从 ① 起。理由：①一条消息就是一个内容单元；②焦点收窄是**按消息**
+过滤的，编号若按标题、焦点按消息，一收窄就错位。代价是用户会看到多组 ①②③。
+
+**测试**：先写红再改绿。`[TGK]` 新增 7 条（main-hook）+ 4 条（background），
+并按新语义改写 `group_key` 的 6 条旧断言（原断言写的是「跨消息连号」）。
+改前红 10 条，改后 **JS 625 项全绿 / Python 9 套全通过**。
+
+**真机**：调试实例里重载扩展（1.3.28）后，在真实页面构造 `.bubble[data-mid]`
++ 内层 `.album-item[data-mid]` 的结构，`__msActiveSite().msgBox/msgId` 返回
+`999001`（不是内层的 `999002`）、`__msOrderInMessage` 返回有效 ord。
+会话消息本身因网络拉不下来，**完整真机（真实消息的 ①②③ 与焦点收窄）待补**。
+
+**教训**：
+1. **「属性名换了」比「逻辑错了」更常见。** 两次「修过还不对」都是盯着算法，
+   实际是数据源换了（d-029 是 ord 语义、这条是属性名）。先 dump 页面结构，
+   再怀疑代码。
+2. **层级注解要取最外层。** 内层相册项带自己的 mid 是「这一格」的号，不是
+   「这条消息」的号。取最近一层会让所有计数从 0 重开——症状和 d-029 一模一样，
+   但根因完全不同。
+3. **改分组键必须三处同步**（background 两处 + popup 一处）。漏了 popup 就是
+   B6 的旧症状「⑪ 在最上面、下面才是 ①②③」。
+
+**涉及文件**：`extension/inject-main.js`（`msgBoxOf`/`msgIdOf`/`mediaContext`/
+`orderMediaInMessage`/`ordOfMedia`/telegram 站点对象）、`extension/background.js`
+（`renumberImages`/`numberShown` 的 `gk`）、`extension/popup.js`（`sameGroup`）、
+`test/main-hook.test.js`（`[TGK]`）、`test/background.test.js`（`[TGK]`）、
+`test/group_key.test.js`（G1/G1b/G4 改期望）。
+
+---
+
+## d-029 · 2026-10-21 · Telegram 序号「对不上」（第三次修）——两套计数流
+
+**问题**：用户 m15907 附截图：「总数差不多，但是序号完全对不上，这个问题已经修过两次了」。
+截图里消息 8848 的 13 条按「①图 ②视频 ③图 ④视频」交替编号。
+
+**我最初的误判**：以为 8848 / 8847 是两条消息被同一标题合并了。
+用户 m15935 纠正：「它们其实来自两条不同的消息，并不是，是一个消息」。
+→ **教训：用户描述的「对不上」先要落到具体一条消息上看，别拿附近的数字猜。**
+
+**真机事实**：消息 8848 一条消息里有 7 个 `<video>` + 若干 `<img>`。
+
+**根因（两套各自从 0 起的计数流）**：
+- 视频走 `ordOfMedia(el)`（`extension/inject-main.js:288`）：
+  `const tag = el.tagName === "AUDIO" ? "audio" : "video";` 然后 `[...box.querySelectorAll(tag)]`
+  —— **只跟同族 video 比**，所以 7 个视频拿到 ord 0..6。
+- 图片走 `scanImages()` 的 `byMsg` 列表下标 —— **只跟图片比**，拿到 ord 0..3。
+- background 的 `compareWithinGroup`（`extension/background.js:1042`）先按 mid 升序、
+  同 mid 再比 ord。两边 ord 撞车（视频 ord=1 和图片 ord=1 同时存在）时只能退回抓取时间 `t`，
+  而 `t` 是异步到达时刻 → **随机**，于是显示成 ①图②视频③图④视频 循环错号。
+
+**修法**：`ordOfMedia` 开头加一句，让视频也走「整条消息统一序」：
+
+```js
+const unified = orderMediaInMessage(el);
+if (unified >= 0) return unified;
+```
+
+`orderMediaInMessage` 是 d-019 给图片写的：上溯找带 `data-message-id` 的祖先，
+对 `video,audio,img` 统一按「同一行按 left、否则按 top、再退 DOM 序」排，返回下标。
+
+**真机复验**：消息 8848 视频 ord 变成 `0,2,4,10,12,14,16`、图片 `6,8,9,18`，
+不再从 0 重复计数；页面侧 `__msOrderInMessage` 对 19 个媒体返回 0..18 连续。
+
+**教训**：
+1. **两套计数器迟早会撞。** 同一实体（一条消息）下的不同类型的条目，必须有**一个**统一序号源；
+   各算各的，只要有展示层把它们并排显示，就一定会出现「交错错号」。
+2. 排序里一旦有「时间」这种异步量当兜底，错号就是**随机的**，每次都长得不一样——
+   这恰恰是「修过两次还不对」的原因：每次都在修别的分支。
+
+**涉及文件**：`extension/inject-main.js`（`ordOfMedia`）、`test/background.test.js`（`[TGORD]`）。
+
+---
+
+## d-028 · 2026-10-21 · 51cg1 / 4kvm「插件不起作用」——HLS 播放列表不是视频
+
+**问题**：用户 m16052：「检查插件为什么对 https://51cg1.com/archives/279033/ 和
+https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分网站做铺垫」。
+
+**51cg1 排查**：
+- state 里该 tab **只有 2 条 other，`diag` 是 null** → `diagBump` 从未被调用，
+  说明 **webRequest 一次都没触发**。
+- 页面实测：`videos:0, iframes:0`，HTML 里 **0 个 `.mp4` / `.m3u8`**。
+- 但找到 `<div class="dplayer" data-config="{...}">`，属性里挂着完整配置：
+  `{"video":{"url":"https://hls.weagdnz.cn/videos5/….m3u8?auth_key=…","type":"hls"}}`。
+- 容器内部只有 `<div class="dplayer-loading">播放器加载中...</div>` ——
+  **DPlayer + hls.js 根本没初始化成功**，浏览器从没请求过那个 m3u8，
+  所以 webRequest 什么都看不到。地址明明摆在 DOM 上，却没人去读。
+- 顺手 curl 那个 m3u8：200、39399 字节、`#EXT-X-KEY:METHOD=AES-128,URI="…/crypt.key"`（加密 HLS）。
+
+**4kvm 排查**：
+- 首页 66 条（image 56 / other 10），图片来自 `gimg0.baidu.com` 图床。
+  **首页本来就没视频**，不算 bug。
+- 详情页 `/play/ch4l5b3mn` 抓到 2 条 m3u8（`oss.douyinbit.com` 和备用域 `myoss.douyinbit.top`），
+  两条都 `page:0`、**无标题**、`s:29007`（=播放列表文本大小）。
+- **结论：扩展确实抓到了，但用户点「下载」拿到的是 29KB 文本，不是视频** ——
+  主观上就是「不起作用」。
+
+**HLS 链路验证（native-host 早就支持）**：
+- `native-host/downloader.py` 的 `use_ytdlp` 判据里 `".m3u8" in low` → 真机跑 `downloader.py`
+  下那个 m3u8，产物 **971 MB / h264 1920×1080 + aac / 53 分钟**。**链路是通的。**
+- 但状态里 `status:"done"` 却又写着 `ERROR: Postprocessing: Error opening output files: Permission denied`
+  —— yt-dlp 退出码 0，ffmpeg 重封装 mp4 失败却被报成 done。**假成功比失败更坑**。
+
+**修法（四层）**：
+1. `background.js` 新增 `isHlsUrl(u)`：只看 `new URL(u).pathname` 是不是 `.m3u8`，
+   **不看 query**（站方 `?url=xxx.m3u8` 那种跳转链接抓到的是跳转前地址，判成 HLS 反而误导）。
+2. `sniff:get` 里给这些条目打 `hint="hls"` —— **只打标记不改 `k`**，
+   下载分派仍靠 `k=video` 走 yt-dlp。
+3. `popup.js`：名字显示成「标题 · HLS 流（视频）」，副行写明
+   「HLS 流 · 分片清单」「点下载自动拼成完整视频」——用户才知道那 29KB 不是坏文件。
+4. `inject-main.js` 新增 dplayer 站点：读 `.dplayer[data-config]` 里的 `video.url`
+   （退回 `video_h265.url`），用 `data-video_title` 当标题直接上报，绕开没起来的播放器。
+
+**真机（51cg1）**：state 从「2 条 other」变成 **193 条**，视频第一条带标题
+「推特约啪博主 FENDSON 付费新作 短发伪白虎美女体育生」、`hint:"dplayer"`。
+
+**真机（4kvm）又踩一坑**：m3u8 条目抓到但没有标题，用户在列表里看到一条光秃秃的
+「HLS 流（视频）」，不知道是哪一集。补 artplayer 站点：页面侧读 `og:title`
+报一条 `hint:"hls"` 的「页面标题条目」，background 用 `applyHlsPageTitle()`
+把标题**借**给同 tab 真正的 m3u8 条目、再把页面条目删掉（它的 URL 是网页，下下来是 HTML）。
+
+**第二个坑：标题被砍过头。** `sitePageTitle` 第一版写「任何 1~10 字的尾巴都当站点名砍掉」，
+`挑情丑闻 - 第1集 -4k影视` 被砍成 `挑情丑闻`。改成「尾巴带 `第N集/第N话/EPn/SnEn` 就不砍」。
+
+**真机最终（4kvm）**：3 条 video → 2 条，标题都是「挑情丑闻 - 第1集」。
+
+**教训**：
+1. **「抓到了」和「能下」是两件事。** m3u8 是文本清单，抓到它不等于抓到视频；
+   展示层必须说清楚「这是清单，点下载会拼成完整视频」，否则用户永远觉得坏了。
+2. **webRequest 看不到的东西，DOM 里可能明明白白摆着。** 播放器起不来 = 零请求，
+   但 `data-config` / `og:title` 照样在。两条发现通路要都试。
+3. **退出码 0 不代表成功。** yt-dlp 把 ffmpeg 的失败吞进 stderr 还返回 0，
+   必须自己扫 `ERROR:` 才算数。
+
+**涉及文件**：`extension/background.js`（`isHlsUrl` / `applyHlsPageTitle`）、
+`extension/popup.js`（`isHlsItem` / `displayName` / `hideRecorder`）、
+`extension/inject-main.js`（dplayer / artplayer 站点）、
+`native-host/downloader.py`（去掉 `--merge-output-format mp4`、扫 stderr 判失败）。
+
+---
+
+## d-027 · 2026-10-21 · Telegram（以及所有 blob:）保存「全部失效」
+
+**问题**：用户报「Telegram 视频和图片下载全部失效」。
+
+**排查（先证明哪一段断了，别猜）**：
+
+真机上逐段实测，结论是**数据一直都能拿到，只是掉进了另一个目录**：
+
+| 路径 | 落点 | 结果 |
+|---|---|---|
+| `__msProbeTotal` 读 blob: | — | 72796（与 DOM 里 blob.size 一致）✅ |
+| `__msRangeDownload`（Native Host） | `D:/…/文件存放处/tg-probe.mp4` | 72796 字节 ✅ |
+| 宿主 `msfile_start/chunk/end` 手打一遍 | 同上 | 3 步全 `ok:true` ✅ |
+| 浮层「保存到本地」→ `doSaveBlob` → `<a download>` | `C:/Users/l/Downloads/test-tg.jfif` | 72796 字节 ⚠️ |
+
+- 宿主链路、blob 读取、探针全部正常，所以不是「下载器挂了」。
+- 走 `<a download>` 那条把文件丢进 **Chrome 默认下载目录**，扩展名还被 MIME 改写成 `.jfif`。用户在插件配的「文件存放处」里看不到任何东西 → 主观感受就是「下载全部失效」。
+- 顺带发现第二个坑：改走 Native Host 后文件名叫 `真机测试图.mp4`，但十六进制是 `ffd8ffe0`（JPEG）。根因是 `sniffExt` 只认音视频魔数、`guessExtFromType` 只认 `audio/*` `video/*`，两个都没命中就兜到写死的 `".mp4"`。
+
+**解决**：
+
+1. `extension/inject-main.js` 的 `runSave` 里，`blob:` 分支从 `doSaveBlob(key, name)` 改成 `startMediaDownload(it.key, it.name, {}, () => {})` —— 统一走 Range + Native Host，落到插件配置的目录、文件名由内容嗅探决定。
+2. `sniffExt` 补图片魔数（JPEG `ffd8ff` / PNG / GIF / WEBP / BMP）。
+3. `guessExtFromType` 补 `IMG_MIME_EXT` 表（jpeg/png/gif/webp/bmp/avif/svg/heic），并先按 `;` 切掉 charset。
+4. 两处 `|| ".mp4"` 兜底改成 `|| ""` —— 认不出来时宁可没扩展名，也别把 JPEG 存成 mp4。
+
+**验证**：
+
+- 真机（重载扩展 + 刷新 Telegram）：浮层显示 `完成 · D:\软件应用\DSH\文件存放处\真机复验图_99398.jpg（71.1 KB，1s）`，落盘 72796 字节，魔数 `ffd8ffe0` ✅
+- `test/site_registry.test.js` 新增 `[BLOB]` 7 项 + `[EXT]` 10 项，全套 89 项全绿。
+
+**教训**：
+
+- 「下载失败」要先分辨是**没下到**还是**下到了别处**。这次是后者，因为 `<a download>` 的文件去向完全不受扩展控制。
+- 在页面里下东西，只有两条路：`<a download>`（去浏览器下载目录，扩展管不着）和 Native Messaging（去插件配置的目录）。凡是用户要求「保存到我的目录」，就必须走后者。
+- 扩展名永远按**字节魔数**定，别信键名也别信调用方给的 MIME —— 兜底值写死成某个具体格式，一定会在别的格式上翻车。
+
+## d-026 · 2026-10-21 · B 站视频页图片只留封面
+
+**问题**：用户报 B 站视频页图片栏混进 banner / 活动图 / 推荐位封面。真机 `BV1Este6wExx` 的 state 里 33 条 `k:"image"`，只有 1 条是 `hint:"bili-cover"`。
+
+**排查**：
+
+- 页面侧 `isImageOnly` 实测**是生效的**：视频页 45 个 `<img>`，逐个调 `site.isImageOnly()`，通过数 **0**。所以 DOM 扫描这条通路没问题。
+- 那 33 条**全部来自 webRequest**（`chrome.webRequest.onHeadersReceived` → `record()`），根本不经过页面，页面侧钩子管不到。
+- 顺手发现第二个洞：`onScanImages` / `isImageOnly` 都用 `biliPlayinfo()`（有没有 `__playinfo__`）当「是不是视频页」。这个判据有两处会错：
+  1. `__playinfo__` 是首页 JS 异步写入的，首屏几百毫秒里是 `undefined` —— 这段时间页面被判成「非视频页」→ 全放行；
+  2. 番剧/课程页的播放清单根本不在 `__playinfo__`（在 `__INITIAL_STATE__.epInfo`）→ 这类页面**永远**判成非视频页，等于完全没有过滤。
+
+**试过但没采用**：往 `isSiteUiAsset` 里继续加 URL 黑名单（`/bfs/banner/`、`/bfs/face/`、`loading-blue.gif`…）。不行——素材路径随改版换，而且用户真正想要的封面和推荐位封面在同一个 `/bfs/archive/` 目录下，只能靠「是不是这一集的封面」区分，靠 URL 区分不出来。
+
+**解决方案**：
+
+1. `extension/inject-main.js` 新增 `biliIsVideoPage()`，**只看 URL**（同步可读、不会闪）：`/video/(BV…|av…)`、`/(bangumi|cheese)/play/(ep|ss)…`。`onScanImages` 和 `isImageOnly` 都改用它。
+2. `isImageOnly` 在「视频页但拿不到封面」时由 `return true`（放行）改成 `return false`（一张都不报）——放行的话 banner 会进 state，进去就清不掉了。
+3. `extension/background.js` 新增 `preferBiliCover(items, tabUrl)`，在 `sniff:get` 里接在 `dedupeImagesByIdentity` 之后：视频页只留 `hint === "bili-cover"` 的图片，视频/音频条目不受影响；非视频页原样返回。这同时覆盖了 webRequest 那条通路。
+
+**真机证据（1.3.24）**：
+
+| 页面 | 改前 | 改后 |
+|---|---|---|
+| `/video/BV1Este6wExx`（视频页） | `image: 33` | **`image: 1`**（就是 bili-cover） |
+| 首页 `/`（对照） | — | `image: 49`（**不被误筛**） |
+
+**教训**：
+
+- 一个站点可能有**两条互不相干**的发现通路（DOM 扫描 / webRequest），在一条上做过滤，另一条完全不受影响。修之前先问「这个条目是从哪条路进来的」。
+- 拿「异步写入的全局变量存不存在」当页面类型判据很脆：首屏会闪，SPA 会滞留。页面类型要看 **URL**，内容要看 **state**，两件事分开。
+- 过滤原则要一致：**宁可这一轮空，也不要把噪声放进 state**。进了 state 的条目，之后规则改严也清不掉（见 d-025）。
+
+**涉及文件**：`extension/inject-main.js`（`biliIsVideoPage`、站点对象 `onScanImages`/`isImageOnly`）、`extension/background.js`（`preferBiliCover` + `sniff:get` 接线）、`test/site_registry.test.js`（[B10] 10 项 + [B10b] 10 项）。
+
+---
+
+## d-025 · 2026-10-21 · Telegram 陈旧封面条目清不掉
+
+**问题**：1.3.21 已给 telegram 站点对象加了 `isDecorImg` 钩子，页面上下文调用确实返回 `true`，但列表里仍有 15 条 `media-preview--image` 封面。
+
+**排查**：
+
+- 在页面里对真实元素调 `site.isDecorImg(el, el.src)` → `true`，钩子本身没问题。
+- 直接读 background 的 state：`imgs: 26`，其中 `media-preview` 命中 **15** 条。
+- 关键：过滤只在**入口**（`scanImages` 的 `continue`）。Telegram 的封面是 `blob:` URL，页面每次刷新/重渲染都换一个地址 —— 新扫描挡掉的是**新地址**，而 state 里那批**旧地址**的条目没有人删，就一直留在列表里。
+
+**解决方案**：`extension/background.js` 新增 `pruneStaleImages(rec)`，在 `sniff:get` 取快照**之前**按当前规则重算一遍，返回清掉的条数（>0 就 `flushSoon`）。只动 `k === "image"`，清三类：
+
+1. 非白名单站点的 `hint` 含 `cover`；
+2. `TG_COVER_HINT = /media-preview--image|media-preview\b/i`（Telegram 左栏列表预览）；
+3. `TG_THUMB_HINT = /(?:^|\s)thumbnail(?:\s|$)/i` 且 URL 在 `web.telegram.org`（消息内封面）。
+
+视频/音频一律不碰——它们不参与这套判定，误删代价远大于收益。
+
+**真机证据（1.3.22）**：`image` 26 → **10**；`media-preview--image` 15 → **0**；`thumbnail` → **0**；剩 8 条 `full-media` 真照片。
+
+**教训**：
+
+- **过滤只在入口做是不够的。** 规则后来变严、或页面用一次性地址（`blob:`）时，已经进 state 的条目永远清不掉。需要一轮「按当前判定重算并清理」。
+- 第一版红测是**假绿**：用 150×150 的假条目测 `looksLikeIcon`，它本来就撞上「方形小图→图标」规则返回 `true`，压根没测到新逻辑。是从真机 DOM 拿到「video + img 同容器」「`.media-preview` 配 `.icon-play`」两个特征后重写测试，才是真红测。
+
+**涉及文件**：`extension/background.js`（`pruneStaleImages` + `sniff:get` 接线）、`test/site_registry.test.js`（[TGS] 7 项）。
+
+---
+
 ---
 
 ## 索引
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-036](#d-036) | 2026-10-22 | 点「取消」没作用：换个下载器接着下 | `main()` 只认 `done`，`cancelled` 照样掉进 yt-dlp；宿主的 `cancelled` 回执是乐观信号，不代表进程停了；顺带把取消延迟 70s→5s |
+| [d-035](#d-035) | 2026-10-22 | 一个分片断流打死整单 | `_hls_get` 的 3 次重试是紧接着的，救不了「抽风几秒」；加外层退避 1s→2s + 错误带上「第几片/重试几轮」 |
+| [d-034](#d-034) | 2026-10-22 | 51cg1 复验：能抓能下，界面文案骗人 | 抓取 109 条带标题、下载走 yt-dlp（分片 AES-128 加密，交回是对的）；「解析播放列表」粘在界面上源于合并式状态写盘 |
+| [d-033](#d-033) | 2026-10-22 | 「完成」但目录里没有视频（第二次） | 状态写盘 `os.replace` 与宿主 0.4s 轮询抢句柄 → WinError 5 从「写错误原因」那行抛出，真因丢失、状态停在旧的 done/100 |
+| [d-032](#d-032) | 2026-10-22 | 4kvm 下载不下来：PNG 壳分片 + 一次性地址 | 地址会过期（reload 重取）+ 分片是「112 字节 PNG 壳 + 真 TS」（按 0x47 周期剥壳）；防盗链方向是反的 |
+| [d-031](#d-031) | 2026-10-22 | HLS 只下到播放列表却报「完成」 | 判据落在产物文件头（`#EXTM3U`）而不是退出码：退出码 0 + 无 ERROR 仍可能是假的 |
+| [d-030](#d-030) | 2026-10-22 | Telegram 序号与焦点全失效 | Web K 把消息号换成 `data-mid` 且每层都有：取**最外层**，分组键改 mid 优先 |
+| [d-026](#d-026) | 2026-10-21 | B 站视频页图片只留封面 | 视频页判定改看 URL（`__playinfo__` 首屏为空、番剧页永远为空）；banner 全走 webRequest，得在 background 补一层 |
+| [d-025](#d-025) | 2026-10-21 | Telegram 陈旧封面条目清不掉 | 过滤只做在入口不够：blob 地址每轮换，旧条目只能靠 `pruneStaleImages` 按当前规则重算 |
+| [d-024](#d-024) | 2026-10-20 | 视频封面默认不当图片收 | 做成一张站点白名单表；小红书封面单独打 xhs-cover 才分得开 |
+| [d-023](#d-023) | 2026-10-20 | 真机复测：编号跨消息错位 + 焦点上报永久失效 | ord 语义是「消息内」的，加 mid 层；焦点补发；同组编号压过 kind |
 | [d-022](#d-022) | 2026-10-20 | 焦点收窄 + 编号对不上内容 | 编号挪到所有滤网之后；新增 focus() 钩子，Telegram 查看器只显示那条 |
 | [d-021](#d-021) | 2026-10-20 | Telegram 同标题不聚拢 / 编号断裂 / blob 不能预览 | 分组键从「消息 id」改成「标题」，排序判据同步；预览门槛放开 blob |
 | [d-020](#d-020) | 2026-10-20 | 只读审查报告落地：tabId=0 / 素材漏判 / SPA 迟到消息 | 先补 24 项红测再修，抓取诊断上浮到 popup |
@@ -38,6 +1149,274 @@
 | [d-003](#d-003) | 2026-10-18 | 改动不生效 / 页面没刷新 | 分三类文件各自的重载方式 |
 | [d-002](#d-002) | 2026-10-18 | 全量测试与 CI | 手机号编码、flaky 修复 |
 | [d-001](#d-001) | 2026-10-18 | 仓库初始化与上传 GitHub | ffmpeg 不进仓库，历史清理 |
+
+---
+
+<a id="d-024"></a>
+## #d-024 · 2026-10-20 · 视频封面默认不当图片收（改成一张站点白名单表）
+
+> 用户 m15108 原话：「改为默认情况下，不会获取视频封面作为一张图片，有需要再做
+> 特殊处理，代码里留有改动的余地。目前来看只获取 B 站、小红书视频封面当作一张图片」
+
+### 一、问题：封面确实是 image，但有两条不同的出路
+
+先在代码里确认了「封面被当图片」的两个位置，都是**有意写的**、不是漏判：
+
+| 位置 | 代码 | 为什么当初这么写 |
+|---|---|---|
+| 小红书视频帖 | `scanXhsNoteImages()` 读 `imageList`（视频帖只有一条 = 封面），`mime: "image/*"` | 封面占 ②、视频占 ①，用户能拿到视频预览图 |
+| B 站视频页 | `onScanImages` 直接 `post({mime:"image/*", hint:"bili-cover"})` | A2 需求：「B 站图片只取所点开视频的封面」 |
+
+所以不能简单删掉任何一处，得先有「默认 vs 例外」的层次。
+
+### 二、方案：白名单表 + 一个判据函数
+
+新增（放在图标判定区，这样测试能把它单独抽出来跑）：
+
+```js
+const VIDEO_COVER_SITES = ["bilibili.com", "xiaohongshu.com"];
+
+function coverAllowed(host) {
+  const h = "." + String(host || "").trim().toLowerCase().replace(/^\.+/, "") + ".";
+  if (h === "..") return false;
+  return VIDEO_COVER_SITES.some((site) => h.endsWith("." + site.toLowerCase() + "."));
+}
+```
+
+**左右都补 `.` 再 `endsWith`** 是关键：不这样的话 `fakebilibili.com` 和
+`bilibili.com.evil.net` 都会命中。子域（`www.` / `m.` / `space.`）自动跟随。
+
+「留有改动余地」就落在这张表上：加站点往数组里塞一个域名，去站点删一个，
+数组清空 = 全网都不收封面。
+
+### 三、过滤落点为什么不在 record()
+
+第一版想把判据塞进 `record()`，但那里拿到的 `d.tabUrl` 是请求发起时的地址；
+小红书是 SPA，从信息流点进帖子**不触发 main_frame**，`rec.url` 还停在上一页。
+`sniff:get` 里有一段专门为此做的修正（`chrome.tabs.get` 拿真实地址），
+所以过滤必须放到 `visible` 那一步：
+
+```js
+const curHost = hostOfUrl(tabUrl);
+const coverOK = coverAllowed(curHost);
+const visible = items.filter((it) => it.k !== "icon"
+  && !(!coverOK && String(it.hint || "").indexOf("cover") >= 0));
+```
+
+用 `indexOf("cover")` 而不是逐个枚举 hint：以后再加 `xxx-cover` 不用回来改这里。
+
+### 四、踩到的真问题：hint 分不开封面和正文图
+
+小红书视频帖的封面原来打的也是 `hint: "xhs-note"`——和正文图**一模一样**。
+只靠 hint 根本区分不出来，要么误删正文图，要么放过封面。
+
+改法：`scanXhsNoteImages()` 里按 `xhsNoteType() === "video"` 分开：
+
+```js
+const isVideoNote = xhsNoteType() === "video";
+const hint = isVideoNote ? "xhs-cover" : "xhs-note";
+```
+
+图文帖的正文图仍然是 `xhs-note`，不受影响。
+
+### 五、连带要改的三处（不改就会静默退化）
+
+`xhs-cover` 是新 hint，凡是「按 hint 认直读条目」的地方都要跟上，否则视频帖会被
+判成「没直读过」而退回全量噪声：
+
+1. `renumberImages` 的 `const real = ...`（决定要不要编号）
+2. `numberShown` 的同名判据
+3. `preferXhsNoteList` 的 `direct` 筛选 —— 这条最隐蔽，它一漏，
+   `preferXhsNoteList` 就认为「页面没报过」，把整份 `items` 原样返回。
+
+### 六、真机验证
+
+| 验证项 | 结果 |
+|---|---|
+| 后台真的换上新代码 | `chrome.runtime.getManifest().version === "1.3.20"` |
+| 白名单内容 | `["bilibili.com","xiaohongshu.com"]` |
+| 三站判定 | `xhs=true bili=true other=false` |
+| 过滤模拟（`example.com`） | `kept = ["xhs-note","none"]` ← 两条 cover 被滤 |
+| 过滤模拟（`xiaohongshu.com`） | `kept = ["bili-cover","xhs-cover","xhs-note","none"]` ← 全留 |
+| 图文帖不误伤（真实页面 6ad49c1c） | `counts={image:1}`，正文图正常 |
+
+### 七、教训
+
+1. **「默认」要写成一张能一眼看完的表**，而不是散在 if 里的若干特例。
+   用户要的就是「以后好改」，那变量名和注释就得承担这个职责。
+2. **同一个 hint 值不能同时表示两件事。** `xhs-note` 既当「正文图」又当「封面」，
+   一旦要区别对待就无解；先拆 hint 再谈过滤。
+3. **新增一个 hint 值，要回头搜它所有使用点。** 本次漏改 `preferXhsNoteList`
+   不会报错、测试也可能照绿，只是静默退回噪声——这类「不报错的退化」最难查。
+
+### 八、涉及文件
+
+- `extension/background.js` — `VIDEO_COVER_SITES` / `coverAllowed` / `hostOfUrl`；
+  `sniff:get` 的 `visible` 过滤；`renumberImages`、`numberShown`、`preferXhsNoteList` 三处 hint 判据
+- `extension/inject-main.js` — `scanXhsNoteImages()` 按 `note.type` 打 `xhs-cover`
+- `test/background.test.js` — `[COVER]` 7 项；顺带把纯逻辑切片终点从 `indexOf("---- 监听")`
+  改成「监听之前最后一次分节线」，否则切不到小红书规则块
+
+---
+
+<a id="d-023"></a>
+## #d-023 · 2026-10-20 · 真机复测：编号跨消息错位 + 查看器焦点上报一次丢掉永久失效
+
+> 用户 m14306 原话：「两个问题依旧存在，为什么不在真机上验证？」
+> 用户 m14493 原话：「两个都按上述方案改，等修」
+>
+> 这一条是**给 d-022 打补丁**：d-022 的自动化测试全绿、也提交了，但两件事在真机上
+> 依旧复现。教训见文末「教训 1」——只做到「自动化测试通过」就说完成，是要返工的。
+
+### 一、问题①「编号对不上内容」的真正根因：跨消息的 ord 互相干扰
+
+真机 dump（频道 ONE PIECE / General，标题「编号：#CC0385」）拿到的事实：
+
+| mid | 条目 | 关键字段 |
+|---|---|---|
+| 7497 | 1 张图 | `ord=0` |
+| 7498 | 5 图 + 7 视频 | `ord=0..9`；其中 1 条 `ref:"viewer"` 的 `ord` **也是 0** |
+| 7508 | 1 张图 | `ord=0` |
+
+`ord` 的语义是「**消息内部**的第几个」，每条消息都从 0 重新开始。而分组键对
+「有标题」的条目用 `"t:" + title`（跨消息合组，这是 d-021 按用户要求改的），
+于是三条消息的 `ord=0` 全撞在一起。组内排序原来只比 `ord`：
+
+```js
+const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+if (oa !== ob) return oa - ob;
+return (a.t || 0) - (b.t || 0);   // 平局只能退到抓取时间 = 随机
+```
+
+平局退到 `t`（异步到达的抓取时间），等于随机 → 真机看到 `①⑥②③④⑤` 这种跳号。
+
+**修法**：抽出 `compareWithinGroup(a, b)`，加一层 **mid 数值升序**：
+
+```js
+function compareWithinGroup(a, b) {
+  const ma = Number(a.mid), mb = Number(b.mid);
+  const aHasMid = (a.mid != null && a.mid !== "" && Number.isFinite(ma));
+  const bHasMid = (b.mid != null && b.mid !== "" && Number.isFinite(mb));
+  if (aHasMid && bHasMid && ma !== mb) return ma - mb;
+  if (aHasMid !== bHasMid) return aHasMid ? -1 : 1;
+  const oa = typeof a.ord === "number" && a.ord >= 0 ? a.ord : 1e6;
+  const ob = typeof b.ord === "number" && b.ord >= 0 ? b.ord : 1e6;
+  if (oa !== ob) return oa - ob;
+  return (a.t || 0) - (b.t || 0);
+}
+```
+
+`renumberImages` 与 `numberShown` 两处**原本各写了一份一模一样的 sort**，这次合并成一个函数，
+以后不会再改歪一处漏一处。无 mid 的条目（普通网站、小红书正文图）退回纯 ord，不受影响。
+
+### 二、问题①的最后一环：popup 先按 kind 切，把序号顺序打烂了
+
+background 已经按「mid 升序 → 组内 ord」编好 ①~⑳，但 popup 的 `visibleItems()` 第一行是：
+
+```js
+const order = ["video", "audio", "doc", "image", "font", "other", "seg"];
+if (ka !== kb) return ka - kb;    // ← 所有 video 提到所有 image 前面
+```
+
+真机实测拿到的 20 条是 `②④⑥⑧…（video 在前）+ ①③⑤⑦…（image 在后）`——
+典型的「编号和内容对不上」。**序号本来就是阅读顺序，kind 只能当兜底**，不能反过来压过它。
+
+修法：把「同组判定」提成 `sameGroup(a, b)`，同组且都编号时 **idx 直接压过 kind**：
+
+```js
+if (sameGroup(a, b) && (a.idx || 0) && (b.idx || 0)) return a.idx - b.idx;
+const ka = order.indexOf(a.k), kb = order.indexOf(b.k);
+if (ka !== kb) return ka - kb;
+```
+
+不同组之间仍然按 kind 分块（这条规则保留，测试锁了）。
+
+### 三、问题②「只看当前打开的那一条」：查看器 DOM 根本没有消息标识
+
+真机实测（Telegram Web A 版），`#MediaViewer` 打开后的上溯链：
+
+```
+.MediaViewerSlide--active → .MediaViewerSlides → DIALOG#MediaViewer
+  → div.opacity-transition → div.Transition → BODY
+```
+
+**全链没有任何 `data-message-id` / `data-peer-id` / `data-media-id`**；
+`.message.highlighted` / `.selected` 也是空的（TG 的「跳转到该消息」用滚动定位，不加类）。
+所以 d-022 里那两条「容器自己带消息号」「媒体元素往上找」在真机上**必然返回空**。
+
+唯一还能对上的是**媒体地址本身**：查看器里的
+`<video src="https://web.telegram.org/a/progressive/document4999508637404...">`
+与聊天里那条消息里的同一个地址（`blob:` 地址在同一页面里也是同一个字符串）。
+
+新增 `tgFocusByMedia()`（方案 B）：
+
+1. `document.querySelectorAll(".MediaViewerSlide--active")` 取**当前展示那一页**
+   （所有 slide 都渲染了，不挑 `--active` 会拿到邻张）；
+2. 取它的 `img/video` 的 `currentSrc || src`；
+3. 去 `[data-message-id] img, [data-message-id] video` 里找同地址的元素；
+4. 上溯 ≤22 层取 `data-message-id`。
+
+拿不到就返回 `""`（不收窄，显示全量）——**宁可多显示，也不猜一个错的**。
+
+### 四、问题②的隐蔽缺陷：一次上报丢掉 = 永久失效
+
+`reportFocus()` 原来只在**值变化**时发：
+
+```js
+if (id === lastFocus) return;
+lastFocus = id;
+post({ cmd: "focus", kind: id ? "mid" : "", id });
+```
+
+真机踩到的现象：查看器刚打开那一瞬间 `post` 发出去了，但 service worker 正在启动
+（或 tab 记录还没建），后台没收到；可 `lastFocus` 已经被设成 `"7498"`，
+之后每一轮都「没变化」直接 return —— **用户看到「明明打开了查看器，列表还是全量」，
+而且无论怎么等都不会自己好**。
+
+修法：加 `FOCUS_RESEND_MS = 5000`，没变化也每 5 秒补发一次，让后台最终一致。
+补发只是一条几十字节的消息，代价可以忽略。修完真机立刻从 186 条收窄到 20 条。
+
+### 五、真机验证结果（这是本轮唯一算数的证据）
+
+```
+{"tabId":54120535,"focus":{"kind":"mid","id":"7498"},
+ "total":20,"counts":{"video":10,"image":10}}
+```
+
+popup 实际渲染出的 20 行（`#list` 的 innerText）：
+
+```
+▣① ▣③ ▶② ▶④ ▣⑤ ▶⑥ ▣⑦ ▶⑧ ▣⑨ ▶⑩ ▣⑪ ▶⑫ ▣⑬ ▶⑭ ▣⑮ ▶⑯ ▣⑰ ▶⑱ ▣⑲ ▶⑳
+```
+
+按 idx 排后连续 ①→⑳ 无跳号，图片/视频按真实阅读顺序交错，全部是「消息 7498」。
+
+### 六、测试
+
+- `test/group_key.test.js` 新增 `[G1b]` 4 项（跨 mid 升序、编号连续、viewer/album 互不干扰、无 mid 仍按 ord）；
+- `[G4]` 新增 2 项（同组编号压过 kind、不同组仍按 kind）；
+- `test/focus_scope.test.js` 新增 6 项（tgFocusByMedia 存在、比对 currentSrc、tgFocus 兜底调用、只取 --active、FOCUS_RESEND_MS、按间隔补发）。
+- 结果：JS **504 → 517 项**全过（background 217 / detect 30 / main-hook 183 / pattern_sync 4 / popup_wiring 21 / range_parallel 14 / site_registry 39），Python **8/8**。
+
+### 七、教训
+
+1. **「自动化测试通过」不等于「做完了」。** d-022 全绿就提交，真机一测两个问题都在。
+   凡是用户能在界面上看见的行为，都必须真机点过再交（AGENTS.md 第 4 节七级状态表）。
+2. **测试断言写错了会假装通过。** 本轮 `[G1b]` 第一版按**数组原始顺序**取 mark，
+   而 `numberShown` 只原地写 `idx/mark`、不重排数组（重排是 popup 的事），
+   于是「编号连续」这条假绿、顺序那条真红。改成「按 idx 排一遍再断言」才对。
+3. **真机数据比推理可靠。** 「三个 ord=0 并列」是 dump 出来的事实，不是猜的；
+   也正因为 dump，才发现 viewer 那条和 album 的 ord 各自从 0 数、根本没法互相对齐。
+4. **一个「只在变化时发」的同步机制，必须有自愈路径。** 否则任何一次丢包都会变成永久故障。
+
+### 八、涉及文件
+
+- `extension/background.js` — 新增 `compareWithinGroup()`，`renumberImages` / `numberShown` 共用
+- `extension/inject-main.js` — 新增 `tgMediaKey()` / `tgFocusByMedia()`，`reportFocus()` 加周期性补发
+- `extension/popup.js` — `visibleItems()` 的「同组编号压过 kind」
+- `test/group_key.test.js` — `[G1b]` 4 项 + `[G4]` 2 项
+- `test/focus_scope.test.js` — `[F2]` 6 项
 
 ---
 
