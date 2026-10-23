@@ -1,0 +1,59 @@
+# 站点覆盖度审计清单
+#
+# 一行一个 URL，`#` 开头是注释，URL 后面可以跟一个 tag（只用于报告分组）。
+# 这份清单回答的是「扩展在多数网站上能不能跑」，不是「支持清单」。
+#
+# 已经测过的站（2026-10-23，docs/site-audit.md）不要重复加：
+#   抖音 / 快手 / B站 / 小红书 / 微博 / 知乎 / 今日头条 / 百度
+#   微信网页 / 淘宝 / 支付宝 / QQ / 美团 / 拼多多 / 京东 / 高德
+#   腾讯视频 / 爱奇艺 / 优酷 / 芒果TV / 红果短剧
+
+# ---------- 长视频：首页是海报墙，用来测「没有播放器时会不会误报」 ----------
+https://tv.sohu.com/            video
+https://www.1905.com/           video
+https://www.miguvideo.com/      video
+https://www.pptv.com/           video
+https://www.le.com/             video
+https://www.acfun.cn/           video
+
+# ---------- 直播：播放器是真 <video> 还是 MSE，一眼能看出 ----------
+https://www.douyu.com/          live
+https://www.huya.com/           live
+https://live.douyin.com/        live
+
+# ---------- 音乐：首页就有试听，测 audio 链 ----------
+https://music.163.com/          music
+https://y.qq.com/               music
+https://www.kugou.com/          music
+https://www.kuwo.cn/            music
+
+# ---------- 资讯：图片多、视频少，测噪声比 ----------
+https://news.sina.com.cn/       news
+https://news.163.com/           news
+https://news.qq.com/            news
+https://www.ifeng.com/          news
+https://www.thepaper.cn/        news
+https://36kr.com/               news
+
+# ---------- 社区 / 图文 ----------
+https://www.douban.com/         social
+https://tieba.baidu.com/        social
+https://bbs.hupu.com/           social
+https://www.jianshu.com/        social
+https://juejin.cn/              social
+https://www.csdn.net/           social
+
+# ---------- 电商 / 生活：商品图海，测「真实内容 vs 噪声」 ----------
+https://www.suning.com/         shop
+https://www.vip.com/            shop
+https://www.goofish.com/        shop
+https://www.mafengwo.cn/        shop
+https://www.dianping.com/       shop
+
+# ---------- 图片站：图应该全部认出来，一张都不该丢 ----------
+https://huaban.com/             image
+https://www.zcool.com.cn/       image
+
+# ---------- 文档 / 工具：基本没有媒体，测「空列表是否干净」 ----------
+https://www.yuque.com/          tool
+https://www.wps.cn/             tool
