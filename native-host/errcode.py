@@ -41,6 +41,7 @@
 import email.utils
 import errno
 import http.client
+import re
 import socket
 import time
 import urllib.error
@@ -52,6 +53,12 @@ RETRY_AFTER_MIN = 1.0
 RETRY_AFTER_MAX = 30.0
 
 INTERNAL = "INTERNAL"
+
+# 「地址其实是 HLS 清单，却按普通文件下下来了」这个场景两条路径都会遇到
+# （直连 / yt-dlp）。文案只留一份：同一原因在三条路径上必须说同一句话，
+# 各写一份就是等着以后漂成两种说法（T-B5 的判据就靠它）。
+DETAIL_PLAYLIST = "拿到的是 #EXTM3U 播放列表，不是视频"
+ACT_PLAYLIST = "用扩展列表里的「下载」按钮，它会按分片拼。"
 
 # 码表。`say` 是一句原因，`act` 是一句该干什么 —— 两者都不许超过一行，
 # 因为 popup 的下载记录只显示一行（background.js 里截 80 字）。
@@ -187,6 +194,100 @@ def classify_exc(exc):
             return "DISK_FULL"
         return INTERNAL
     return INTERNAL
+
+
+# yt-dlp 的失败只有英文输出，没有状态码（它自己已经重试过 10 次）。
+# 这张表是「把它的输出翻译回码表」的**唯一**入口：顺序即优先级，
+# 越靠前越具体 —— 抓错顺序会让「登录失败」被后面的 "not found" 抢走。
+_YT_RULES = [
+    (re.compile(r"digital rights management|\bwidevine\b|\bplayready\b|\bdrm\b", re.I),
+     "DRM_PROTECTED"),
+    (re.compile(r"http error 429|too many requests", re.I), "HTTP_429"),
+    (re.compile(r"http error 401", re.I), "AUTH_REQUIRED"),
+    (re.compile(r"http error 403|forbidden", re.I), "HTTP_403"),
+    (re.compile(r"http error 404|http error 410|: not found", re.I), "HTTP_404"),
+    # 5xx 不折成一个码：原样留住数字，才知道是谁的锅（与 classify_http 一致）
+    (re.compile(r"http error (5\d\d)", re.I), "_5XX"),
+    # 比 HTTP 码靠后：403 是站点给的**事实**，登录是它的解释；
+    # 事实优先，解释只在没有事实时使用。
+    (re.compile(r"sign in to confirm|log ?in required|please log ?in|members[- ]only|"
+                r"private video|this video is private|"
+                r"only available for (registered|premium)|需要登录|请先登录", re.I),
+     "AUTH_REQUIRED"),
+    (re.compile(r"token (has )?expired|signature (has )?expired|"
+                r"url (has )?expired|expired url", re.I), "TOKEN_EXPIRED"),
+    (re.compile(r"unsupported codec|no decoder|codec not supported|unknown encoder", re.I),
+     "CODEC_UNSUPPORTED"),
+    # 本机实测过的那一条：ffmpeg 重封装时 Permission denied（下载目录被安全软件挡）
+    (re.compile(r"no space left|disk quota|permission denied|errno 28", re.I), "DISK_FULL"),
+    (re.compile(r"timed out|timeout|connection reset|connection aborted|incompleteread", re.I),
+     "NET_TIMEOUT"),
+    (re.compile(r"getaddrinfo failed|name or service not known|nodename nor servname|"
+                r"temporary failure in name resolution|connection refused|"
+                r"tunnel connection failed", re.I), "NET_DNS"),
+]
+
+
+def classify_ytdlp(text):
+    """yt-dlp 的 stdout/stderr 尾巴 → 码。
+
+    为什么必须翻译：yt-dlp 的报错是英文、还带着自己的重试记录，直接贴给用户
+    等于把 d-054 之前的状态还回去（用户看到 `HTTP Error 403: Forbidden`）。
+
+    只认**已知**的几种说法；都不认就返回 `INTERNAL` —— 它在这里的语义和异常
+    分类器一致：「我们漏了一种说法」。调用方拿到 INTERNAL 时必须把原文带上，
+    否则诊断信息就断了。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return INTERNAL
+    for rx, code in _YT_RULES:
+        m = rx.search(s)
+        if not m:
+            continue
+        if code == "_5XX":
+            return "HTTP_%s" % m.group(1)
+        return code
+    return INTERNAL
+
+
+# 三条路径各报一个码时，对外只留一个。顺序 = 「越能说明用户下一步做什么」越靠前。
+# 例：DRM 保护比 403 更具体（403 可以刷新页面重来，DRM 永远放不了）；
+# INTERNAL 永远垫底 —— 它是「我们没认出」，不该盖住别人给出的真原因。
+_PRIORITY = [
+    "DRM_PROTECTED", "AUTH_REQUIRED", "CODEC_UNSUPPORTED", "TOKEN_EXPIRED",
+    "HTTP_403", "HTTP_404", "SEGMENT_GAP", "DISK_FULL", "VERIFY_MISMATCH",
+    "HTTP_429", "NET_TIMEOUT", "NET_DNS", INTERNAL,
+]
+
+
+def _rank(code):
+    try:
+        return _PRIORITY.index(code)
+    except ValueError:
+        # 表外 HTTP_5xx：瞬时抖动，说明不了用户该做什么，排在中段偏后
+        if isinstance(code, str) and code.startswith("HTTP_5"):
+            return len(_PRIORITY) - 2
+        return len(_PRIORITY) - 1
+
+
+def consensus(codes):
+    """三条路径各自的失败码 → 对外的一个码。
+
+    **一致就直接用**：同一条原因在三条路径上撞了三次，这是最强证据，
+    不需要再挑。不一致时才按 `_PRIORITY` 挑最具体的那一个 ——
+    分散的码说明每条路被挡在不同地方，而用户只该看到一个下一步。
+    """
+    got = [c for c in codes if c]
+    if not got:
+        return INTERNAL
+    if all(c == got[0] for c in got):
+        return got[0]
+    best = got[0]
+    for c in got[1:]:
+        if _rank(c) < _rank(best):
+            best = c
+    return best
 
 
 def parse_retry_after(value, now=None):

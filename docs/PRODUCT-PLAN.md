@@ -162,7 +162,9 @@ DRM_PROTECTED  AUTH_REQUIRED  DISK_FULL  VERIFY_MISMATCH
 
 **验收**：13 个码每个至少一条测试路径；人为制造 3 种失败（断网 / 删一个分片 / 塞 DRM 清单），popup 显示对应建议。
 已做部分：HTTP 路径全部接线（429 重试、403 不重试、5xx 重试、Retry-After 夹取），
-HLS / yt-dlp 两条路径的接线留给 T-B5（P3'）。
+HLS / yt-dlp 两条路径 1.3.49 已接完（T-B5 / P3'）：
+「同一个原因 → 同一个码 → 同一句话」，三条路的话**逐字相同**；
+三条都失败时对外只留最具体的那一个码一句话，三句原话进 `trail` 给诊断包。
 
 ---
 

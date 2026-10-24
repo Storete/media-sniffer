@@ -111,10 +111,13 @@ json.dump(job(id="both4", url="https://example.invalid/live/index.m3u8"), open(p
 sys.argv = ["downloader.py", path4]
 D.main()
 st4 = json.load(open(os.path.join(TMP, "both4.json"), encoding="utf-8"))
-check("双失败时两条原因都保留",
-      st4.get("status") == "error" and "yt-dlp" in st4.get("message", "") and "直连" in st4.get("message", ""), st4)
-check("三路全失败时自实现 HLS 的原因也保留（不然用户只看到 yt-dlp 的 404）",
-      "自实现 HLS" in st4.get("message", ""), st4)
+# 1.3.49（T-B5）改了这里的口径：message 只留**一句**人话，三路原话进 trail。
+# 旧断言钉的是「把三句拼进 message」——那正是这一刀要去掉的行为
+# （用户拿到 200 字的串，比只告诉他一个原因更没用）。
+check("多路失败时对外只有一句人话（不再把三句拼进 message）",
+      st4.get("status") == "error" and "／" not in st4.get("message", ""), st4)
+check("三条路径各自的原话进 trail（诊断用，用户不看见）",
+      all(k in st4.get("trail", "") for k in ("自实现HLS", "yt-dlp", "直连")), st4)
 
 print("RESULT: " + ("ALL PASS" if all(results) else "FAILED %d" % results.count(False)))
 sys.exit(0 if all(results) else 1)

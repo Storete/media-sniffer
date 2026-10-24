@@ -578,7 +578,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
                 write_status(job_id, status="cancelled", err="", message="用户取消")
                 return
     except Exception as e:
-        write_status(job_id, status="error", message=("读取下载输出失败: " + str(e))[:300])
+        _give_up(job_id, errcode.INTERNAL, ("读取 yt-dlp 输出失败: " + str(e))[:60])
         return
 
     proc.wait()
@@ -595,16 +595,22 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         # 文件存了下来（退出码 0、无 ERROR）。见 looks_like_playlist 的说明。
         if looks_like_playlist(final_file):
             cleanup_ytdlp_junk(outdir, base)
-            write_status(
-                job_id,
-                status="error",
-                message="只下到播放列表（#EXTM3U），不是视频。"
-                        "yt-dlp 没把这条地址当成 HLS 流，多半是该站需要 Referer/Cookie，"
-                        "或清单本身加密。",
-            )
+            # 与直连路径**同一个码、同一句话**：用户不该因为在哪条路上撞到
+            # 「把清单当文件下」而看到两种解释（T-B5）。
+            _give_up(job_id, "VERIFY_MISMATCH",
+                     errcode.DETAIL_PLAYLIST, act=errcode.ACT_PLAYLIST)
+        elif not final_file or not os.path.exists(final_file):
+            # 第四种假成功：退出码 0、没有 FILE: 行、目录里也没有真视频。
+            # 原代码在这里直接写 done + file=""，用户看到「完成」但什么都没有。
+            product = find_done_product(outdir, base)
+            if product:
+                write_status(job_id, status="done", percent=100, speed="", eta="",
+                             err="", file=product, message="")
+            else:
+                _give_up(job_id, "VERIFY_MISMATCH", "yt-dlp 说完成了，但目录里找不到视频文件")
         else:
-            write_status(job_id, status="done", percent=100, speed="", eta="", file=final_file,
-                         message="")
+            write_status(job_id, status="done", percent=100, speed="", eta="",
+                         err="", file=final_file, message="")
     else:
         # 尾部有 ERROR 行**不等于**失败（真机 2026-10-22 51cg1 第三次下载）：
         # yt-dlp 退出码 0、170MB 的真 mp4 已经下好，却打了一行内容为空的
@@ -614,11 +620,16 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         product = find_done_product(outdir, base)
         if proc.returncode == 0 and product:
             write_status(job_id, status="done", percent=100, speed="", eta="",
-                         file=product, message="")
+                         err="", file=product, message="")
             return
-        msg = post_err or (" | ".join(tail[-6:]) or ("yt-dlp 退出码 %s" % proc.returncode))
+        # 失败：把 yt-dlp 的英文输出翻成码表里的一个码。
+        # 看的是整段尾巴而不是那一行 ERROR —— 真机上「原因」常常在上一行，
+        # ERROR 行本身可能只有一句空的 `ERROR:`。
+        code = errcode.classify_ytdlp("\n".join(tail[-12:]))
         cleanup_ytdlp_junk(outdir, base)
-        write_status(job_id, status="error", message=msg[:600])
+        # 认不出来的说法才贴原文（诊断要靠它）；认得出的已经有中文本事了。
+        detail = str(post_err or " ".join(tail[-4:]))[:70] if code == errcode.INTERNAL else ""
+        _give_up(job_id, code, detail)
 
 
 def _origin(tab_url):
@@ -963,9 +974,7 @@ def run_urllib(job):
                 # 但**建议不一样**：这不是「再点一次会好」，重试一百次还是清单，
                 # 得换一条走分片下载的路径。所以这里覆盖 act，码不变。
                 _give_up(job_id, "VERIFY_MISMATCH",
-                         "拿到的是 #EXTM3U 播放列表，不是视频；这条地址是 HLS 清单，"
-                         "得按分片下载",
-                         act="用扩展列表里的「下载」按钮，它会按分片拼。")
+                         errcode.DETAIL_PLAYLIST, act=errcode.ACT_PLAYLIST)
                 return
             write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
                          err="", message="")
@@ -984,10 +993,10 @@ def run_urllib(job):
                     write_status(job_id, status="cancelled", err="", message="用户取消")
                     return
                 continue          # 回到顶部：`resumed` 还在，所以续传语义不受影响
-            detail = "HTTP %d" % e.code
-            if why:
-                detail = "%s，%s" % (detail, why)
-            _give_up(job_id, code, detail)
+            # detail 只在**有额外事实**时才写：码自己的话里已经带了状态码，
+            # 再拼一句「HTTP 403」就是「站点拒绝了这个请求（403）（HTTP 403）」。
+            # 这不是美观问题：三条路径要给同一句话（T-B5），谁多写一句就不一致了。
+            _give_up(job_id, code, why)
             return
         except Exception as e:
             code = errcode.classify_exc(e)
@@ -1254,9 +1263,17 @@ def run_hls_self(job, quiet=False):
         if name_k not in headers:
             headers[name_k] = hv
 
-    def bail(msg, take_over=True):
-        if take_over or not quiet:
-            write_status(job_id, status="error", message=_short(msg, 300))
+    def bail(code, detail="", act="", take_over=True):
+        """写失败码 + 一句人话。
+
+        `take_over=False` 表示「这单不该由我下」（AES / BYTERANGE），
+        它**不是失败**，只是换一条路 —— 所以不写错误码。quiet 时连状态都不写，
+        免得把下一条路（yt-dlp）的报错冲掉。
+        """
+        if take_over:
+            _give_up(job_id, code, detail, act)
+        elif not quiet:
+            write_status(job_id, status="error", err="", message=_short(detail, 300))
         return take_over
 
     # 阶段提示：拉清单 + 解析分片期间界面本来什么都没有（真机 51cg1 现场
@@ -1266,29 +1283,35 @@ def run_hls_self(job, quiet=False):
     try:
         text = _hls_get(job["url"], headers).decode("utf-8-sig", "replace")
     except urllib.error.HTTPError as e:
-        return bail("拉取播放列表失败：HTTP %d %s（该站地址有时效，请刷新页面后重试）"
-                    % (e.code, e.reason))
+        return bail(errcode.classify_http(e.code, getattr(e, "headers", None)))
     except Exception as e:
-        return bail("拉取播放列表失败：%s" % e)
+        code = errcode.classify_exc(e)
+        return bail(code, str(e)[:60] if code == errcode.INTERNAL else "")
 
     base = job["url"]
     info = parse_hls_playlist(text, base)
     if info["kind"] == "master":
         if not info["child"]:
-            return bail("多码率清单里没找到子清单")
+            return bail("VERIFY_MISMATCH", "多码率清单里没有子清单")
         base = info["child"]
         try:
             text = _hls_get(base, headers).decode("utf-8-sig", "replace")
+        except urllib.error.HTTPError as e:
+            return bail(errcode.classify_http(e.code, getattr(e, "headers", None)))
         except Exception as e:
-            return bail("拉取子清单失败：%s" % e)
+            code = errcode.classify_exc(e)
+            return bail(code, str(e)[:60] if code == errcode.INTERNAL else "")
         info = parse_hls_playlist(text, base)
 
     if info["encrypted"] or info["byterange"]:
         # 这两种 yt-dlp 处理得比我们好（它能拉密钥、能按 BYTERANGE 取片），
         # 不该抢过来 —— 抢过来只会把「能下」变成「不能下」。
-        return bail("AES 加密 / BYTERANGE 清单，交回 yt-dlp 处理", take_over=False)
+        return bail("", "AES 加密 / BYTERANGE 清单，交回 yt-dlp 处理", take_over=False)
     if not info["segments"]:
-        return bail("清单里没有分片（可能是空清单或地址已失效）")
+        # 空清单的两种可能（地址过期 / 这条流本身没有分片）用户要做的事完全一样：
+        # 先刷新页面重抓一次；还这样就是后者。所以建议写全，别让他反复试。
+        return bail("VERIFY_MISMATCH", "清单里一个分片都没有",
+                    act="刷新页面重新抓一条地址；还这样就是这条流本身没有分片。")
 
     name = sanitize(job.get("filename") or "", "video")
     root, _ext = os.path.splitext(name)
@@ -1328,8 +1351,10 @@ def run_hls_self(job, quiet=False):
         except Exception as e:
             first_err = e
     if first_data is None:
-        return bail("下载分片失败（0/%d 已下）：%s。该站地址有时效，刷新页面后重试"
-                    % (total, first_err))
+        # 四档请求头都试过还取不到第一片 —— 原因就是那个异常本身
+        # （403：地址/防盗链；超时：网络）。不再自己编一句「地址有时效」。
+        code = errcode.classify_exc(first_err)
+        return bail(code, str(first_err)[:60] if code == errcode.INTERNAL else "")
     phase.done()   # 探测结束，后面就由逐片进度接管
 
     # 滑动窗口：线程池负责下载，主线程严格按 index 顺序取结果写盘。
@@ -1397,25 +1422,30 @@ def run_hls_self(job, quiet=False):
             os.remove(part)
         except OSError:
             pass
-        write_status(job_id, status="cancelled", percent=0, message="用户取消")
+        write_status(job_id, status="cancelled", err="", percent=0, message="用户取消")
         return True
     except _SegmentFailed as e:
         try:
             os.remove(part)
         except OSError:
             pass
-        return bail("下载分片失败（%d/%d 已下）：第 %d 片重试 %d 轮仍失败：%s"
-                    "。网络抖一下不会这样，多半是这一片在服务端有问题，"
-                    "刷新页面换个地址重试" % (done_segs, total, e.idx + 1, SEG_ATTEMPTS, e.err))
+        # 归 SEGMENT_GAP 而不是 VERIFY_MISMATCH：产物一个字节都不完整，
+        # 不是「文件内容不对」而是「有一段一直取不到」。事实（第几片、重试几轮、
+        # 已下多少）全部进 detail，不再写成一段需要读三遍的长句。
+        return bail("SEGMENT_GAP",
+                    "第 %d 片重试 %d 轮仍失败，已下 %d/%d"
+                    % (e.idx + 1, SEG_ATTEMPTS, done_segs, total))
     except Exception as e:
         try:
             os.remove(part)
         except OSError:
             pass
-        return bail("下载分片失败（%d/%d 已下）：%s" % (done_segs, total, e))
+        code = errcode.classify_exc(e)
+        return bail(code, "已下 %d/%d，%s" % (done_segs, total, str(e)[:50])
+                    if code == errcode.INTERNAL else "已下 %d/%d" % (done_segs, total))
 
     if os.path.getsize(ts_path) <= 0:
-        return bail("拼出来的文件是空的")
+        return bail("VERIFY_MISMATCH", "拼出来的文件是 0 字节")
 
     # 转封装成 mp4：-c copy 不重编码，几秒到几十秒。失败不算失败 ——
     # TS 本身就是完整可播的视频（mpv/VLC/PotPlayer 都能放），删掉才是真的白干。
@@ -1467,14 +1497,14 @@ def run_hls_self(job, quiet=False):
                 except OSError:
                     pass
                 write_status(job_id, status="done", percent=100, speed="", eta="",
-                             file=out_mp4, message="已拼成完整视频")
+                             err="", file=out_mp4, message="已拼成完整视频")
                 return True
 
     msg = "已拼成完整视频（TS 容器，播放器能直接放）"
     if remux_err:
         msg += "；转 mp4 失败：" + remux_err
     write_status(job_id, status="done", percent=100, speed="", eta="",
-                 file=ts_path, message=msg)
+                 err="", file=ts_path, message=msg)
     return True
 
 
@@ -1714,6 +1744,7 @@ def main():
             # 字节），所以先自己试没有副作用；搞不定（AES 加密 / BYTERANGE / 拉不
             # 到清单）再由 yt-dlp 接手。
             hls_msg = ""
+            hls_code = ""
             if looks_like_hls_url(url):
                 if run_hls_self(job, quiet=True):
                     st_h = read_status(job_id)
@@ -1723,6 +1754,7 @@ def main():
                     if st_h.get("status") in ("done", "cancelled"):
                         return
                     hls_msg = st_h.get("message") or ""
+                    hls_code = st_h.get("err") or ""
 
             run_ytdlp(job, ytdlp, ffmpeg)
             # yt-dlp 失败时给一次普通 HTTP 下载的机会：很多「302/403」只是 yt-dlp
@@ -1730,19 +1762,34 @@ def main():
             st = read_status(job_id)
             if st.get("status") == "error":
                 ytdlp_msg = st.get("message") or ""
+                ytdlp_code = st.get("err") or ""
                 run_urllib(job)
                 st2 = read_status(job_id)
                 if st2.get("status") == "error":
-                    parts = []
-                    if hls_msg:
-                        parts.append("自实现 HLS: " + hls_msg)
-                    parts.append("yt-dlp: " + ytdlp_msg)
-                    parts.append("直连: " + (st2.get("message") or ""))
-                    write_status(job_id, status="error", message=_short(" ／ ".join(parts)))
+                    # 三条路都失败：对外只留**一个**码、一句话。
+                    #
+                    # 原来是把三句报错拼成「自实现 HLS: … ／ yt-dlp: … ／ 直连: …」，
+                    # 那是写给作者看的，用户拿到一条 200 字的串，还是不知道该干什么。
+                    # 现在 code 用 consensus 挑（三条一致就用它，否则挑最具体的一个），
+                    # 各自的原话留在 trail 里给诊断包用 —— 人看一句，机器看三条。
+                    codes = [hls_code, ytdlp_code, st2.get("err") or ""]
+                    code = errcode.consensus(codes)
+                    trail = []
+                    for label, c, m in (("自实现HLS", hls_code, hls_msg),
+                                        ("yt-dlp", ytdlp_code, ytdlp_msg),
+                                        ("直连", st2.get("err") or "", st2.get("message") or "")):
+                        if c or m:
+                            # 有码记码；没码（老调用点 / 测试里的假实现）就记那句话。
+                            # 只记「无码」等于把三条路的诊断信息一起丢掉 ——
+                            # trail 存在的唯一理由就是「以后能查出是谁的锅」。
+                            trail.append("%s=%s" % (label, c or _short(m, 40)))
+                    write_status(job_id, status="error", err=code,
+                                 message=errcode.describe(code),
+                                 trail=" ／ ".join(trail))
         else:
             run_urllib(job)
     except Exception as e:
-        write_status(job_id, status="error", message=("下载进程异常: " + str(e))[:400])
+        _give_up(job_id, errcode.INTERNAL, ("下载进程异常: " + str(e))[:60])
 
 if __name__ == "__main__":
     main()

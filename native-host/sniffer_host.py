@@ -493,7 +493,7 @@ def poll_job(job_id):
     while time.time() < deadline:
         st = read_status(job_id)
         if st:
-            snapshot = {k: st.get(k) for k in ("status", "percent", "speed", "eta", "file", "message")}
+            snapshot = {k: st.get(k) for k in ("status", "percent", "speed", "eta", "file", "message", "err")}
             if snapshot != last:
                 last = snapshot
                 send({
@@ -505,6 +505,9 @@ def poll_job(job_id):
                     "eta": st.get("eta") or "",
                     "file": st.get("file") or "",
                     "message": st.get("message") or "",
+                    # 错误码也要跟着走：popup 的「为什么失败」一行靠它分类，
+                    # 只传 message 的话扩展侧只能拿中文句子做正则（d-054 之前那样）。
+                    "err": st.get("err") or "",
                     # 页面桥靠 inProgress 判断「这条 id 还会有后续消息」；
                     # 不带的话第一条 progress 就会把映射拆掉，后面全断
                     "inProgress": True,
@@ -522,7 +525,13 @@ def poll_job(job_id):
                     except OSError:
                         sz = 0
                 send({"id": job_id, "action": st.get("status"), "status": st.get("status"),
-                      "file": f, "size": sz, "message": st.get("message") or ""})
+                      "file": f, "size": sz, "message": st.get("message") or "",
+                      # **这条漏过一次**：download（downloader.py）早就把 err 写进状态
+                      # 文件了，扩展侧也早就开始读 msg.err（background 里 code 字段），
+                      # 中间的宿主却不转发 —— 于是 UI 上永远没有错误码，两边都以为
+                      # 对方没实现。字段穿过的每一跳都要有测试钉住。
+                      "err": st.get("err") or "",
+                      "trail": st.get("trail") or ""})
                 return
         time.sleep(0.4)
     send({"id": job_id, "action": "error", "status": "error", "message": "任务超时"})
