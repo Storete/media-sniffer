@@ -10,6 +10,45 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-079 · 2026-10-24 · T-F5/F6/F7：AI 分析管道全通、白名单动作、extractor 插件机制实证
+
+### 一口气三刀（用户「全做」），大脑路线从架构图变成可运行的管道
+
+**T-F5 失败 AI 分析（管道全通）**：`native-host/brain.py` 是唯一真源——
+build_prompt（case 全字段 + 全量词表进 prompt）、parse_analysis（JSON 提取 +
+**受控词表校验**：词表外策略显性 ok=False 暴露，不悄悄给可能错的建议）、
+analyze（OpenAI 兼容端点，urllib 纯标准库，**任何失败返回 {ok:False} 不抛**
+——分析挂了不能影响下载主流程）。接线：宿主 HANDLERS["ai-analyze"] →
+background ai:analyze（30s 兜底 + native 响应转回）→ popup「AI」按钮
+（对最近一条失败分析）。history 条目补 jobId/url（AI 的定位键）。
+评测对接 `tools/llm_brain.py`：corpus_eval --brain 直接考 LLM。
+测试 host_brain_test **19 项**（fake OpenAI 端点零外网：Bearer 头/model/
+500 不抛/词表校验全覆盖）。
+
+**T-F6 白名单动作（核心就绪）**：brain.py ACTIONS 5 动作
+（retry-with-headers/switch-chain/page-parse/page-save/give-up）——每个的
+执行器在宿主/扩展里**早已存在**；propose_actions 受控映射
+（LLM 不能发明动作；分析不 ok → 空动作）。循环执行器待 LLM 实测后接。
+
+**T-F7 extractor 插件机制（实证通过）**：`yt_dlp_plugins/extractor/` +
+PYTHONPATH → 手写最小 extractor（自定义 URL scheme + 直出 formats）→
+yt-dlp 自动加载、提取成功。**「LLM 写插件 → 注册 → 生效」的机制全链可行**，
+两个坑记下：插件用绝对导入（`from yt_dlp.extractor.common import`），
+相对导入不可用。LLM 生成环节依赖 F5 评测调通，暂缺。
+
+### 边界如实
+
+- 评测集的**真实 LLM 准确率报告**还没跑：需要用户配置 MS_AI_ENDPOINT/KEY/MODEL
+  （三个环境变量）→ `corpus_eval --brain tools/llm_brain.py`；
+- popup 的 AI 配置 UI 未做（打磨期 storage.local.aiConfig 手动配置，
+  {endpoint, key, model}）；
+- F2 语料上量（详情页展开/千级）工具未动——F5/F6 是关键路径优先。
+
+### 数字
+
+新增 native-host/brain.py、tools/llm_brain.py、host_brain_test **19 项**；
+background/popup 各一处接线；ytdlp_api 清一处占位。JS 1153 项不变。
+
 ## d-078 · 2026-10-24 · T-F4 yt-dlp 器官化：从 CLI 黑盒到进程内的库
 
 ### 起点：d-075 的架构结论落地
@@ -3352,6 +3391,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-079](#d-079) | 2026-10-24 | T-F5/F6/F7：AI 分析管道 + 白名单动作 + 插件机制 | brain.py 唯一真源（prompt/解析/词表校验/analyze 不抛）+ 宿主 handler + popup AI 按钮 + llm_brain 评测对接（19 项测试，fake endpoint 零外网）；F6 ACTIONS 白名单映射；F7 插件注册全链实证（绝对导入坑）；真实 LLM 准确率待用户配 key |
 | [d-078](#d-078) | 2026-10-24 | T-F4 yt-dlp 器官化 | ytdlp_api.py（API 驱动 + 结构化错误分类 + CLI 兜底分派）+ install.bat 钉版 2026.8.19；host_ytdlp_api_test 19 项；两条夹具教训（postprocessor 是字符串 / 假 mp4 被验证层拒收） |
 | [d-077](#d-077) | 2026-10-24 | T-F3 考卷与考场（提前落地） | eval-cases 24 案（受控词表 10 strategy）+ corpus_eval 可插拔大脑 + 规则基线跑分 33%=玩偶智商；VERIFY_MISMATCH 泛化桶 16 错题=LLM 的岗位说明书；正样本 done×2 入库；15 案待用户批改 |
 | [d-076](#d-076) | 2026-10-24 | T-F1 语料采集器 + 第一跑 | 纯度闸门（direct/marked/clean/fetch-error）+ 纯宿主直灌 + JSONL/分布报告；第一跑 25 条：0 done / 14 VERIFY_MISMATCH / 0 INTERNAL（错误码表全接住）；三条教学：种子需分层、schema 补 trail、纯度闸门真实世界正常；corpus_harvest_test 11 项 |

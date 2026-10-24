@@ -916,8 +916,41 @@ def do_log(msg):
     send({"id": msg.get("id") or "", "action": "log", "ok": True})
 
 
+def do_ai_analyze(msg):
+    """T-F5：失败 AI 分析。msg 带 jobId + url（background 的 downloads 有 url）。
+
+    读状态文件组 case → brain.analyze（LLM）→ 结构化结果原样回。
+    分析挂了返回 {ok: False, error}——绝不影响下载主流程。
+    """
+    import brain
+    job_id = str(msg.get("jobId") or "")
+    url = str(msg.get("url") or "")
+    st = {}
+    if job_id:
+        try:
+            stf = os.path.join(APP_DIR, "jobs", job_id + ".json")
+            if os.path.isfile(stf):
+                st = json.load(open(stf, encoding="utf-8"))
+        except Exception:
+            st = {}
+    case = {
+        "url": url,
+        "observed": {"chain": "?", "errcode": st.get("err") or "",
+                     "trail": st.get("trail") or "",
+                     "message": st.get("message") or ""},
+        "markers": [],
+    }
+    cfg = msg.get("ai") or {}
+    result = brain.analyze(case, cfg.get("endpoint") or "", cfg.get("key") or "",
+                           cfg.get("model") or "")
+    result["action"] = "ai-analyze"
+    result["id"] = msg.get("id") or "ai"
+    send(result)
+
+
 HANDLERS = {
     "ping": do_ping,
+    "ai-analyze": do_ai_analyze,
     "download": do_download,
     "cancel": do_cancel,
     "reveal": do_reveal,

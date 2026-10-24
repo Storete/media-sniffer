@@ -1684,6 +1684,38 @@ $("#diagBtn").addEventListener("click", async function () {
   }
 });
 
+/**
+ * 「AI」按钮（T-F5）：对最近一条失败的下载记录做 AI 分析。
+ * 失败时给出的不是又一句固定文案，而是根因假设 + 受控词表里的下一步。
+ */
+$("#aiBtn").addEventListener("click", async function () {
+  const btn = this;
+  const { history } = await chrome.storage.session.get({ history: [] });
+  const lastFail = (history || []).filter((h) => h && h.ok === false).slice(-1)[0];
+  if (!lastFail) {
+    $("#hint").textContent = "本次会话还没有失败的下载记录可分析";
+    setTimeout(() => ($("#hint").textContent = ""), 3000);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "…";
+  const res = await chrome.runtime.sendMessage({
+    type: "ai:analyze",
+    jobId: lastFail.jobId || "",
+    url: lastFail.url || "",
+  });
+  btn.disabled = false;
+  btn.textContent = "AI";
+  if (res && res.ok) {
+    $("#hint").textContent =
+      "AI: " + (res.diagnosis || "?") + " → " + (res.strategy_label || res.strategy || "?")
+      + (res.advice ? "｜" + res.advice : "");
+  } else {
+    $("#hint").textContent = (res && res.error) || "AI 分析不可用";
+  }
+  setTimeout(() => ($("#hint").textContent = ""), 8000);
+});
+
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;
   await chrome.runtime.sendMessage({ type: "sniff:clear", tabId });
   allItems = [];

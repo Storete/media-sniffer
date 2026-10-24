@@ -490,7 +490,7 @@ async function notifySaved(p) {
   try {
     const { history } = await chrome.storage.session.get({ history: [] });
     const list = Array.isArray(history) ? history : [];
-    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), code: ok ? "" : String(p.code || ""), advice: ok ? "" : String(p.advice || "").slice(0, 120), adviceTitle: ok ? "" : String(p.adviceTitle || "").slice(0, 40), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
+    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), code: ok ? "" : String(p.code || ""), advice: ok ? "" : String(p.advice || "").slice(0, 120), adviceTitle: ok ? "" : String(p.adviceTitle || "").slice(0, 40), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "", jobId: String(p.jobId || ""), url: String(p.url || "").slice(0, 300) });
     while (list.length > 100) list.shift();
     await chrome.storage.session.set({ history: list });
   } catch (e) { /* 忽略 */ }
@@ -1905,6 +1905,14 @@ function connectNative() {
       return;
     }
     if (msg && msg.id) {
+  // T-F5：AI 分析的宿主响应 → 转回挂起的 popup 请求
+  if (msg && msg.action === "ai-analyze" && msg.id && pendingAi.has(String(msg.id))) {
+    const cb = pendingAi.get(String(msg.id));
+    pendingAi.delete(String(msg.id));
+    cb({ ok: !!msg.ok, diagnosis: msg.diagnosis || "", strategy: msg.strategy || "",
+         strategy_label: msg.strategy_label || "", confidence: msg.confidence,
+         advice: msg.advice || "", error: msg.error || "" });
+  }
       clearFileReq(msg.id);
       const job = downloads.get(msg.id) || {};
       Object.assign(job, msg);
@@ -1928,6 +1936,8 @@ function connectNative() {
         const file = String(msg.file || "");
         notifySaved({
           ok,
+          jobId: msg.id || "",
+          url: job.url || "",
           filename: file || job.filename || job.url || "",
           size: Number(msg.size) || 0,
           error: ok ? "" : (msg.message || (msg.action === "cancelled" ? "已取消" : "下载失败")),
@@ -2467,6 +2477,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         break;
       }
+      case "ai:analyze": {
+        // T-F5 失败 AI 分析：popup 带失败记录上下文 → 组 case → 宿主调 LLM。
+        // AI 配置（endpoint/key/model）存 chrome.storage.local.aiConfig（打磨期
+        // 手动配置；发行前做成设置 UI + opt-in）。
+        (async () => {
+          try {
+            const cfg = (await chrome.storage.local.get({ aiConfig: null })).aiConfig || {};
+            if (!cfg.endpoint || !cfg.key) {
+              sendResponse({ ok: false, error: "未配置 AI 分析（storage.local.aiConfig 需含 endpoint/key）" });
+              return;
+            }
+            const jid = "ai-" + Date.now();
+            pendingAi.set(jid, sendResponse);
+            postNative({ action: "ai-analyze", id: jid,
+              jobId: msg.jobId || "", url: msg.url || "",
+              ai: { endpoint: cfg.endpoint, key: cfg.key, model: cfg.model || "" } });
+            // 宿主响应异步回来（nativePort.onMessage 里 action==="ai-analyze" 收尾）；
+            // 30s 兜底防挂
+            setTimeout(() => {
+              if (pendingAi.has(jid)) {
+                pendingAi.get(jid)({ ok: false, error: "AI 分析超时" });
+                pendingAi.delete(jid);
+              }
+            }, 30000);
+          } catch (e) {
+            sendResponse({ ok: false, error: String(e.message || e) });
+          }
+        })();
+        return true;   // 异步 sendResponse
+      }
       case "ms:diag": {
         // 诊断包（§6）：一键打包「版本 + 错误记录」，popup 组装后进剪贴板。
         // 降低支持成本的唯一杠杆——用户不用截图，我们不用猜版本。
@@ -2565,6 +2605,8 @@ function ctxNameFromUrl(u) {
  * 没回（页面脚本没注入/已失效）就当没有，走 srcUrl 原路。
  */
 const pendingCtx = new Map();
+// T-F5：AI 分析的挂起响应（nativePort 异步回 → 这里转回 popup）
+const pendingAi = new Map();
 function askPageCtx(tabId) {
   return new Promise((resolve) => {
     const requestId = "ctx-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
