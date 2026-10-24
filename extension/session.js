@@ -224,6 +224,25 @@ var MSSession = (function () {
    * @param {Array|Map} opt.items 扁平条目（`rec.items` 的 values 或 Map 本身）
    * @param {string} opt.tabUrl   当前页地址
    */
+  /**
+   * 「这条地址是多码率主清单」的判定（T-C10）。
+   *
+   * 判据是条目上的 `listKind`（background 的 applyHlsMetaTo 从 hls-meta.js 的
+   * 正文解析打上，随 storage 持久化）；**没有元数据就不判**——webRequest 只见
+   * 地址、清单正文还没读到时，它可能只是我们还没证据的普通媒体，宁可留在
+   * variants 里也不凭 URL 形状猜。
+   *
+   * 为什么要把主清单从 variants 排除：`x36xhzz.m3u8` 这类地址在旧模型里是一条
+   * 合法的 video 条目（点它宿主会选默认档下载），但在会话模型里它是「清单的
+   * 清单」——混进 variants 就是 S1 选档下拉里一条没有分辨率的假档位（T-C10）。
+   * 注意排除只发生在**会话层**：旧模型的 popup 列表条目原样保留。
+   * msBuildSession 与 msDiffSession **必须用同一个判据**——一边排除一边比较，
+   * 差异就会变成假 missing / 假 extra。
+   */
+  function isMasterListEntry(it) {
+    return !!it && typeof it === "object" && String(it.listKind || "") === "master";
+  }
+
   function msBuildSession(opt) {
     const o = opt || {};
     const list = listOf(o.items);
@@ -233,6 +252,7 @@ var MSSession = (function () {
     let cover = "";
     for (const it of list) {
       if (!it || typeof it !== "object") continue;
+      if (isMasterListEntry(it)) continue;   // 主清单不是媒体流：不进 variants（T-C10）
       const k = String(it.k || "");
       if (k === "image") {
         const u = typeof it.u === "string" ? it.u : "";
@@ -307,6 +327,11 @@ var MSSession = (function () {
   //   max）。这是**故意的**，不是丢数据，所以计入 merged 而不进 changed。
   // · 分片 / 图标 / 文档 / 字体 / 非 http 地址：两边都不该出现（约束 2），
   //   计入 dropped。
+  // · 多码率主清单地址（listKind==="master"）：旧模型把它当一条可点的 video 条目
+  //   （点它宿主会选默认档），新模型**有意**不把它当媒体流（T-C10：混进 variants
+  //   就是选档下拉里的假档位）。两边口径一致地跳过，计入 masterSkipped ——
+  //   既不是 missing（新模型没丢东西，popup 列表里的条目原样在），也不是 dropped
+  //   （旧模型那条是合法存在的）。判据必须与 msBuildSession 完全同一个函数。
   function msDiffSession(session, items) {
     const st = session || {};
     const list = listOf(items);
@@ -322,7 +347,7 @@ var MSSession = (function () {
     const imgMap = new Map();
     for (const im of imgs) if (im && im.url) imgMap.set(im.url, im);
 
-    const counts = { seen: 0, media: 0, image: 0, dropped: 0, merged: 0 };
+    const counts = { seen: 0, media: 0, image: 0, dropped: 0, merged: 0, masterSkipped: 0 };
     const urlCount = new Map();
     const flat = [];      // [{kind, url, row}]  row 里的键已经是映射后的
     for (const it of list) {
@@ -342,6 +367,8 @@ var MSSession = (function () {
       }
       const r = normalize(it);
       if (!r) { counts.dropped++; continue; }
+      // 与 msBuildSession 同判据：主清单不进 variants，也不进比较（见上方说明）
+      if (isMasterListEntry(it)) { counts.masterSkipped++; continue; }
       counts.media++;
       urlCount.set(r.url, (urlCount.get(r.url) || 0) + 1);
       flat.push({ kind: "media", url: r.url, row: r });

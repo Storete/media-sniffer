@@ -10,6 +10,46 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-066 · 2026-10-24 · T-C10：主清单地址不再混进 variants——判据是现成的，难点在双跑口径
+
+### 起点：挂了三轮的账
+
+d-058 就写明「会话的 tracks[].variants 里混进了主清单自己的地址，留给 S3 一起处理」，
+S3 早就做完了它还挂着。影响：S1 的选档数据里有一条没有分辨率的假档位；
+未来任何按 variants 消费的逻辑都会把它当成可直下的媒体流。
+
+### 为什么比看上去小，又比看上去险
+
+**小**：判定主清单的能力 1.3.45 就有了——hls-meta.js 解析清单正文，applyHlsMetaTo
+把 `listKind:"master"` 打在条目上且随 storage 持久化。修复就是在会话层用它。
+
+**险**：直接排除会破坏双跑——旧模型 items 里有这条合法条目，新模型 variants 没有
+它，msDiffSession 立刻报 missing，T-E2 刚验证过的「shadow 恒绿」每天假红。
+所以两端必须**同一个判据**（`isMasterListEntry`，共享函数）：构建端排除、
+比较端豁免并计入新计数 `masterSkipped`。它不是 missing（popup 列表条目原样保留，
+点它宿主仍会选默认档下载——旧模型的能力一条没少），也不是 dropped（那条在旧模型
+是合法存在）。
+
+**保守边界**：只有 `listKind==="master"` 才排除；没有元数据（webRequest 先到、
+清单正文还没读到）**不凭 URL 形状猜**——它可能只是还没证据的普通媒体。代价是
+「只抓到 master 的页面」variants 为空、kind 落 unknown——诚实的空比假档位好，
+且用户仍可从 popup 列表点那条 master 下载。
+
+### 反向验证（三组变异，各红各的）
+
+- A 构建端不排除 → **4 红**：假档位回归 variants、双跑 ok 变 false、「只剩 master
+  时 kind 误判 video」（最后这条红的正是「假档位让会话把清单页当成视频页」）；
+- B 比较端不豁免 → **2 红**：master 进 missing、双跑假红；
+- C 判据漂移（两端判据不一致）→ **4 红**：共享函数存在的意义，漂移立刻暴露。
+
+### 数字
+
+- `session_shadow` 49 → **56 项**（[9] 段 7 项：排除/保留/masterSkipped/无元数据
+  边界/只剩 master）；JS 全量 1091 → **1098 项 / 18 文件 / 0 失败**；
+- 无头真机复验（`tools/verify_headless.py --pages`）：B 站首页 + 视频页 shadow
+  仍 `ok:true`；
+- 版本 1.3.57 → **1.3.58**（产品代码 `extension/session.js`）。
+
 ## d-064 · 2026-10-24 · 真机验证自动化：headless Chrome + CDP 把 E 组打穿大半，顺带把 ffmpeg 拦截的新形态钉死
 
 ### 起点：「你去做真机验证」
@@ -2814,6 +2854,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-066](#d-066) | 2026-10-24 | T-C10：主清单地址不再混进 variants | 判据复用 1.3.45 的 listKind，共享函数给构建/比较两端；新计数 masterSkipped（不是 missing 也不是 dropped）；反向验证三组全红；JS 1098 项全过、真机两页 shadow 仍绿；版本 1.3.58 |
 | [d-064](#d-064) | 2026-10-24 | 真机验证自动化：headless Chrome + CDP 打穿 E 组大半 | `Extensions.loadUnpacked` 加载 1.3.57，SW 内 MSSession 存活、回放真跑、B 站两页双跑 `ok:true`、选 720 档 ffprobe 实测 1280x720；ffmpeg 拦截形态从「启动崩」变为「写盘拦」，按 exe 所在目录标签定案；工具收编 `tools/verify_headless.py` |
 | [d-063](#d-063) | 2026-10-24 | 规则库落地：模板 + CI 门禁 + 六条真实案例 | 每条已启用案例必须解析出指向 `test/` 真实文件的引用（空库绿、坏引用红，门禁自身 25 项反向验证）；顺带把「本机全量 5 假红」钉死在 WorkBuddy 沙箱的根目录 `Low Mandatory Level` 标签——干净 worktree 全绿，本机验真绿到 CI/干净副本 |
 | [d-036](#d-036) | 2026-10-22 | 点「取消」没作用：换个下载器接着下 | `main()` 只认 `done`，`cancelled` 照样掉进 yt-dlp；宿主的 `cancelled` 回执是乐观信号，不代表进程停了；顺带把取消延迟 70s→5s |

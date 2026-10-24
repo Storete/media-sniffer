@@ -223,5 +223,43 @@ const mapSt = S.msBuildSession({ items: mapBag, tabUrl: PAGES.hls.url });
 const mapD = S.msDiffSession(mapSt, mapBag);
 ok("Map 输入与数组结果一致", JSON.stringify(mapD) === JSON.stringify(hlsD), { map: mapD, arr: hlsD });
 
+// ---------------------------------------------------------------- [9] T-C10：主清单不进 variants
+section("[9] 多码率主清单地址不进 variants，双跑也不许报丢（T-C10）");
+
+// 真实形态（B 站类站点）：webRequest 抓到 master + media 两条 video 条目，
+// 页面 fetch 读到正文后 applyHlsMetaTo 给 master 打上 listKind:"master"。
+// master 混进 variants 就是选档下拉里一条没有分辨率的假档位（T-C10）。
+const bilibiliItems = [
+  { u: "https://example.com/x36xhzz.m3u8", k: "video", m: "application/vnd.apple.mpegurl", listKind: "master", name: "完整流" },
+  { u: "https://example.com/index-1080.m3u8", k: "video", m: "application/vnd.apple.mpegurl", listKind: "media", w: 1920, h: 1080, dur: 634 },
+  { u: "https://example.com/index-720.m3u8", k: "video", m: "application/vnd.apple.mpegurl", listKind: "media", w: 1280, h: 720, dur: 634 },
+];
+const biSt = S.msBuildSession({ items: bilibiliItems, tabUrl: "https://www.bilibili.com/video/BVtest" });
+const biUrls = (biSt.tracks[0] ? biSt.tracks[0].variants : []).map((v) => v.url);
+ok("variants 里没有主清单地址", biUrls.indexOf("https://example.com/x36xhzz.m3u8") < 0, biUrls);
+ok("variants 里保留两条真媒体流", biUrls.length === 2, biUrls);
+const biD = S.msDiffSession(biSt, bilibiliItems);
+ok("双跑仍然 ok（master 不算丢）", biD.ok === true, biD);
+ok("master 计入 masterSkipped=1", biD.counts.masterSkipped === 1, biD.counts);
+
+// 边界：没有元数据（listKind 缺失）的 m3u8 **不许猜**——webRequest 先到、
+// 清单正文还没读到的时刻，它可能是还没证据的普通媒体，留在 variants 才对。
+const noMetaItems = [
+  { u: "https://example.com/live.m3u8", k: "video", m: "application/vnd.apple.mpegurl" },
+];
+const nmSt = S.msBuildSession({ items: noMetaItems, tabUrl: "https://example.com/live" });
+const nmUrls = (nmSt.tracks[0] ? nmSt.tracks[0].variants : []).map((v) => v.url);
+ok("无元数据的 m3u8 仍进 variants（不凭 URL 形状猜）", nmUrls.length === 1, nmUrls);
+const nmD = S.msDiffSession(nmSt, noMetaItems);
+ok("无元数据场景双跑 ok 且 masterSkipped=0", nmD.ok === true && nmD.counts.masterSkipped === 0, nmD);
+
+// 只抓到 master、还没读到子清单的页面：variants 为空是诚实的（比假档位好），
+// 旧模型的 popup 列表条目不受影响（那是旧模型的职责，不在会话层）。
+const onlyMasterSt = S.msBuildSession({
+  items: [bilibiliItems[0]], tabUrl: "https://www.bilibili.com/video/BVtest",
+});
+ok("只剩 master 时 tracks 为空（kind=unknown 而不是假档位）",
+   onlyMasterSt.tracks.length === 0 && onlyMasterSt.kind === "unknown", onlyMasterSt.kind);
+
 console.log("\n" + (fail ? "有失败：" : "全部通过：") + pass + " 通过 / " + fail + " 失败");
 process.exit(fail ? 1 : 0);
