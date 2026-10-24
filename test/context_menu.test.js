@@ -91,7 +91,11 @@ sandbox.chrome = {
     },
     onChanged: makeEvent([]),
   },
-  cookies: { getAll: () => Promise.resolve([]) },
+  cookies: { getAll: (q) => Promise.resolve(
+    q && q.url && q.url.indexOf("bilibili.com") >= 0
+      ? [{ domain: ".bilibili.com", hostOnly: false, path: "/", secure: true,
+           name: "SESSDATA", value: "login-state", expirationDate: 1900000000 }]
+      : []) },
   downloads: { download: () => Promise.resolve(1) },
   action: { setBadgeText() {}, setBadgeBackgroundColor() {}, setIcon() {} },
   scripting: { executeScript: () => Promise.resolve([]) },
@@ -115,12 +119,15 @@ const onClickedHandler = sandbox.chrome.contextMenus.onClicked.addListener
   // ---------------------------------------------------------------- [1] 注册
   section("[1] onInstalled 注册三类菜单（不做 B28 的「解析此页」）");
   await listeners.onInstalled[0]();
-  ok("注册了 3 个菜单项", menusCreated.length === 3, menusCreated.map((m) => m.id));
+  ok("注册了 4 个菜单项", menusCreated.length === 4, menusCreated.map((m) => m.id));
   const byId = {};
   for (const m of menusCreated) byId[m.id] = m;
   ok("视频/音频项 contexts=video+audio", JSON.stringify(byId["ms-dl-media"].contexts) === JSON.stringify(["video", "audio"]), byId["ms-dl-media"]);
   ok("图片项 contexts=image", JSON.stringify(byId["ms-dl-image"].contexts) === JSON.stringify(["image"]), byId["ms-dl-image"]);
-  ok("链接项存在且不含「解析此页」", !!byId["ms-dl-link"] && !byId["ms-dl-page"], Object.keys(byId));
+  ok("链接项存在", !!byId["ms-dl-link"], Object.keys(byId));
+  ok("B28 第四项：page 上下文「用本地解析器下载此页」",
+     byId["ms-dl-page"] && JSON.stringify(byId["ms-dl-page"].contexts) === JSON.stringify(["page"]),
+     byId["ms-dl-page"]);
 
   // onMessage handler（ctx-res 分发走它）
   const pageMsg = (payload) => onMessageHandler(
@@ -194,6 +201,29 @@ const onClickedHandler = sandbox.chrome.contextMenus.onClicked.addListener
   const d6 = hostMsgs.find((m) => m.action === "download");
   ok("linkUrl 直接下载", d6 && d6.url === "https://cdn.example.com/a/track.m4a", d6);
   ok("kind=other", d6 && d6.kind === "other", d6 && d6.kind);
+
+  // ---------------------------------------------------------------- [7] B28 page 项
+  section("[7] page 项：页面 URL + 全量 cookie 走 jar 形态");
+  hostMsgs.length = 0;
+  await sandbox.handleContextMenu(
+    { menuItemId: "ms-dl-page", pageUrl: "https://www.bilibili.com/video/BV1QJ/" },
+    { id: 7 });
+  const d7 = hostMsgs.find((m) => m.action === "download");
+  ok("页面 URL 作为下载地址", d7 && d7.url === "https://www.bilibili.com/video/BV1QJ/", d7 && d7.url);
+  ok("kind=video（走 yt-dlp 分支的规划判据）", d7 && d7.kind === "video", d7 && d7.kind);
+  ok("cookies 是结构化数组（jar 形态，宿主写 Netscape 文件）",
+     d7 && Array.isArray(d7.cookies) && d7.cookies.length === 1
+     && d7.cookies[0].name === "SESSDATA", d7 && d7.cookies);
+  ok("不再发 header 形态 Cookie（cookie 字段为空）", d7 && !d7.cookie, d7 && d7.cookie);
+
+  // 非 http 页面：不下载，失败记录说人话
+  hostMsgs.length = 0;
+  await sandbox.handleContextMenu(
+    { menuItemId: "ms-dl-page", pageUrl: "chrome://extensions/" }, { id: 7 });
+  ok("chrome:// 页面不发起下载", !hostMsgs.some((m) => m.action === "download"));
+  await new Promise((r) => setTimeout(r, 5));
+  const last7 = (sessionStore.history || []).slice(-1)[0];
+  ok("失败原因写进下载记录", last7 && last7.ok === false && /本地解析器/.test(last7.error || ""), last7);
 
   console.log("\n" + (fail ? "有失败：" : "全部通过：") + pass + " 通过 / " + fail + " 失败");
   process.exit(fail ? 1 : 0);

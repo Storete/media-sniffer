@@ -30,6 +30,13 @@ console.log("[2] 批量选择的关键节点与事件");
 for (const id of ["selectToggle", "batchBar", "selAllBox", "selInv", "selSave", "selDone"]) {
   check(`#${id} 在 HTML 里`, new RegExp('id="' + id + '"').test(HTML));
 }
+// B28「整页解析」按钮（1.3.60）：入口存在 + 发 native:download-page + 有降级文案
+check("#pageDl 按钮在 HTML 里", /id="pageDl"/.test(HTML));
+check("#pageDl 绑定了点击处理", /#pageDl"\)\.addEventListener\("click"/.test(JS));
+check("整页解析发 native:download-page", /type: "native:download-page"/.test(JS));
+check("background 处理 native:download-page", /case "native:download-page":/.test(fs.readFileSync(path.join(EXT, "background.js"), "utf8")));
+check("chrome:// 页面有拦截提示", /交不了给本地解析器/.test(JS));
+
 check("#selectToggle 绑定了 setSelecting", /#selectToggle"\)\.addEventListener\("click",\s*\(\)\s*=>\s*setSelecting/.test(JS));
 check("#selSave 绑定了 saveSelected", /#selSave"\)\.addEventListener\("click"/.test(JS));
 check("批量条默认隐藏", /id="batchBar" class="batch-bar hidden"/.test(HTML));

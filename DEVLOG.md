@@ -10,6 +10,51 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-069 · 2026-10-24 · B28 落地：整页解析——cookiejar 链路 + 两个入口，测试顺手钉住「cmd 批处理转发 % 会炸」
+
+### 起点：d-068 判 GO，用户拍板「你自己决定，彻底解决问题」
+
+半天刀按计划落地。四个文件各改一层，全部复用既有链路：
+
+- **downloader.py**：`write_cookie_netscape()`（chrome.cookies 结构 → Netscape 七列；
+  hostOnly 决定加不加"."前缀、会话 cookie 给远期时间——写 0 会被 jar 当过期丢掉、
+  带制表符的坏行跳过）；`run_ytdlp` 拆成薄壳（try/finally 管 cookie 临时文件的
+  生命周期——文件里有登录态，**每条退出路径都必须删**）+ `_run_ytdlp` 主体；
+  有 cookie_file 时抑制 legacy `--add-header Cookie:`（两份同源 cookie 同发，
+  一部分 CDN 因重复头直接 4xx），Referer/Origin/抓到的请求头照常。
+- **background.js**：`native:download-page` 消息（页面 URL + `chrome.cookies.getAll`
+  全量结构化导出；jar 形态在手就不发 header Cookie）；右键菜单第四项
+  「用本地解析器下载此页」（contexts:["page"]，B29 当初留的位子）。
+- **popup**：footer「整页解析」按钮——「插件列表抓不全的站」的兜底入口，
+  chrome:// 页面有拦截提示，失败落下载记录。
+
+### 测试折出来的两条
+
+**① cmd 批处理转发会二次解析 %。** 集成测试最初想用 .bat 包装真进程的假 yt-dlp：
+`--progress-template` 的参数含 `%(progress...)s`，经 `%*` 展开后 cmd 重扫出坏变量
+引用，实测报「'%' 不是内部或外部命令」。这是批处理的本质缺陷不是产品 bug——
+测试改用 FakePopen 捕获 cmd 列表（要验证的参数构造与文件清理完全覆盖）。
+教训记下：**以后任何「经 cmd 转发的参数含 %」的场景都要先想这一层**。
+
+**② 薄壳 try/finally 的位置。** `_run_ytdlp` 主体有 6 个 return 点，让每个都记得
+删登录态文件不现实；拆 `run_ytdlp`（壳，管生命周期）+ `_run_ytdlp`（主体，不动）
+零重排完成，且异常照常穿透（测试 2c 钉住「删了文件且异常没被吞」）。
+
+### 反向验证（3 组全红）
+
+① 抑制 legacy header 的逻辑去掉 → 「argv 不含 Cookie:」红；② finally 清理去掉 →
+「临时文件用完即删」等 2 红；③ page 菜单分支不导出 cookie → 「结构化数组」红 2。
+（第一组变异还顺带暴露过测试自身的问题：cookie 文件在读之前就被 finally 删了——
+改由 FakeProc 构造时当场读；异常穿透被吞过一次——补了 raised 断言。）
+
+### 数字
+
+- 新增 `test/host_cookie_jar_test.py` **24 项**（run_all 自动发现）；context_menu
+  19 → **26**（第四项 + page 流程）；popup_wiring 71 → **76**（pageDl 五断言）；
+- Python 干净副本 **26 通过 / 2 跳过 / 0 失败**（工作区内跑仍有已知沙箱假红 5 套，
+  集合与改动前一致）；JS **1145 项 / 20 文件 / 0 失败**；
+- 版本 1.3.59 → **1.3.60**（extension 四文件 + downloader.py）。
+
 ## d-068 · 2026-10-24 · B28 可行性一小时：页面 URL → yt-dlp 的「传递层」设想成立，GO
 
 ### 裸验三步（不经扩展，按 B28 既定判据）
@@ -2932,6 +2977,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-069](#d-069) | 2026-10-24 | B28 落地：整页解析 | popup 按钮 + 右键第四项 → native:download-page → Netscape 临时文件 → --cookies（jar 形态），同发抑制 legacy 头，finally 保证每条退出路径删登录态文件；测试折出「cmd 批处理转发 % 会炸」；反向验证 3 组全红；Python 干净副本 26/0、JS 1145 项；版本 1.3.60 |
 | [d-068](#d-068) | 2026-10-24 | B28 可行性一小时：GO | Netscape 转换器写通、B 站页面 URL 零适配提出 1080p、cookie 形态判别（jar 才是 extractor 可读形态，header 只到传输层）；抖音 headless 有验证码墙（探测局限，产品路径不受限）；落地约半天，排期待拍板 |
 | [d-067](#d-067) | 2026-10-24 | B29 右键菜单：指哪打哪 | 三类菜单+页面解析器（capture 记录，currentSrc/srcset/picture/懒加载/背景图）；blob 降级问页面、问不到不静默；测试抓到 picture `<source>` 优先级写反（右键常拿到降级格式），已修；JS 1133 项；版本 1.3.59 |
 | [d-066](#d-066) | 2026-10-24 | T-C10：主清单地址不再混进 variants | 判据复用 1.3.45 的 listKind，共享函数给构建/比较两端；新计数 masterSkipped（不是 missing 也不是 dropped）；反向验证三组全红；JS 1098 项全过、真机两页 shadow 仍绿；版本 1.3.58 |

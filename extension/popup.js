@@ -1544,6 +1544,35 @@ $("#historyBtn").addEventListener("click", async () => {
   renderHistory(history, false);
 });
 
+/**
+ * 「整页解析」按钮（B28）：当前页面 URL + 本站 cookie（jar 形态）交给本地
+ * yt-dlp。给「插件列表抓不全的站」用的兜底入口 —— yt-dlp 的站点解析器自己
+ * 会解协议，扩展只递 URL 和凭据，不注入任何东西。
+ */
+$("#pageDl").addEventListener("click", async function () {
+  const btn = this;
+  if (!tabUrl || !/^https?:/i.test(tabUrl)) {
+    $("#hint").textContent = "当前页面类型（chrome:// 等）交不了给本地解析器";
+    setTimeout(() => ($("#hint").textContent = ""), 4000);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "…";
+  const res = await chrome.runtime.sendMessage({
+    type: "native:download-page",
+    url: tabUrl,
+    tabId,
+  });
+  btn.disabled = false;
+  btn.textContent = "整页解析";
+  if (res && res.ok) {
+    $("#hint").textContent = "已交给本地解析器，进度在下方任务区";
+    setTimeout(() => ($("#hint").textContent = ""), 4000);
+  } else {
+    setHost(false, res ? res.error : "本地下载器不可用");
+  }
+});
+
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;
   await chrome.runtime.sendMessage({ type: "sniff:clear", tabId });
   allItems = [];

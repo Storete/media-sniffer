@@ -693,7 +693,73 @@ def cleanup_ytdlp_junk(outdir, base):
     return removed
 
 
+def write_cookie_netscape(cookies):
+    """chrome.cookies.getAll 的结构化 cookie → Netscape cookies.txt 临时文件。
+
+    B28 的核心：yt-dlp 的站点解析器在内部构造 API 请求时读的是 cookiejar
+    （`self._get_cookies()`），**header 形态的 Cookie 对它不可见** —— 只有
+    `--cookies` 填充的 jar 才可编程读取（d-068 实测判别）。返回 None 表示
+    没有可用 cookie，调用方退回 header 老路。
+
+    字段对照（chrome.cookies.getAll → Netscape 七列）：
+      · `hostOnly=TRUE` → 只对精确 host 生效：domain 不加"."、第 2 列 FALSE；
+        否则 domain 加"."前缀、第 2 列 TRUE（Netscape 用这个前缀表达「含子域」）；
+      · 会话 cookie 没有 expirationDate：给远期 2147483647 —— 文件用完即删，
+        「比真实寿命长」无害，写 0 反而会被 cookiejar 当过期丢掉；
+      · 名值里带制表符/换行的（合法 cookie 不会）跳过，坏一条不坏整份。
+    """
+    if not cookies:
+        return None
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        try:
+            name = str(c.get("name") or "")
+            value = str(c.get("value") or "")
+            domain = str(c.get("domain") or "")
+            path = str(c.get("path") or "/") or "/"
+            if not name or not domain or not value:
+                continue
+            if any(ch in name or ch in value for ch in (chr(9), chr(10), chr(13))):
+                continue
+            host_only = bool(c.get("hostOnly"))
+            inc = "FALSE" if host_only else "TRUE"
+            dom = domain if (host_only or domain.startswith(".")) else "." + domain
+            secure = "TRUE" if c.get("secure") else "FALSE"
+            try:
+                exp = int(float(c.get("expirationDate")))
+            except (TypeError, ValueError):
+                exp = 0
+            if exp <= 0:
+                exp = 2147483647
+            lines.append(chr(9).join([dom, inc, path, secure, str(exp), name, value]))
+        except Exception:
+            continue
+    if len(lines) <= 1:
+        return None
+    fd, path = tempfile.mkstemp(prefix="ms-cookies-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8", newline=chr(10)) as f:
+        f.write(chr(10).join(lines) + chr(10))
+    return path
+
+
 def run_ytdlp(job, ytdlp, ffmpeg):
+    """薄壳：负责 cookie 临时文件的生命周期（B28），主体在 _run_ytdlp。
+
+    文件里有登录态 cookie，**必须**在每一条退出路径（含异常）上都删掉 ——
+    try/finally 收口在这里，主体函数内部的多个 return 就不用各自记着删。
+    """
+    cookie_file = write_cookie_netscape(job.get("cookies"))
+    try:
+        return _run_ytdlp(job, ytdlp, ffmpeg, cookie_file)
+    finally:
+        if cookie_file:
+            try:
+                os.remove(cookie_file)
+            except OSError:
+                pass
+
+
+def _run_ytdlp(job, ytdlp, ffmpeg, cookie_file):
     """跑 yt-dlp。适合 m3u8 / mpd / 「一个网页里藏着视频」这几类，
     HLS 分片它比我们自己拼强得多（并发、重试、音视频合并都能处理）。
 
@@ -701,8 +767,10 @@ def run_ytdlp(job, ytdlp, ffmpeg):
     写死会出现「已经 .mp4 又拼一个 .mp4」。真正的落盘名靠 --print
     after_move:FILE: 那一行回读，比猜扩展名可靠。
 
-    cookie 走 --add-header 而不是 --cookies 文件：我们没有 Netscape 格式的
-    cookie 文件，只能把整条 Cookie 头递过去。
+    cookie 有两条路（d-068 判别）：扩展导出了结构化 cookie（job["cookies"]，
+    B28 整页解析入口）→ 写 Netscape 临时文件走 `--cookies` —— 解析器内部读的
+    cookiejar 只有这条路能填上，header 形态它看不见；没有结构化 cookie（老的
+    媒体直链场景）→ 维持 `--add-header Cookie:` 老路，够用。
     """
     job_id = job["id"]
     outdir = job.get("outdir") or DEFAULT_OUT
@@ -731,7 +799,12 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         "--hls-prefer-native",
         "--output", outtmpl,
     ]
-    cmd += ytdlp_header_args(job)
+    # cookie_file 在手时抑制 header 形态的 Cookie：两份同源 cookie 同时发，
+    # 一部分 CDN 会因为重复头直接 4xx。Referer / Origin / 抓到的请求头照常。
+    cmd += ytdlp_header_args(
+        {k: v for k, v in job.items() if k != "cookie"} if cookie_file else job)
+    if cookie_file:
+        cmd += ["--cookies", cookie_file]
     if ffmpeg:
         cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
         # 不要加 --merge-output-format mp4（2026-10-21 用户 m16052 排查 4kvm 时发现）。

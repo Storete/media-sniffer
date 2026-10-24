@@ -1760,7 +1760,10 @@ const pendingHlsRetry = new Map(); // tabId -> {oldUrl, kind, filename, referer,
 /** 发起一次本地下载。popup 点「下载」和「过期自动重下」都走这里 */
 async function startNativeDownload(o) {
   const settings = await getSettings();
-  const cookie = settings.useCookies ? await buildCookieHeader(o.url) : "";
+  // B28：结构化 cookies（chrome.cookies.getAll 的原样列表）优先 —— 宿主会写成
+  // Netscape 临时文件走 --cookies（解析器的 cookiejar 只有这条路能填上）。
+  // 走了 jar 就不再发 header 形态的 Cookie（两份同源同发会重复头）。
+  const cookie = (!o.cookies && settings.useCookies) ? await buildCookieHeader(o.url) : "";
   const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
   // 只接受 http(s) 的 variant：它是从清单正文里读出来的地址、要交给本地下载器
   // 去取，形状不对就当作没选（回落宿主自己挑最好的），不要把它传下去碰运气。
@@ -1786,6 +1789,7 @@ async function startNativeDownload(o) {
     referer: o.referer || "",
     tabUrl: o.tabUrl || "",
     cookie,
+    cookies: Array.isArray(o.cookies) ? o.cookies : undefined,
     // 抓取时看到的请求头（白名单 5 个），宿主会再过滤一遍后重放。
     // 没有它时很多 CDN 会因为缺 Origin/Accept 直接 403。
     headers: o.headers || {},
@@ -2442,6 +2446,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         break;
       }
+      case "native:download-page": {
+        // B28：把当前页面 URL 整个交给 yt-dlp（1800+ extractor 接管解析），
+        // 扩展只当「凭据 + URL 传递层」。cookie 用结构化全量导出（jar 形态）。
+        try {
+          const url = String(msg.url || "");
+          if (!/^https?:/i.test(url)) throw new Error("仅支持 http(s) 页面地址");
+          const r = await startNativeDownload({
+            url,
+            kind: "video",           // 页面 URL 走 yt-dlp 分支的判据（plan_download）
+            filename: String(msg.filename || ""),
+            referer: url,
+            tabUrl: url,
+            tabId: msg.tabId,
+            cookies: await chrome.cookies.getAll({ url }),
+          });
+          sendResponse({ ok: true, id: r.id });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e.message || e) + "（是否已运行安装脚本？）" });
+        }
+        break;
+      }
       case "native:cancel": {
         try {
           postNative({ action: "cancel", id: msg.id });
@@ -2506,6 +2531,10 @@ function createMenus() {
     contexts: ["image"] });
   chrome.contextMenus.create({ id: "ms-dl-link", title: "下载此链接的媒体",
     contexts: ["link"] });
+  // B28 落地后第四项有了实体：页面 URL + 本站 cookiejar 交给 yt-dlp 解析。
+  // 放 page 上下文 —— 空白处/文本上右键也在（video/image/link 上下文不重复出）。
+  chrome.contextMenus.create({ id: "ms-dl-page", title: "用本地解析器下载此页",
+    contexts: ["page"] });
 }
 
 /** URL 的默认文件名：尾段（去查询串），空就让宿主用站点名兜底。 */
@@ -2551,6 +2580,22 @@ function askPageCtx(tabId) {
 async function handleContextMenu(info, tab) {
   const tabId = tab && tab.id != null ? tab.id : null;
   const pageUrl = String(info.pageUrl || (tab && tab.url) || "");
+  // B28 第四项：整页交给本地解析器。cookiejar 形态，不复用下面的 srcUrl 逻辑。
+  if (info.menuItemId === "ms-dl-page") {
+    if (!/^https?:/i.test(pageUrl)) {
+      notifySaved({ ok: false, filename: ctxNameFromUrl(pageUrl) || pageUrl,
+        size: 0, error: "这个页面类型（chrome:// 等）交不了给本地解析器" });
+      return;
+    }
+    try {
+      await startNativeDownload({
+        url: pageUrl, tabId, kind: "video", filename: "",
+        referer: pageUrl, tabUrl: pageUrl,
+        cookies: await chrome.cookies.getAll({ url: pageUrl }),
+      });
+    } catch (e) { /* startNativeDownload 内部已兜 */ }
+    return;
+  }
   let url = String(info.srcUrl || info.linkUrl || "");
   let kind = info.menuItemId === "ms-dl-image" ? "image"
     : info.menuItemId === "ms-dl-link" ? "other" : "video";
