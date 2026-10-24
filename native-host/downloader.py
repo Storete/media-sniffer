@@ -695,13 +695,18 @@ def cleanup_ytdlp_junk(outdir, base):
 
 # B27：时间段「1:30-2:45」「00:01:30-00:02:45」「90-165」的解析。
 # 只认 H:M:S / M:S / 纯秒三种形态 —— popup 输入框里用户会怎么写，比 RFC 宽松不了多少。
-_TR_PART = re.compile(r"^\d{1,2}(?::\d{1,2}){0,2}$")
+_TR_COLON = re.compile(r"^\d{1,3}:\d{1,2}(?::\d{1,2})?$")   # M:S / H:M:S
+_TR_SEC = re.compile(r"^\d{1,5}$")                            # 纯秒
 
 
 def _tr_norm(part):
     """单段 → H:MM:SS；非法（分钟/秒超 59、段超 3）返回 None。"""
     part = part.strip()
-    if not (_TR_COLON.match(part) or _TR_SEC.match(part)):
+    if _TR_SEC.match(part):
+        # 纯秒 → H:MM:SS（"165" 是 2 分 45 秒，不能原样放秒位）
+        s = int(part)
+        return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+    if not _TR_COLON.match(part):
         return None
     nums = [int(x) for x in part.split(":")]
     if len(nums) == 3 and (nums[1] > 59 or nums[2] > 59):
