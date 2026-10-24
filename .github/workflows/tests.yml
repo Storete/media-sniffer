@@ -46,6 +46,14 @@ jobs:
         run: node test/popup_wiring.test.js
 
       # 进度卡与阶段文案（1.3.38 起）：防止界面上出现「与播放进度无关」这类解释性废话
+      # B29 右键菜单（1.3.59 起）：注册/点击处理/blob 降级/命名（19 项）+
+      # 页面侧元素解析器 currentSrc/srcset/picture/懒加载/背景图（16 项）
+      - name: context_menu（19 项）
+        run: node test/context_menu.test.js
+
+      - name: ctx_pick（16 项）
+        run: node test/ctx_pick.test.js
+
       - name: ui_card（39 项）
         run: node test/ui_card.test.js
 

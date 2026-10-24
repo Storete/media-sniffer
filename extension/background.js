@@ -2282,6 +2282,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 来自 content script 的页面内捕获上报
         const p = msg.payload || {};
         const tid = sender.tab && sender.tab.id;
+        // B29：inject-main 对「右键元素是什么」的应答，交给挂起的 handleContextMenu
+        if (p.cmd === "ctx-res") {
+          const wait = pendingCtx.get(String(p.requestId || ""));
+          if (wait) { clearTimeout(wait.timer); pendingCtx.delete(String(p.requestId || "")); wait.resolve(p.ctx || null); }
+          sendResponse({ ok: true });
+          break;
+        }
         if (tid == null) { sendResponse({ ok: false }); break; }
         // 单页应用导航（B 站、小红书都是）：pushState 不会触发 tabs.onUpdated，
         // 上一个页面的条目和 xhsVid 会一直留着，表现为「换了视频就抓不到」、
@@ -2476,4 +2483,96 @@ chrome.runtime.onInstalled.addListener(async () => {
   if (cur.concurrency == null) {
     await chrome.storage.local.set({ concurrency: 16, outdir: "", useCookies: true });
   }
+  setupContextMenus();
 });
+
+// ------------------------------------------------------------ B29 右键菜单
+//
+// 「指哪打哪」：把「在几百条里认出那一条」换成「在哪儿点就下哪个」（用户 2026-10-23）。
+// 三类菜单按 Chrome 的 contexts 自然分流（video/audio / image / link），不做的
+// 是「解析此页」（B28 未排期）——不注册一个点了会空转的菜单项。
+//
+// 硬边界（写进降级文案而不是装作能下）：MSE 站的 <video> 的 src 是 blob:，
+// Chrome 给 onClicked 的 info.srcUrl 也是 blob —— 右键对抖音/B 站播放器无效，
+// 那要靠整页嗅探（现有列表）或 B28 的页面级解析，不是菜单能救的。
+function setupContextMenus() {
+  try { chrome.contextMenus.removeAll(() => { try { createMenus(); } catch (e) { /* 忽略 */ } }); } catch (e) { /* 忽略 */ }
+}
+
+function createMenus() {
+  chrome.contextMenus.create({ id: "ms-dl-media", title: "下载这个视频/音频",
+    contexts: ["video", "audio"] });
+  chrome.contextMenus.create({ id: "ms-dl-image", title: "下载这张图片",
+    contexts: ["image"] });
+  chrome.contextMenus.create({ id: "ms-dl-link", title: "下载此链接的媒体",
+    contexts: ["link"] });
+}
+
+/** URL 的默认文件名：尾段（去查询串），空就让宿主用站点名兜底。 */
+function ctxNameFromUrl(u) {
+  try {
+    const tail = String(u || "").split("?")[0].split("#")[0].split("/");
+    return decodeURIComponent(tail[tail.length - 1] || "");
+  } catch (e) { return ""; }
+}
+
+/**
+ * 问页面「用户刚右键的是哪个元素」。
+ *
+ * info.srcUrl 在懒加载图（data-src）、背景图、<picture> 场景下是空的或不是
+ * 真实大图 —— inject-main 在 contextmenu 的 capture 阶段记下了被点元素，这里
+ * 回去取。应答走 ms:page（cmd:"ctx-res"）异步回来，用 requestId 关联；800ms
+ * 没回（页面脚本没注入/已失效）就当没有，走 srcUrl 原路。
+ */
+const pendingCtx = new Map();
+function askPageCtx(tabId) {
+  return new Promise((resolve) => {
+    const requestId = "ctx-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6);
+    const timer = { fn: null };
+    timer.fn = () => {
+      if (pendingCtx.delete(requestId)) resolve(null);
+    };
+    pendingCtx.set(requestId, { resolve, timer });
+    setTimeout(timer.fn, 800);
+    try {
+      chrome.tabs.sendMessage(tabId, { type: "ms:ctx-get", requestId }, () => {
+        void chrome.runtime.lastError;   // 页面脚本不在（chrome:// 等）——走超时
+      });
+    } catch (e) {
+      if (pendingCtx.delete(requestId)) resolve(null);
+    }
+  });
+}
+
+/**
+ * 右键菜单点击：能直接下的直接下（复用 popup 同一条 startNativeDownload 链，
+ * 记录/错误码/续传全都在），blob 或空地址才去问页面。
+ */
+async function handleContextMenu(info, tab) {
+  const tabId = tab && tab.id != null ? tab.id : null;
+  const pageUrl = String(info.pageUrl || (tab && tab.url) || "");
+  let url = String(info.srcUrl || info.linkUrl || "");
+  let kind = info.menuItemId === "ms-dl-image" ? "image"
+    : info.menuItemId === "ms-dl-link" ? "other" : "video";
+
+  const isBlob = (u) => !u || /^blob:/i.test(u) || !/^https?:/i.test(u);
+  let pageCtx = null;
+  if (isBlob(url) && tabId != null) {
+    pageCtx = await askPageCtx(tabId);
+    if (pageCtx && pageCtx.url && !isBlob(pageCtx.url)) {
+      url = pageCtx.url;
+      kind = pageCtx.kind === "image" ? "image" : kind;
+    }
+  }
+  if (isBlob(url)) {
+    // 不静默：右键没有 popup 可看，失败原因必须落在下载记录里
+    notifySaved({ ok: false, filename: ctxNameFromUrl(pageUrl) || pageUrl,
+      size: 0, error: "这是流式播放（blob）或拿不到直链，右键下不了——请用扩展列表里的下载入口" });
+    return;
+  }
+  // 命名优先用元素上下文（img.alt / 邻近标题），别落成 video.mp4（B29 设计⑤）
+  const name = (pageCtx && pageCtx.name) || ctxNameFromUrl(url);
+  try { await startNativeDownload({ url, tabId, kind, filename: name,
+    referer: pageUrl, tabUrl: pageUrl }); } catch (e) { /* startNativeDownload 内部已兜 */ }
+}
+try { chrome.contextMenus.onClicked.addListener((info, tab) => { handleContextMenu(info, tab); }); } catch (e) { /* 测试桩可能没有 */ }

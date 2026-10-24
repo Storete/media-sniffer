@@ -10,6 +10,52 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-067 · 2026-10-24 · B29 右键菜单：指哪打哪，测试顺手抓到一个「picture 优先级写反」
+
+### 起点：T-D3，方案两年前就定了
+
+DEVELOPMENT B29 的设计（用户 2026-10-23 提出）已把难点写死：**右键替代不了名称优化，
+替代的是「在几百条里找那一条」**——电商/图文页 316 张图的场景，右键点哪张下哪张。
+硬边界也早写死：MSE 站 `<video>` 的 src 是 blob:，右键对抖音/B 站播放器无效，
+那不是菜单能救的。本刀按既定方案落地，范围砍掉「解析此页」项（B28 未排期，
+不注册一个点了空转的菜单）。
+
+### 四处各改一层，全部复用既有链路
+
+- **manifest**：+`contextMenus` 权限；
+- **background**：onInstalled 注册三类菜单（contexts 自然分流）；onClicked 里
+  srcUrl 可用直接走 `startNativeDownload`——popup 同一条链，下载记录/错误码/
+  续传/超时重试全自动有；blob/空地址才回页面问（`ms:ctx-get`，800ms 超时降级）；
+  问不到**不静默**：右键没有 popup 可看，失败原因必须落在下载记录里（notifySaved）；
+- **content.js**：转发 ctx-get（纯搬运层，10 行）；
+- **inject-main**：`contextmenu` 的 **capture** 阶段监听（菜单弹出前记录，
+  站点 stopPropagation 拦不掉），解析真实地址：currentSrc→src→picture
+  `<source>`→srcset 最大候选→懒加载属性（data-src/data-original/data-lazy-src）
+  →背景图（getComputedStyle）。记录带 60 秒时效，右键后干了别的就不给陈旧答案。
+
+### 测试抓到的真缺陷：picture 优先级写反
+
+`msPickSrcset` 的注释写「`<picture>` 的 `<source>` 优先级高于 img 自身」，
+但调用顺序是 `el.currentSrc || el.src || msPickSrcset(el)`——有 src 就根本
+不看 picture。而 `<picture>` 场景下浏览器**实际渲染的是 `<source>` 的候选**
+（通常是更大的 webp/avif 变体），img.src 只是 fallback。结果：右键下载拿到的
+常常是降级格式。修法：`msPickSrcset(el) || el.currentSrc || el.src || ...`。
+ctx_pick 测试的「picture 的 source 被选中」一条先红后绿，钉住这个顺序。
+
+### 反向验证（4 组变异，全红）
+
+① 解析器丢懒加载兜底 → data-src 断言处崩（exit=1，红的正是那行）；
+② srcset 不取最大候选 → 1 红；③ 背景页去掉问页面降级 → 1 红（ms:ctx-get 消失）；
+④ blob 失败不写记录 → 2 红（失败记录消失）。
+
+### 数字
+
+- 新增 `test/context_menu.test.js` 19 项（注册/直下/blob 降级/双 blob 不静默/
+  超时降级/link 菜单）+ `test/ctx_pick.test.js` 16 项（五类元素形态 + 命名链）；
+- JS 1098 → **1133 项 / 20 文件 / 0 失败**；CI 接入两套；
+- 版本 1.3.58 → **1.3.59**（`extension/`：manifest / background / content /
+  inject-main 四文件）。
+
 ## d-066 · 2026-10-24 · T-C10：主清单地址不再混进 variants——判据是现成的，难点在双跑口径
 
 ### 起点：挂了三轮的账
@@ -2854,6 +2900,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-067](#d-067) | 2026-10-24 | B29 右键菜单：指哪打哪 | 三类菜单+页面解析器（capture 记录，currentSrc/srcset/picture/懒加载/背景图）；blob 降级问页面、问不到不静默；测试抓到 picture `<source>` 优先级写反（右键常拿到降级格式），已修；JS 1133 项；版本 1.3.59 |
 | [d-066](#d-066) | 2026-10-24 | T-C10：主清单地址不再混进 variants | 判据复用 1.3.45 的 listKind，共享函数给构建/比较两端；新计数 masterSkipped（不是 missing 也不是 dropped）；反向验证三组全红；JS 1098 项全过、真机两页 shadow 仍绿；版本 1.3.58 |
 | [d-064](#d-064) | 2026-10-24 | 真机验证自动化：headless Chrome + CDP 打穿 E 组大半 | `Extensions.loadUnpacked` 加载 1.3.57，SW 内 MSSession 存活、回放真跑、B 站两页双跑 `ok:true`、选 720 档 ffprobe 实测 1280x720；ffmpeg 拦截形态从「启动崩」变为「写盘拦」，按 exe 所在目录标签定案；工具收编 `tools/verify_headless.py` |
 | [d-063](#d-063) | 2026-10-24 | 规则库落地：模板 + CI 门禁 + 六条真实案例 | 每条已启用案例必须解析出指向 `test/` 真实文件的引用（空库绿、坏引用红，门禁自身 25 项反向验证）；顺带把「本机全量 5 假红」钉死在 WorkBuddy 沙箱的根目录 `Low Mandatory Level` 标签——干净 worktree 全绿，本机验真绿到 CI/干净副本 |

@@ -108,6 +108,11 @@
       // 重载页面反而会丢掉已缓冲的媒体，所以给一个「就地重扫」的入口。
       toPage({ cmd: "rescan" });
       sendResponse({ ok: true });
+    } else if (msg.type === "ms:ctx-get") {
+      // B29：background 在右键菜单点击后回来问「用户刚点的是哪个元素」，
+      // 应答由 inject-main 经 ms:page（cmd:"ctx-res"）异步回，这里只负责转发。
+      toPage({ cmd: "ctx-get", requestId: msg.requestId });
+      sendResponse({ ok: true });
     } else if (msg.type === "ms:ping") {
       // popup 打开时用来判断「本页脚本还活着吗」。
       // 能走到这里就说明 content.js 还在；页面主世界的 inject-main 是否还活着

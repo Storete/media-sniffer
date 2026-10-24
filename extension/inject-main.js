@@ -4118,6 +4118,102 @@
       return;
     }
 
+
+  // ------------------------------------------------------------ B29 右键元素解析
+  //
+  // contextmenu 的 **capture** 阶段（菜单弹出前记录，不被站点 stopPropagation 拦掉）。
+  // Chrome 给 onClicked 的 info.srcUrl 只认识 <img src>/<video src>——懒加载图
+  // （data-src）、srcset/<picture>、背景图全拿不到真实地址，video 取的是 <source>
+  // 而不是 currentSrc 的情况也常见。这里在页面里把「被点的那个元素」解析成真实地址
+  // 存起来，等 background 的 ms:ctx-get 来问（菜单点下去之后）。
+  let msLastCtx = null;
+
+  function msAbs(u) {
+    try { return new URL(u, location.href).href; } catch (e) { return String(u || ""); }
+  }
+
+  function msNameFrom(el) {
+    // 命名用元素上下文（B29 设计⑤）：alt → title → aria-label → 邻近标题 → 文档标题
+    const attr = (a) => { const v = el && el.getAttribute && el.getAttribute(a); return v ? String(v).trim() : ""; };
+    let n = attr("alt") || attr("title") || attr("aria-label");
+    if (!n) {
+      const near = el && el.closest && el.closest("figure,[class*=card],[class*=item]");
+      if (near) {
+        const h = near.querySelector("h1,h2,h3,h4,[class*=title],figcaption");
+        n = h ? String(h.textContent || "").trim() : "";
+      }
+    }
+    if (!n) n = String(document.title || "").trim();
+    return n.slice(0, 80);
+  }
+
+  function msPickSrcset(el) {
+    // srcset 取宽度最大的候选；<picture> 的 <source> 优先级高于 img 自身
+    const best = (s) => {
+      let out = "", w = -1;
+      for (const part of String(s || "").split(",")) {
+        const seg = part.trim().split(/\s+/);
+        if (!seg[0]) continue;
+        const m = /([\d.]+)w/.exec(seg[1] || "");
+        const cw = m ? parseFloat(m[1]) : 0;
+        if (cw >= w) { w = cw; out = seg[0]; }
+      }
+      return out;
+    };
+    const pic = el && el.closest && el.closest("picture");
+    if (pic) {
+      for (const so of pic.querySelectorAll("source")) {
+        const c = best(so.getAttribute("srcset"));
+        if (c) return c;
+      }
+    }
+    return best(el && el.getAttribute && el.getAttribute("srcset")) || "";
+  }
+
+  function msPickFromElement(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const tag = el.tagName;
+    let url = "", kind = "";
+    if (tag === "IMG") {
+      // <picture> 里浏览器实际渲染的是 <source> 的候选（通常是更大的 webp/avif
+      // 变体），img 的 src 只是它的 fallback —— 所以 picture 的 source 要排在
+      // src **前面**，否则右键拿到的常是降级格式。msPickSrcset 内部再兜 srcset
+      // 与懒加载属性，当前面全空时才会走到。
+      url = msPickSrcset(el) || el.currentSrc || el.src
+        || el.getAttribute("data-src") || el.getAttribute("data-original")
+        || el.getAttribute("data-lazy-src") || "";
+      kind = "image";
+    } else if (tag === "VIDEO" || tag === "AUDIO") {
+      const so = el.querySelector && el.querySelector("source");
+      url = el.currentSrc || el.src || (so && so.src) || "";
+      kind = tag === "VIDEO" ? "video" : "audio";
+    } else {
+      // 背景图（大量图墙是 div+background-image）
+      try {
+        const bg = getComputedStyle(el).backgroundImage || "";
+        const m = /url\(["']?([^"')]+)["']?\)/.exec(bg);
+        if (m && m[1] && m[1] !== "none") { url = m[1]; kind = "image"; }
+      } catch (e) { /* 忽略 */ }
+    }
+    if (!url) return null;
+    url = msAbs(url);
+    return { url, kind, name: msNameFrom(el), t: Date.now() };
+  }
+
+  try {
+    document.addEventListener("contextmenu", (e) => {
+      // 只认能解析出东西的目标；解析不出（纯文本/空白处）就清掉旧记录，
+      // 免得 background 问到上一个元素的陈旧答案。
+      try { msLastCtx = msPickFromElement(e.target) || null; } catch (err) { msLastCtx = null; }
+    }, true);
+  } catch (e) { /* 忽略 */ }
+
+  function msCtxAnswer(requestId) {
+    // 60 秒内的记录才算数：太旧说明用户右键后干了别的，答案不可信
+    const ok = msLastCtx && (Date.now() - msLastCtx.t) < 60000;
+    post({ cmd: "ctx-res", requestId: requestId || "", ctx: ok ? msLastCtx : null });
+  }
+
     if (!d.__ms_sniffer_cmd) return;
 
     if (d.cmd === "hello" || d.cmd === "rescan") {
@@ -4145,6 +4241,8 @@
       siteReplayReport();
       return;
     }
+
+    if (d.cmd === "ctx-get") { msCtxAnswer(d.requestId); return; }
 
     if (d.cmd === "save") {
       // 兼容旧链路：popup 直接点名保存
