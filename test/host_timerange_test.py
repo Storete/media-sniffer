@@ -139,6 +139,113 @@ finally:
         D.subprocess.Popen = real_popen
     shutil.rmtree(tmp, ignore_errors=True)
 
+# ---------------------------------------------------------------- [3] B27 ③层：自实现 HLS 选片
+
+print("[3] 自实现 HLS：EXTINF 选片 + 只下覆盖分片（真实 HTTP 请求计数）")
+
+# 3a: _parse_extinf_durs
+M3U8 = (
+    "#EXTM3U\n"
+    "#EXT-X-VERSION:3\n"
+    "#EXT-X-TARGETDURATION:3\n"
+    "#EXTINF:2.0,\n"
+    "seg0.ts\n"
+    "#EXTINF:2.0,\n"
+    "seg1.ts\n"
+    "#EXTINF:2.0,\n"
+    "seg2.ts\n"
+    "#EXTINF:2.0,\n"
+    "seg3.ts\n"
+    "#EXTINF:2.0,\n"
+    "seg4.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+durs = D._parse_extinf_durs(M3U8)
+check("EXTINF 时长解析（MAP 行天然跳过）", durs == [2.0] * 5, durs)
+
+tr = D.parse_time_range("3-7")   # → *00:00:03-00:00:07
+check("区间归一", tr == "*00:00:03-00:00:07", tr)
+win = D.select_segment_window(durs, tr)
+# 时间轴 [0,2)[2,4)[4,6)[6,8)[8,10)；覆盖 3-7 = 第 2~4 片（下标 1-3）
+check("选片 3-7s → 下标 1..3", win == (1, 3), win)
+check("选片 0-2s → 只有第 1 片", D.select_segment_window(durs, D.parse_time_range("0-2")) == (0, 0))
+check("end 超总长钳到最后一片", D.select_segment_window(durs, D.parse_time_range("8-99")) == (4, 4))
+check("start 超总长 → None（整段兜底）", D.select_segment_window(durs, D.parse_time_range("99-100")) is None)
+check("空表 → None", D.select_segment_window([], tr) is None)
+
+# 3b: 集成——本地 HTTP 服务器 + 请求计数，断言只请求选中分片
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+REQS = []
+# 假分片不行：收尾的验证四层会拿真 ffprobe 探产物（钉着），占位字节过不了。
+# 用真 ffmpeg 生成 10 秒 TS，按 188 字节整数倍等分 5 片——拼接后仍是合法 TS。
+import subprocess
+FFBIN = os.path.join(os.environ["LOCALAPPDATA"], "Temp", "ms-verify-bin", "ffmpeg.exe")
+os.makedirs(tmp, exist_ok=True)   # tmp 在 [2] 段的 finally 里被删了
+real_ts = os.path.join(tmp, "real.ts")
+subprocess.run([FFBIN, "-y", "-f", "lavfi", "-i", "testsrc=duration=10:size=160x90:rate=10",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=10",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-f", "mpegts", real_ts],
+               capture_output=True, timeout=120)
+ts_data = open(real_ts, "rb").read()
+if len(ts_data) % 188:
+    ts_data = ts_data[: len(ts_data) - (len(ts_data) % 188)]
+chunk = len(ts_data) // 5
+MEDIA = {
+    "/v.m3u8": M3U8.replace("seg", "/seg/seg").replace("/seg//", "/seg/"),
+    "/init.mp4": b"\x00\x00\x00\x18ftypmp42",
+}
+for i in range(5):
+    MEDIA["/seg/seg%d.ts" % i] = ts_data[i * chunk: (i + 1) * chunk]
+
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        REQS.append(self.path)
+        body = MEDIA.get(self.path)
+        if body is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        if self.path.endswith(".m3u8"):
+            # 清单里的相对地址按 /seg/... 服务
+            body = body.encode("utf-8")
+            for i in range(5):
+                body = body.replace(("/seg/seg%d.ts" % i).encode(),
+                                    ("http://127.0.0.1:%d/seg/seg%d.ts" % (self.server.server_port, i)).encode())
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+port = srv.server_port
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+trout = os.path.join(tmp, "tr-out")
+os.makedirs(trout, exist_ok=True)
+job3 = {"id": "tr-self", "url": "http://127.0.0.1:%d/v.m3u8" % port, "kind": "video",
+        "out": "tr-self", "timeRange": "3-7", "outdir": trout, "concurrency": 2,
+        "remux": False}   # 本机沙箱拦 ffmpeg 写盘（T-E5），③层选片验证只看请求计数
+D.run_hls_self(job3)
+st = D.read_status("tr-self")
+check("自实现链 done", st.get("status") == "done", st.get("status"))
+seg_reqs = sorted(r for r in REQS if "/seg/seg" in r)
+check("只请求了选中分片（第 2~4 片）",
+      seg_reqs == ["/seg/seg%d.ts" % i for i in (1, 2, 3)], seg_reqs)
+check("清单拉取", REQS.count("/v.m3u8") >= 1)
+srv.shutdown()
+
+# 3c: 反向验证埋点在文件底部统一跑
+
 print()
 print("=" * 50)
 if ok:

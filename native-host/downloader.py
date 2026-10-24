@@ -738,6 +738,71 @@ def parse_time_range(raw):
     return "*%s-%s" % (na, nb)
 
 
+_EXTINF_RE = re.compile(r"^#EXTINF:([\d.]+)", re.M)
+
+
+def _parse_extinf_durs(text):
+    """清单正文 → 每个分片的时长（EXTINF 秒）。
+
+    B27 ③层：自实现 HLS 链的选片需要时间轴。与 parse_hls_playlist 的
+    segments 天然对齐（标准 VOD 里 EXTINF 行数 == 分片数；EXT-X-MAP 等
+    标签行不匹配 EXTINF 正则，天然跳过）。调用方必须校验
+    `len(durs) == len(segments)`，不齐就放弃选片 —— 整段下永远是对的兜底。
+    """
+    try:
+        return [float(m) for m in _EXTINF_RE.findall(text or "")]
+    except ValueError:
+        return []
+
+
+def _tr_end_sec(tr):
+    body = tr[1:] if tr.startswith("*") else tr
+    b = body.partition("-")[2]
+    nums = [int(x) for x in b.split(":")]
+    while len(nums) < 3:
+        nums.insert(0, 0)
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+def select_segment_window(durs, tr):
+    """时长表 + 已归一区间（"*s-e" 形态）→ (首片下标, 末片下标)。
+
+    覆盖式选片：从累计时间轴 >= start 的第一片，到时间轴 >= end 的第一片
+    （分片对齐，精度 = 分片粒度；remux 段再按剩余偏移精切）。返回 None
+    表示选不了（区间起点在片外 / 总长为 0），调用方整段下。
+    end 超出总长**钳到最后一片**——「下到结尾」是用户的常见意图。
+    """
+    if not durs or not tr:
+        return None
+    body = tr[1:] if tr.startswith("*") else tr
+    a, _, b = body.partition("-")
+    def _sec(t):
+        nums = [int(x) for x in t.split(":")]
+        while len(nums) < 3:
+            nums.insert(0, 0)
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    start, end = _sec(a), _sec(b)
+    total = sum(durs)
+    if total <= 0 or start >= total:
+        return None
+    if end > total:
+        end = total
+    acc = 0.0
+    i0 = i1 = None
+    for i, d in enumerate(durs):
+        if i0 is None and acc + d > start:
+            i0 = i
+        if acc + d >= end:
+            i1 = i
+            break
+        acc += d
+    if i0 is None:
+        return None
+    if i1 is None:
+        i1 = len(durs) - 1
+    return (i0, i1)
+
+
 def write_cookie_netscape(cookies):
     """chrome.cookies.getAll 的结构化 cookie → Netscape cookies.txt 临时文件。
 
@@ -1756,6 +1821,23 @@ def run_hls_self(job, quiet=False):
     part = ts_path + ".part"
 
     segs = info["segments"]
+    # B27 ③层：自实现链的时间段截取。EXTINF 时长能对齐分片才选（不齐整段下）；
+    # 拼完后 remux 段按剩余偏移精切（tr_win 记给那边用）。
+    tr_win = None
+    tr = parse_time_range(job.get("timeRange"))
+    if tr and len(segs) > 1:
+        durs = _parse_extinf_durs(text)
+        if durs and len(durs) == len(segs):
+            win = select_segment_window(durs, tr)
+            if win:
+                i0, i1 = win
+                offset = sum(durs[:i0])
+                end_s = min(_tr_end_sec(tr), sum(durs))
+                tr_win = (offset, end_s - offset)   # (窗口起点在原视频的秒偏移, 精切终点-起点)
+                segs = segs[i0:i1 + 1]
+                write_status(job_id, err="", message="时间段截取：只下第 %d-%d 片（共 %d 片）"
+                             % (i0 + 1, i1 + 1, len(durs)))
+            notes.append("已按时间段截取（分片对齐后再精切）")
     total = len(segs)
     workers = max(1, min(16, int(job.get("concurrency") or 8)))
     done_bytes = 0
@@ -1898,10 +1980,17 @@ def run_hls_self(job, quiet=False):
             tmp_mp4 = os.path.join(tempfile.gettempdir(), "ms-remux-%s.mp4" % job_id)
             write_status(job_id, status="merging", percent=100, message="转封装 mp4")
             try:
+                remux_cmd = [ffmpeg, "-y", "-i", ts_path, "-c", "copy", "-f", "mp4",
+                             "-nostdin", "-hide_banner"]
+                if tr_win:
+                    # B27 ③层：分片只保证覆盖区间（分片对齐），这里按剩余偏移精切。
+                    # -ss 放 -i 前（输入定位快），-to 是绝对输出时长终点。
+                    off, cut_to = tr_win
+                    remux_cmd[2:2] = ["-ss", "%.3f" % off]
+                    remux_cmd += ["-t", "%.3f" % cut_to]
+                remux_cmd += ["-loglevel", "error", tmp_mp4]
                 r = subprocess.run(
-                    [ffmpeg, "-y", "-i", ts_path, "-c", "copy", "-f", "mp4",
-                     "-nostdin", "-hide_banner",
-                     "-loglevel", "error", tmp_mp4],
+                    remux_cmd,
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", timeout=1800, **_NO_WINDOW,
                 )
