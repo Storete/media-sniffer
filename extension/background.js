@@ -2467,6 +2467,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         break;
       }
+      case "ms:diag": {
+        // 诊断包（§6）：一键打包「版本 + 错误记录」，popup 组装后进剪贴板。
+        // 降低支持成本的唯一杠杆——用户不用截图，我们不用猜版本。
+        try {
+          const { msRecentErrors } = await chrome.storage.local.get({ msRecentErrors: [] });
+          sendResponse({ ok: true, version: chrome.runtime.getManifest().version, errors: msRecentErrors || [] });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e.message || e) });
+        }
+        break;
+      }
       case "native:cancel": {
         try {
           postNative({ action: "cancel", id: msg.id });

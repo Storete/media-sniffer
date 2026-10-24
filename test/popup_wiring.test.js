@@ -31,6 +31,15 @@ for (const id of ["selectToggle", "batchBar", "selAllBox", "selInv", "selSave", 
   check(`#${id} 在 HTML 里`, new RegExp('id="' + id + '"').test(HTML));
 }
 // B28「整页解析」按钮（1.3.60）：入口存在 + 发 native:download-page + 有降级文案
+// §6 产品件（1.3.61）：诊断包 + 首次空态「粘贴链接」
+check("#diagBtn 按钮在 HTML 里", /id="diagBtn"/.test(HTML));
+check("#diagBtn 绑定了点击处理", /#diagBtn"\)\.addEventListener\("click"/.test(JS));
+check("诊断向 background 要 ms:diag", /type: "ms:diag"/.test(JS));
+check("background 处理 ms:diag", /case "ms:diag":/.test(fs.readFileSync(path.join(EXT, "background.js"), "utf8")));
+check("诊断有脱敏口径（URL 去查询串）", /pathname/.test(JS) && /origin/.test(JS));
+check("空态有「粘贴链接」入口", /或粘贴视频页\/媒体链接/.test(JS));
+check("粘贴链接走 native:download-page（cookiejar 形态）",
+      (JS.match(/native:download-page/g) || []).length >= 2);
 check("#pageDl 按钮在 HTML 里", /id="pageDl"/.test(HTML));
 check("#pageDl 绑定了点击处理", /#pageDl"\)\.addEventListener\("click"/.test(JS));
 check("整页解析发 native:download-page", /type: "native:download-page"/.test(JS));

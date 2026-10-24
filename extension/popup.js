@@ -593,6 +593,29 @@ function renderList() {
       scan.addEventListener("click", () => rescanPage(scan));
       actions.append(scan);
       d.append(actions);
+      // 「粘贴链接」（§6 首次空态三动作之一）：B28 落地后这个动作有了实体——
+      // 把任意 http(s) URL（视频页/媒体直链都行）连本站 cookie 一起交给本地解析器
+      const linkRow = el("div", "empty-actions");
+      const linkInput = document.createElement("input");
+      linkInput.type = "text";
+      linkInput.placeholder = "或粘贴视频页/媒体链接…";
+      linkInput.style.cssText = "flex:1;min-width:0;padding:5px 8px;border:1px solid #d4d4d8;border-radius:8px;font:12px system-ui";
+      const linkGo = el("button", "btn-txt tint-blue", "解析下载");
+      linkGo.addEventListener("click", async () => {
+        const u = linkInput.value.trim();
+        if (!/^https?:\/\//i.test(u)) {
+          $("#hint").textContent = "请粘贴 http(s) 开头的链接";
+          setTimeout(() => ($("#hint").textContent = ""), 3000);
+          return;
+        }
+        linkGo.disabled = true;
+        const res = await chrome.runtime.sendMessage({ type: "native:download-page", url: u, tabId: null });
+        linkGo.disabled = false;
+        $("#hint").textContent = res && res.ok ? "已交给本地解析器，进度在下方任务区" : (res ? res.error : "本地下载器不可用");
+        setTimeout(() => ($("#hint").textContent = ""), 4000);
+      });
+      linkRow.append(linkInput, linkGo);
+      d.append(linkRow);
     }
     // 诊断：用户报「某站视频列表为空」时，这一行能直接告诉我们是哪一步丢的。
     // 只在「确实收到过请求、但全被丢掉」时显示，避免给正常空页加噪声。
@@ -820,6 +843,25 @@ function renderItem(it, no, hlsFamily, groupOf) {
   meta.append(sub);
   const vrow = variantRow(it);
   if (vrow) meta.append(vrow);
+  // B27 时间段截取：video/audio 且非直播（直播没有绝对时间轴）才显示
+  if ((it.k === "video" || it.k === "audio") && !it.live) {
+    const trwrap = el("div", "vsel");
+    const tr = document.createElement("input");
+    tr.type = "text";
+    tr.className = "vsel-sel";
+    tr.placeholder = "可选：00:01:30-00:02:45";
+    tr.title = "只下这一段时间（B27）。格式 1:30-2:45 / 00:01:30-00:02:45 / 秒-秒；留空 = 整段";
+    tr.style.maxWidth = "180px";
+    tr.value = timeRangePick.get(it.u) || "";
+    tr.addEventListener("change", () => {
+      const v = tr.value.trim();
+      if (v) timeRangePick.set(it.u, v);
+      else timeRangePick.delete(it.u);
+    });
+    const trtip = el("span", "vsel-tip", "时间段");
+    trwrap.append(trtip, tr);
+    meta.append(trwrap);
+  }
   row.append(meta);
 
   const ops = el("div", "ops");
@@ -1186,10 +1228,13 @@ async function startDownload(it, btn) {
   // 用户选了清晰度就下那一档（直接下子清单；宿主会把它当 media 清单处理），
   // 没选就交 master，由宿主挑画质最好的那档。
   const chosen = variantPick.get(it.u) || "";
+  // B27：填了时间段就透传（合法性宿主 parse_time_range 把关，非法 = 整段下）
+  const timeRange = (timeRangePick.get(it.u) || "").trim() || undefined;
   const res = await chrome.runtime.sendMessage({
     type: "native:download",
     url: it.u,
     variant: chosen,
+    timeRange,
     kind: it.k,
     // 文件名：**标题优先**，没有标题才退回 URL 推出的名字。
     //
@@ -1570,6 +1615,53 @@ $("#pageDl").addEventListener("click", async function () {
     setTimeout(() => ($("#hint").textContent = ""), 4000);
   } else {
     setHost(false, res ? res.error : "本地下载器不可用");
+  }
+});
+
+/**
+ * 「诊断」按钮（§6 诊断包）：一键打包版本/条目统计/脱敏错误日志进剪贴板。
+ * 报问题的唯一杠杆——用户不用截图、我们不用猜版本。
+ * 脱敏口径：URL 只留 origin + 首段路径（去查询串——里面常有 token），每条截 120 字。
+ */
+$("#diagBtn").addEventListener("click", async function () {
+  const btn = this;
+  btn.disabled = true;
+  const sanitizeUrl = (u) => {
+    try {
+      const x = new URL(String(u || ""));
+      return x.origin + x.pathname.split("/").slice(0, 2).join("/") + "/…";
+    } catch (e) { return String(u || "").slice(0, 60); }
+  };
+  const lines = [];
+  lines.push("资源嗅探诊断包 " + new Date().toISOString());
+  lines.push("扩展版本: " + (chrome.runtime.getManifest().version));
+  lines.push("页面: " + sanitizeUrl(tabUrl) + (siteBlocked() ? "（已屏蔽站点）" : ""));
+  lines.push("条目: " + JSON.stringify(counts) + "（全部 " + allItems.length + "）");
+  const dg = diagText(lastDiag);
+  if (dg) lines.push("抓取诊断: " + dg);
+  const { history } = await chrome.storage.session.get({ history: [] });
+  if ((history || []).length) {
+    lines.push("最近下载记录:");
+    for (const h of history.slice(-5)) {
+      lines.push("  " + (h.ok ? "✓" : "✗") + " " + String(h.name || "").slice(0, 40)
+        + (h.code ? " [" + h.code + "]" : "") + (h.error ? " " + String(h.error).slice(0, 60) : ""));
+    }
+  }
+  try {
+    const r = await chrome.runtime.sendMessage({ type: "ms:diag" });
+    if (r && r.ok) {
+      lines.push("扩展内部错误（最近 " + (r.errors || []).length + " 条，脱敏）:");
+      for (const e of (r.errors || []).slice(-8)) {
+        lines.push("  [" + e.where + "] " + String(e.detail || "").replace(/https?:\/\/[^\s"']+/g, (m) => sanitizeUrl(m)).slice(0, 120));
+      }
+    }
+    lines.push("本地引擎: " + ($("#hostState").textContent || "?"));
+    await navigator.clipboard.writeText(lines.join("\n"));
+    btn.textContent = "已复制";
+    setTimeout(() => { btn.textContent = "诊断"; btn.disabled = false; }, 2500);
+  } catch (e) {
+    btn.textContent = "失败";
+    setTimeout(() => { btn.textContent = "诊断"; btn.disabled = false; }, 2500);
   }
 });
 
