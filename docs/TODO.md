@@ -38,7 +38,7 @@
 | T-C4 | S2 验证四层 + 12 错误码 | 删掉一个分片 → 界面说「分片缺失，已重试 3 次」 | ✅ 1.3.53（验证四层落地，第 4 层真机待验）<br>证据：d-059；`host_verify_test` 36 项<br>四层收成一个纯函数 `verify_product(path, expect, ffprobe)` → `(ok, code, detail, extra)`；四条下载链（直链/yt-dlp/HLS/合并）收尾统一走 `finish_verified`，**done 必经验证**<br>反向验证：废清单检查 6 红、废 ffprobe returncode 2 红、废缺轨道 2 红、废时长 2 红<br>**判据后半句「删分片→界面报错」要真机复验**（本机无 ffmpeg，第 4 层用假 subprocess 验逻辑）；「12 错误码」已在前几刀升到 15 码并全接线 |
 | T-C5 | S3 规划表外置 + 表驱动测试 | 「这条为什么走 yt-dlp」能答 | ✅ 1.3.54<br>证据：d-060；`host_plan_test` 32 项表驱动<br>分派抠成纯函数 `plan_download(job, tools) -> {chain, reason, args, expect}`；`reason` 是人话「为什么」，进 `main()` 失败时的 `trail` 第一项<br>反向验证：废 hls 判定 2 红、废 use_ytdlp 7 红、废 merge 优先级 4 红<br>**后续**：S4 时 popup 复用 `plan_download`，reject 地址不显示「下载到本地」按钮 |
 | T-C6 | S4 工作站（队列 / 续传 / 历史，关浏览器照跑） | 关浏览器后任务继续 | ⬜（依赖 B 组）<br>**为何现在不做**：① 依赖 B 组下载内核，内核 2026-10-24 才补齐、未上真机（T-E5），地基未验不可盖楼；② PRODUCT-PLAN §5「顺序不可换」，且 §4「S4 不可跳过 P1 直接做提速」。<br>**定调（2026-10-24 与用户对齐）**：队列/续传/历史不是三个独立功能，而是同一份 `jobs.jsonl` + 常驻引擎衍生的三种能力；**不做独立的「下载历史页」**，历史只作「失败/完成记录载体（可重试 + 喂知识库分母）」。<br>**关键澄清**：大文件数据始终流式写磁盘（`.part`），从没进内存；进内存的只是几十字节任务状态，而它活在会被浏览器随时杀的 Service Worker 里——这才是「关浏览器就断」的根。S4 的工程量不在下载逻辑（B 组已就绪），在**把引擎搬出浏览器进程、变成独立常驻进程**（跨进程状态机 + 本地端口 token 鉴权 + 系统整合 + 真机验证）。<br>**引擎内存量级**：本体约 40–80 MB（一空白标签页量级，不随任务数增长），真正吃内存的是它临时拉起的 ffmpeg/yt-dlp 子进程（下完即退）。 |
-| T-C7 | S5 知识库双通道 + CI | 同站失败 3 次自动出建议 | 🔄 1.3.55 解释库自动通道落地（规则库 + CI 待做）<br>证据：d-061；`host_knowledge_test` 52 项 + `host_knowledge_host_test` 13 项<br>纯函数 `knowledge.py`（site_key 归一化 / fail_signature / record_failure / explain），阈值 ≥3 才开口；宿主 `poll_job` 失败收尾记账+出建议<br>反向验证：阈值改 1 五红、site 不归一化 6 红、签名不看码 3 红、废建议 2 红、废记账 2 红<br>**抓到一个真死锁**：Lock 非可重入，记账持锁后再 load 死锁，改 RLock<br>**1.3.56 popup 展示落地（本刀）**：宿主把站点级建议从「拼进 message 字符串」改成独立字段 `advice`/`adviceTitle` 发出；background 透传存 history/lastResult；popup 失败记录里建议单独一行 `.h-advice`（琥珀色、带「已知问题」标题），与红色 `.h-why`（单次原因）分两行。反向验证：丢 title 1 红、退回拼 message 3 红、建议并进 h-why 2 红<br>**待做**：规则库（人工通道）+ compatibility 模板 + CI（见交接文档 `HANDOFF-T-C7-规则库.md`） |
+| T-C7 | S5 知识库双通道 + CI | 同站失败 3 次自动出建议 | ✅ 1.3.57（自动化通过，案例真实度待真机）<br>证据：d-061（解释库纯函数+宿主记账）+ d-062（popup 展示）+ **d-063（规则库：模板 + CI 门禁 + 回填 6 案例）**<br>1.3.55 解释库自动通道：`knowledge.py` 纯函数（site_key 归一化 / fail_signature / record_failure / explain），阈值 ≥3 才开口；宿主 `poll_job` 失败收尾记账+出建议<br>反向验证：阈值改 1 五红、site 不归一化 6 红、签名不看码 3 红、废建议 2 红、废记账 2 红<br>**抓到一个真死锁**：Lock 非可重入，记账持锁后再 load 死锁，改 RLock<br>1.3.56 popup 展示：建议改独立字段 `advice`/`adviceTitle` 透传，popup 失败记录里琥珀色 `.h-advice` 与红色 `.h-why` 分两行；反向验证：丢 title 1 红、退回拼 message 3 红、并进 h-why 2 红<br>**1.3.57 规则库（人工通道）**：`docs/compatibility/`（README 准入三件套 + 000-template）+ CI 门禁 `tools/check_compat_rules.py`（每条已启用案例必须解析出指向 `test/` 下**真实存在**文件的引用；空库绿、坏引用红）；门禁自身 `compat_gate_test` 25 项反向验证（无引用/坏引用/缺字段/缺小节/无 frontmatter/目录不存在全钉红，带 BOM 好案例钉绿）；回填 6 条真实案例（001 文件名边界 / 002 BOM 首行 / 003 TG 分组 / 004 编号时机 / 005 焦点丢失 / 006 封面误收，来源 d-047 + B6~B11，引用逐一验真）<br>**后续**：规则库新案例按「用户报告+根因+可复现测试」三件套随真机失败逐条进，硬塞 = 造假规则库 |
 | T-C8 | S6 产品件七项（隐私政策 / 首次空态 / 诊断包 / opt-in 统计 / 发版通道 / 法律声明 / i18n） | 见 `PRODUCT-PLAN.md` §6 | ⬜ |
 | T-C9 | L1-b 读**播放器 API JSON**（独立开关） | 排 S6 之后，唯一改变隐私边界的动作 | 🅿️ 挂起 |
 
@@ -55,14 +55,18 @@
 
 ## E. 真机未验（自动化绿了但没上真机的）
 
+> 2026-10-24（d-064）：headless Chrome + CDP `Extensions.loadUnpacked`（Chrome 137+ 移除
+> `--load-extension` 后的官方通道）把 E 组里**不依赖登录态与 popup 交互**的部分自动化了，
+> 工具收在 `tools/verify_headless.py`（`--sw` 验 T-E1/T-E3，`--pages` 验 T-E4/T-E2）。
+
 | # | 事项 | 状态 |
 |---|---|---|
-| T-E1 | S0-5 SW 内存活 `typeof MSSession === "object"` | ⬜ |
-| T-E2 | S0-6 三页字段级等价（需基线 json） | ⬜ |
-| T-E3 | S0-7 真机 items 回放喂 `msBuildSession` | ⬜ |
-| T-E4 | 1.3.43~1.3.46 累计四刀的真机复验（HLS 时长 / 文件名 / 记录 / 折叠） | 🔄 部分（1.3.44/45 验过，46 待验） |
-| **T-E5** | **真机确认 `bin/ffmpeg.exe` 能跑**（合并 / HLS 转 mp4 全靠它） | ⬜ **重要**<br>本机该目录被 WorkBuddy 沙箱打了 `Low Mandatory Level` 标签，**里面任何 exe 都起不来**（连系统 `whoami.exe` 放进该目录也失败），所以本机无法验证 ffmpeg 与合并。<br>真机不受影响（进程完整性由 token 决定，不由 exe 所在目录决定），但**未验证**。<br>操作：`chrome://extensions` reload → 找个 B 站视频点合并，看是否成功 |
-| T-E6 | 选非默认档下完后用 `ffprobe` 验宽高（T-C1 的产物侧复核） | ⬜<br>自动化已用「请求了哪个档目录的分片」证明选档生效（验行为）；**产物宽高仍需真机**。<br>操作：reload → 找一条有多档的 HLS（如 mux 测试流）→ 选 720P 下完 →<br>`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 <文件>`，应得 `1280,720` |
+| T-E1 | S0-5 SW 内存活 `typeof MSSession === "object"` | ✅ d-064<br>headless Chrome 加载 1.3.57，SW（background.js）内 `MSSession` 为 object，`msBuildSession`/`msDiffSession`/`msSessionSid` 全 function |
+| T-E2 | S0-6 三页字段级等价（需基线 json） | 🔄 两页已过（d-064）<br>B 站首页 + 视频页（从首页 DOM 取的真实 BV，非固定 URL）双跑 `ms:shadow` 均 `ok:true`、missing/changed/extra 全 0；首页 kind 判 `image-set`、视频页判 `video`（DASH 双流 3 video+1 audio+4 seg）<br>**剩**：小红书/Telegram 需登录态，headless 无登录态做不了——待用户日常使用时观察 shadow 是否恒绿 |
+| T-E3 | S0-7 真机 items 回放喂 `msBuildSession` | ✅ d-064（自动化等价）<br>SW 内喂真形态 items：sid 非空（`xiaohongshu.com/explore/abc123`，d-058 的「静默空串」在真 SW 环境不存在）、xhs-cover 正确分离进 cover、正文图收进 images、m3u8 进 tracks=1 |
+| T-E4 | 1.3.43~1.3.46 累计四刀的真机复验（HLS 时长 / 文件名 / 记录 / 折叠） | 🔄 大头已过（d-064）：真页面抓取、同片折叠、列表、记录链路在 headless 真页面全活（视频页 161 条含 seg 折叠）；popup 交互与日常使用的细节随用户使用复验 |
+| **T-E5** | **真机确认 `bin/ffmpeg.exe` 能跑**（合并 / HLS 转 mp4 全靠它） | 🔄 **实质达成，剩一次日常点击复验**（d-064）<br>已验：bin/ffmpeg 与 TEMP 副本**同一文件**全功能可用（-version、libx264/aac 编码、`run_merge` 同款命令合并出音视频双轨、真实 170MB HLS TS→mp4 转封装、ffprobe 探测）<br>**沙箱拦截形态变了**：d-056 时代 bin/ 内 exe「启动即崩 0xC0000409」，今天**能启动**（tool_runs 探测通过）但**写盘被拦**（`Error opening output files: Permission denied`）——产品 remux 因此降级为「TS 完整可播 + 失败原因可见」，降级设计正确工作；TEMP 副本同命令成功，证明拦截按 **exe 所在目录的完整性标签**，与启动方式/cwd/CREATE_NO_WINDOW 无关（全部控制变量排除过）<br>**根目录标签未变**（`Low Mandatory Level:(OI)(CI)(NW)`）：本机在工作区目录内跑会起子进程/写盘的全量回归会假红（实测 5 套；同 HEAD 干净 worktree 全绿 25/25）→ 本机验「真绿」到 CI 或干净副本<br>剩：用户日常 `chrome://extensions` reload → 点一次合并（预期直接成功） |
+| T-E6 | 选非默认档下完后用 `ffprobe` 验宽高（T-C1 的产物侧复核） | ✅ d-064<br>真实多档流 x36xhzz（5 档）job 传 `variant:"720"`（popup 只传高度的真实路径）→ 产品整链下载 → **ffprobe 实测产物 `h264,1280,720`**（不是默认的最高档 1080）、时长 634.6s 完整、aac 音轨在；状态文件 `quality:"1280x720"` 与产物一致<br>popup 的选档 UI 交互本身随用户日常使用复验 |
 
 ---
 
