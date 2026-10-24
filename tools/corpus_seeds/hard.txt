@@ -1,0 +1,13 @@
+# 疑难样本种子：第一跑里 VERIFY_MISMATCH 的 14 条 + 已知难站
+# 判据：这些预期失败，但「失败的样子」（错误码 + trail）是大脑的学习材料。
+# 期望值见 docs/corpus/eval-cases.jsonl 的对应条目。
+https://tv.sohu.com/
+https://www.miguvideo.com/
+https://www.pptv.com/
+https://www.le.com/
+https://www.acfun.cn/
+https://www.douyu.com/
+https://www.huya.com/
+https://live.douyin.com/
+https://music.163.com/
+https://y.qq.com/

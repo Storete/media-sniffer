@@ -1,0 +1,7 @@
+# 正样本种子：公开的稳定测试流（小文件优先，采集当天有效）
+# 判据：这些链接纯宿主档应当 done——校准「done 的形状」。
+# 已验证 done（2026-10-24）：MDN flower / w3schools mov_bbb
+# 大文件流需 --job-timeout 300+：https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8
+# 注：Google storage 系（gtv-videos-bucket 等）本机网络不可达（403/404），已剔除。
+https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4
+https://www.w3schools.com/html/mov_bbb.mp4

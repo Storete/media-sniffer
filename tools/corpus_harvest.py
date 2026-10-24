@@ -100,14 +100,15 @@ def probe(url):
     return ("unknown", ctype, [])
 
 
-def run_download(url, n, tmp, app_jobs):
+def run_download(url, n, tmp, app_jobs, job_timeout=120):
     """纯宿主档：写 job → 子进程跑 downloader main → 读状态。返回语料记录。"""
     jid = "corpus-%s-%d" % (hashlib.md5(url.encode()).hexdigest()[:8], n)
     job = {"id": jid, "url": url, "kind": "video", "out": "corpus-%d" % n,
            "outdir": tmp, "concurrency": 4}
     jp = os.path.join(tmp, "job-%s.json" % jid)
     json.dump(job, open(jp, "w", encoding="utf-8"), ensure_ascii=False)
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", MS_JOB_TIMEOUT="120",
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
+               MS_JOB_TIMEOUT=str(job_timeout),
                NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
     t0 = time.time()
     try:
@@ -159,6 +160,8 @@ def main(argv=None):
     ap.add_argument("--outdir", default=os.path.join(
         os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MediaSniffer", "corpus"))
     ap.add_argument("--keep-media", action="store_true", help="保留下载产物（默认只留记录）")
+    ap.add_argument("--job-timeout", type=int, default=120,
+                    help="单条下载的任务级超时秒（默认 120；大 HLS 流适当加大）")
     args = ap.parse_args(argv)
 
     links = load_links(args.input)[: args.limit]
@@ -193,7 +196,7 @@ def main(argv=None):
             print("  [%d/%d] SKIP 抓不到（%s）" % (n, len(links), info))
             time.sleep(args.rate)
             continue
-        dl = run_download(url, n, args.outdir, app_jobs)
+        dl = run_download(url, n, args.outdir, app_jobs, args.job_timeout)
         dl.update({k: rec[k] for k in ("purity", "info", "markers", "ts")})
         dl["outcome"] = dl.get("status") or "no-status"
         jf.write(json.dumps(dl, ensure_ascii=False) + "\n"); jf.flush()

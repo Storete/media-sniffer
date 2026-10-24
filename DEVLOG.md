@@ -10,6 +10,53 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-077 · 2026-10-24 · T-F3 考卷与考场：基线跑分 33%——「玩偶的智商」第一次被测量
+
+### 起点：F2 判据里的「评测集」——做的时候发现考卷可以先落
+
+用户 F 系列规划（TODO 里的 M1~M6）里评测集排 F3、依赖语料上量（F2）。
+做的时候发现**考卷不必等千级语料**：第一跑的 14 条 VERIFY_MISMATCH +
+20 站审计 + DEVLOG 里的实锤案例（4kvm 剥壳 / 抖音 MSE / 腾讯私有清单 /
+Telegram blob / B 站 DASH）已经覆盖了失败分类的主干。先落考卷和考场，
+上量后再补案例。
+
+### 考卷（docs/corpus/eval-cases.jsonl，24 案）
+
+每案：URL + 来源引用（d-0XX/第一跑/审计）+ observed（实际 chain/errcode/trail）
++ **expected.strategy（受控词表 10 个）+ expected.diagnosis（一句人话）+ status**
+（已确认 9 = DEVLOG 实锤过的 / 待复核 15 = 等用户批改）。受控词表是关键设计：
+「说得对但词不对」= 没对接上，评分才能自动化。
+
+### 考场（tools/corpus_eval.py）
+
+- **大脑接口**：`--brain path.py` 暴露 `diagnose(case) -> {diagnosis, strategy}`——
+  未来 LLM 大脑、现在的规则基线、任何方案，同一张卷子可比；
+- **规则基线**（缺省）：只用产品现有信号（errcode/chain/trail/markers），
+  **不许背 URL 关键词**——它的分数是「确定性管线遇到新站时的上限」；
+- 评分：strategy 精确匹配，按 status 分组出准确率。
+
+### 基线跑分：8/24（33%）
+
+全对的三类：done 形状、DRM（不做）、纯图文页（纯度闸门的信息够用）。
+几乎全错的一类：**VERIFY_MISMATCH 泛化桶**——视频站首页/直播站/音乐站/
+新闻门户在基线眼里是同一个错（「yt-dlp 解析结果不是媒体」），只能统一猜
+「去给具体视频页」，于是直播猜错、音乐猜错、门户猜错。**这 16 道错题就是
+LLM 大脑的岗位说明书**：它要做的第一件事，就是把 VERIFY_MISMATCH 这一个码
+按页面真实形态拆成 four种不同的下一步。考卷已逐题标了期望诊断。
+
+### 正样本补采（F2 的一部分提前完成）
+
+分层种子 `tools/corpus_seeds/`（positive/hard）；MDN flower + w3schools
+mov_bbb **done×2 入库**（「成功长什么样」有了样本）；Google storage 系源
+本机不可达（403/404）已剔除并注明；harvest 加 `--job-timeout`（x36xhzz
+这种 179MB 的 HLS 用 120s 任务超时跑不完）。
+
+### 数字
+
+新增 `docs/corpus/eval-cases.jsonl`（24 案）、`tools/corpus_eval.py`、
+`tools/corpus_seeds/`（positive/hard）；corpus_harvest 加 --job-timeout；
+TODO 的 F 系列状态合并进用户规划稿（我此前误加了重复行，已删）。
+
 ## d-076 · 2026-10-24 · T-F1 语料采集器：大脑的第一跑，25 条种子换来三条教学
 
 ### 起点：用户拍板「初级训练」路线（T-F1，判据见 TODO）
@@ -3271,6 +3318,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-077](#d-077) | 2026-10-24 | T-F3 考卷与考场（提前落地） | eval-cases 24 案（受控词表 10 strategy）+ corpus_eval 可插拔大脑 + 规则基线跑分 33%=玩偶智商；VERIFY_MISMATCH 泛化桶 16 错题=LLM 的岗位说明书；正样本 done×2 入库；15 案待用户批改 |
 | [d-076](#d-076) | 2026-10-24 | T-F1 语料采集器 + 第一跑 | 纯度闸门（direct/marked/clean/fetch-error）+ 纯宿主直灌 + JSONL/分布报告；第一跑 25 条：0 done / 14 VERIFY_MISMATCH / 0 INTERNAL（错误码表全接住）；三条教学：种子需分层、schema 补 trail、纯度闸门真实世界正常；corpus_harvest_test 11 项 |
 | [d-075](#d-075) | 2026-10-24 | 用户提议：真机模拟用户验收入流程 | AGENTS 7.5（人工勾单：点插件/列表匹配页面/逐 tab 计数/每链点下载验落盘可播/失败文案）；verify_headless --userflow 自动半实测全绿（列表匹配 + 73821B 落盘） |
 | [d-074](#d-074) | 2026-10-24 | 真机白屏：B27 UI 只落了一半 | 渲染块引用未声明的 timeRangePick，video 条目必抛 → 列表纯空白；补声明 + renderList 兜底（错误一句话代替白屏）+ 回放 harness 入库（popup 渲染路径从此有运行时回归）；教训：测试全绿的覆盖范围要说得出；1.3.63 |
