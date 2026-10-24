@@ -76,7 +76,7 @@ node test/range_parallel.test.js
 node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（23 套；缺「能跑的 ffmpeg」时相关套件自己报 SKIP=77）
+# Python（24 套；缺「能跑的 ffmpeg」时相关套件自己报 SKIP=77）
 python test/run_all.py
 
 # JS 全量 + 可复现的总数（**别再用 `grep -c "✓"` 手工数**）
@@ -168,7 +168,7 @@ python test/run_js.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 12 套主 JS + 23 套 Python 全绿（JS 全套 **1085** 项，用 `python test/run_js.py` 取数），数字记进 `DEVLOG.md`
+- [ ] 12 套主 JS + 24 套 Python 全绿（JS 全套 **1085** 项，用 `python test/run_js.py` 取数），数字记进 `DEVLOG.md`
   —— **「跳过」不算「全绿」**：`run_all.py` 的汇总行会自己打这句提醒。套件内部跳过用
   `sys.exit(77)`（automake 约定），**不要用 `exit(0)`**：那会被记成 PASS，等于把「没测」说成「过了」。
 - [ ] **从源码里切片/截取跑测试时，先确认切到的不是空串或半截。**

@@ -309,9 +309,11 @@ check("码是 HTTP_403（三条一致 → 直接用）", st.get("err") == "HTTP_
 check("对外只有一句人话，不再是「自实现 HLS: … ／ yt-dlp: … ／ 直连: …」",
       st.get("message") == E.describe("HTTP_403"), st.get("message"))
 check("trail 里留住了三条路径各自的码（诊断用）",
-      len([x for x in (st.get("trail") or "").split(" ／ ") if "=" in x]) == 3, st.get("trail"))
+      len([x for x in (st.get("trail") or "").split(" ／ ") if "=" in x]) == 4, st.get("trail"))
 check("trail 里三条路径都点了名",
       all(k in (st.get("trail") or "") for k in ("自实现HLS", "yt-dlp", "直连")), st.get("trail"))
+check("trail 第一项是「规划」—— 为什么走这条链（T-C5 判据：能答「为什么走 yt-dlp」）",
+      (st.get("trail") or "").startswith("规划="), st.get("trail"))
 
 # 三条不一致时：对外取**最具体**的那个，而不是「最后一条路的说法」。
 # 现场：HLS 与直连都被 403 挡住（解不出内容），但 yt-dlp 认出了 DRM ——

@@ -2037,25 +2037,110 @@ def _short(s, n=400):
     return (s or "")[:n]
 
 
+def plan_download(job, tools=None):
+    """规划表（L2-a 的落地）：这一单该走哪条下载链，以及为什么。
+
+    把 `main()` 里那段内嵌 `if` 链抽成**纯函数**：输入是 job（数据）+ tools
+    （能力，不在这里调 `find_tool`，这样测试不用真起子进程就能驱动 30~50 条
+    表驱动用例）。输出是数据，不碰网络、不碰文件、不写状态。
+
+    返回：
+        {
+          "chain":  "merge" | "hls" | "ytdlp" | "urllib" | "reject",
+          "reason": 一句人话 —— 为什么走这条链（判据「这条为什么走 yt-dlp」
+                   能不能答，就看这个字段），
+          "args":   传给对应 run_* 的补充参数（目前只有 urllib 的 expect），
+          "expect": 产物验证预期（喂给 verify_product / finish_verified），
+        }
+
+    分派顺序**刻意固定**（不是并列的 if，是一串优先级）：
+      1. mode == "merge"            → merge（合并任务没有 url）
+      2. 地址不是 http(s)           → reject（相对/blob 地址，外部进程取不到）
+      3. 有 yt-dlp 且该用 yt-dlp     → hls / ytdlp（见 use_ytdlp 的判定）
+      4. 其余                        → urllib（直链，自己发 Range）
+
+    第 3 步内部再分：m3u8 先 hls（自实现剥壳，搞不定再 yt-dlp 接手），
+    非 m3u8 的站点页/音视频走 ytdlp。
+    """
+    tools = tools or {}
+    mode = job.get("mode") or ""
+    url = (job.get("url") or "").strip()
+    kind = job.get("kind") or "other"
+    low = url.lower()
+
+    if mode == "merge":
+        return {
+            "chain": "merge",
+            "reason": "合并任务没有 URL，直接按 mode=merge 分发",
+            "args": {},
+            "expect": {"tracks": ["video"]},
+        }
+
+    if not re.match(r"^https?://", url, re.I):
+        return {
+            "chain": "reject",
+            "reason": "地址不是 http(s)（相对路径 / blob / data），外部进程取不到",
+            "args": {},
+            "expect": {},
+        }
+
+    ytdlp = tools.get("ytdlp")
+    looks_like_file = bool(MEDIA_EXT.search(low)) or "/progressive/" in low
+    use_ytdlp = (
+        ytdlp is not None
+        and not looks_like_file
+        and (kind in ("video", "audio") or ".m3u8" in low or ".mpd" in low
+             or "format=m3u8" in low)
+    )
+
+    if not use_ytdlp:
+        why = "是明确的媒体直链（扩展名/带 Range）" if looks_like_file else (
+            "没有可用的 yt-dlp" if ytdlp is None else
+            "kind=%s 且地址不像媒体" % kind)
+        return {
+            "chain": "urllib",
+            "reason": "直链下载：" + why,
+            "args": {},
+            "expect": {},
+        }
+
+    if looks_like_hls_url(url):
+        return {
+            "chain": "hls",
+            "reason": "m3u8 先走自实现剥壳（伪装分片站只有下了第一片才知道），"
+                     "搞不定（AES/BYTERANGE）再由 yt-dlp 接手",
+            "args": {},
+            "expect": {},
+        }
+
+    return {
+        "chain": "ytdlp",
+        "reason": "站点页 / 非 m3u8 的流地址，交给 yt-dlp（HLS 分片支持最好）",
+        "args": {},
+        "expect": {},
+    }
+
+
 def main():
     job = json.load(open(sys.argv[1], encoding="utf-8"))
     job_id = job["id"]
     os.makedirs(JOBS_DIR, exist_ok=True)
     try:
-        # 合并任务没有 url，先于地址校验分发
-        if job.get("mode") == "merge":
+        ytdlp = find_tool(["yt-dlp"])
+        ffmpeg = find_tool(["ffmpeg"])
+        # 规划表（L2-a）：这一单首选走哪条链、为什么。分派不再是一段内嵌 if，
+        # 而是先问 plan_download —— 执行和「为什么」用同一份逻辑，不会漂移。
+        plan = plan_download(job, {"ytdlp": ytdlp, "ffmpeg": ffmpeg})
+        chain = plan["chain"]
+
+        if chain == "merge":
             run_merge(job)
             return
 
-        # 相对地址（Telegram 的 /a/progressive/document…、blob:、data:）外部进程根本取不到：
-        # yt-dlp 会把它当网页去爬，然后报 HTTP 302。这种一律交回页面保存。
-        #
-        # **这条刻意不进码表**（T-B6 时特意确认过）：它不是「失败原因」，
-        # 而是「这条地址不该被派给外部下载器」—— 属于路由判断。等 T-C5 的规划表
-        # 建好，这类地址在 popup 里就不该出现「下载到本地」按钮，连踩都踩不到。
-        # 在路由修好之前留一句话，比给它编一个码更诚实。
-        url = (job.get("url") or "").strip()
-        if not re.match(r"^https?://", url, re.I):
+        # reject：地址不是 http(s)。这不是「失败原因」而是「不该派给外部下载器」的
+        # 路由判断，刻意不进码表（T-B6 确认过）。等 popup 侧把这类地址的「下载到本地」
+        # 按钮去掉，连踩都踩不到；在此之前留一句话比给它编一个码更诚实。
+        if chain == "reject":
             write_status(
                 job_id, status="error",
                 message="这不是外部进程能直接取的地址（可能是页内相对路径/blob），"
@@ -2063,74 +2148,56 @@ def main():
             )
             return
 
-        ytdlp = find_tool(["yt-dlp"])
-        ffmpeg = find_tool(["ffmpeg"])
-        kind = job.get("kind") or "other"
-        low = url.lower()
-        # 已经确认是媒体文件直链的（扩展名明确、带 Range 的 progressive 链接），
-        # 不要无谓地先丢给 yt-dlp —— 它对非站点 URL 经常返回 302/403，
-        # 白白浪费一轮还会给出看不懂的报错。
-        looks_like_file = bool(MEDIA_EXT.search(low)) or "/progressive/" in low
-        use_ytdlp = (
-            ytdlp is not None
-            and not looks_like_file
-            and (kind in ("video", "audio") or ".m3u8" in low or ".mpd" in low
-                 or "format=m3u8" in low)
-        )
-        if use_ytdlp:
-            # m3u8 先走自实现，而不是先 yt-dlp。
-            #
-            # 理由是「壳只有下第一片才知道」：伪装分片站（4kvm，2026-10-22）的
-            # 清单长得完全正常，yt-dlp 会一路重试到超时（514 个分片 × --retries 10
-            # × --fragment-retries 10，实测几分钟还停在 percent 0），用户只能干等。
-            # 自实现剥壳对普通 HLS 是原样透传（strip_masquerade 认不出壳就返回原
-            # 字节），所以先自己试没有副作用；搞不定（AES 加密 / BYTERANGE / 拉不
-            # 到清单）再由 yt-dlp 接手。
-            hls_msg = ""
-            hls_code = ""
-            if looks_like_hls_url(url):
-                if run_hls_self(job, quiet=True):
-                    st_h = read_status(job_id)
-                    # cancelled 也必须停：「用户点了取消」不是「这一路没搞成」，
-                    # 继续掉进 yt-dlp 等于取消按钮没作用（真机 1.3.33 冒烟撞到：
-                    # 状态被从 cancelled 覆盖成 downloading，目录又开始出现文件）。
-                    if st_h.get("status") in ("done", "cancelled"):
-                        return
-                    hls_msg = st_h.get("message") or ""
-                    hls_code = st_h.get("err") or ""
-
-            run_ytdlp(job, ytdlp, ffmpeg)
-            # yt-dlp 失败时给一次普通 HTTP 下载的机会：很多「302/403」只是 yt-dlp
-            # 的站点识别误判，真正带 cookie/referer 的直连反而能下。
-            st = read_status(job_id)
-            if st.get("status") == "error":
-                ytdlp_msg = st.get("message") or ""
-                ytdlp_code = st.get("err") or ""
-                run_urllib(job)
-                st2 = read_status(job_id)
-                if st2.get("status") == "error":
-                    # 三条路都失败：对外只留**一个**码、一句话。
-                    #
-                    # 原来是把三句报错拼成「自实现 HLS: … ／ yt-dlp: … ／ 直连: …」，
-                    # 那是写给作者看的，用户拿到一条 200 字的串，还是不知道该干什么。
-                    # 现在 code 用 consensus 挑（三条一致就用它，否则挑最具体的一个），
-                    # 各自的原话留在 trail 里给诊断包用 —— 人看一句，机器看三条。
-                    codes = [hls_code, ytdlp_code, st2.get("err") or ""]
-                    code = errcode.consensus(codes)
-                    trail = []
-                    for label, c, m in (("自实现HLS", hls_code, hls_msg),
-                                        ("yt-dlp", ytdlp_code, ytdlp_msg),
-                                        ("直连", st2.get("err") or "", st2.get("message") or "")):
-                        if c or m:
-                            # 有码记码；没码（老调用点 / 测试里的假实现）就记那句话。
-                            # 只记「无码」等于把三条路的诊断信息一起丢掉 ——
-                            # trail 存在的唯一理由就是「以后能查出是谁的锅」。
-                            trail.append("%s=%s" % (label, c or _short(m, 40)))
-                    write_status(job_id, status="error", err=code,
-                                 message=errcode.describe(code),
-                                 trail=" ／ ".join(trail))
-        else:
+        if chain == "urllib":
             run_urllib(job)
+            return
+
+        # chain == "hls" 或 "ytdlp"：都先按「m3u8 走自实现」的老规则跑。
+        # hls 是首选，搞不定（AES/BYTERANGE/拉不到清单）再由 yt-dlp 接手；
+        # 理由是「壳只有下第一片才知道」：伪装分片站（4kvm）的清单长得完全正常，
+        # yt-dlp 会一路重试到超时。自实现剥壳对普通 HLS 原样透传，先试没有副作用。
+        hls_msg = ""
+        hls_code = ""
+        if chain == "hls":
+            if run_hls_self(job, quiet=True):
+                st_h = read_status(job_id)
+                # cancelled 也必须停：「用户点了取消」不是「这一路没搞成」，
+                # 继续掉进 yt-dlp 等于取消按钮没作用（真机 1.3.33 冒烟撞到）。
+                if st_h.get("status") in ("done", "cancelled"):
+                    return
+                hls_msg = st_h.get("message") or ""
+                hls_code = st_h.get("err") or ""
+
+        run_ytdlp(job, ytdlp, ffmpeg)
+        # yt-dlp 失败时给一次普通 HTTP 下载的机会：很多「302/403」只是 yt-dlp
+        # 的站点识别误判，真正带 cookie/referer 的直连反而能下。
+        st = read_status(job_id)
+        if st.get("status") == "error":
+            ytdlp_msg = st.get("message") or ""
+            ytdlp_code = st.get("err") or ""
+            run_urllib(job)
+            st2 = read_status(job_id)
+            if st2.get("status") == "error":
+                # 三条路都失败：对外只留**一个**码、一句话。
+                #
+                # 原来是把三句报错拼成「自实现 HLS: … ／ yt-dlp: … ／ 直连: …」，
+                # 那是写给作者看的，用户拿到一条 200 字的串，还是不知道该干什么。
+                # 现在 code 用 consensus 挑（三条一致就用它，否则挑最具体的一个），
+                # 各自的原话留在 trail 里给诊断包用 —— 人看一句，机器看三条。
+                codes = [hls_code, ytdlp_code, st2.get("err") or ""]
+                code = errcode.consensus(codes)
+                trail = ["规划=%s" % plan["reason"]]
+                for label, c, m in (("自实现HLS", hls_code, hls_msg),
+                                    ("yt-dlp", ytdlp_code, ytdlp_msg),
+                                    ("直连", st2.get("err") or "", st2.get("message") or "")):
+                    if c or m:
+                        # 有码记码；没码（老调用点 / 测试里的假实现）就记那句话。
+                        # 只记「无码」等于把三条路的诊断信息一起丢掉 ——
+                        # trail 存在的唯一理由就是「以后能查出是谁的锅」。
+                        trail.append("%s=%s" % (label, c or _short(m, 40)))
+                write_status(job_id, status="error", err=code,
+                             message=errcode.describe(code),
+                             trail=" ／ ".join(trail))
     except Exception as e:
         _give_up(job_id, errcode.INTERNAL, ("下载进程异常: " + str(e))[:60])
 
