@@ -1152,6 +1152,44 @@ console.log("\n[HLSP] applyHlsPageTitle：把页面标题借给真 m3u8 条目")
   check("[HRTY] 没有等待任务时返回空", pick(undefined, "https://a.com/x.m3u8", 500) === "");
 }
 
+// ---------------------------------------------------------------- 选清晰度的入参净化
+//
+// `vlist` 是从**页面**（站点 JS 环境里的钩子）传过来的，而 popup 会拿它当下载
+// 地址交给本地下载器。所以这一层不是「校验」，是**信任边界**：一条被污染的 url
+// 等于让站点决定我们下什么。下面的用例全是「坏形状应该被丢掉」。
+{
+  // 切片边界不能用 "\n" 拼：background.js 是 CRLF，"/**\n *" 匹配不上，
+  // indexOf 返回 -1 之后 slice(start, -1) 会一路取到文件末尾，
+  // 于是这段「纯函数测试」把整个 background 又执行了一遍（chrome is not defined）。
+  // 改用不含换行的锚点 + lastIndexOf("}") 收尾。
+  const _start = bgCode.indexOf("function normVariants");
+  const _end = bgCode.indexOf(" * 页面侧的清单元数据到达");
+  const src = bgCode.slice(_start, bgCode.lastIndexOf("}", _end) + 1);
+  const nvCtx = vm.createContext({ Array, Number, String, RegExp, JSON, Math, Object });
+  vm.runInContext(src + "\nthis.__nv = normVariants;", nvCtx, { filename: "normVariants" });
+  const nv = nvCtx.__nv;
+
+  const good = nv([[2000000, "1920x1080", "https://a.com/1.m3u8"],
+                   [900000, "854x480", "http://b.com/2.m3u8"]]);
+  check("[VAR] 正常两档原样通过", good.length === 2 && good[0].res === "1920x1080", good);
+  check("[VAR] 带宽被转成数字", good[0].bandwidth === 2000000, good[0]);
+  check("[VAR] 非 http(s) 的地址被丢（javascript:/data:/file:）",
+    nv([[1, "1", "javascript:alert(1)"], [1, "1", "data:text/html,x"],
+        [1, "1", "file:///c:/x"]]).length === 0);
+  check("[VAR] 超长 url 被丢（>2048）",
+    nv([[1, "1", "https://a.com/" + "x".repeat(3000)]]).length === 0);
+  check("[VAR] 不是数组的项被丢",
+    nv(["https://a.com/x.m3u8", null, 42, { url: "https://a.com/y" }]).length === 0);
+  check("[VAR] 字段不足 3 个被丢", nv([[1, "1080"]]).length === 0);
+  check("[VAR] 传进来的不是数组 → 空数组，不抛",
+    nv(undefined).length === 0 && nv("x").length === 0 && nv({}).length === 0);
+  check("[VAR] 最多只留 8 档（防清单写成上百档把消息撑大）",
+    nv(Array.from({ length: 30 }, (_, i) => [1, "1", "https://a.com/" + i])).length === 8);
+  check("[VAR] res 被截断到 20 字符（页面能塞任意长文本）",
+    nv([[1, "9".repeat(200), "https://a.com/x"]]).length === 1
+    && nv([[1, "9".repeat(200), "https://a.com/x"]])[0].res.length <= 20);
+}
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

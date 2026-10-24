@@ -781,6 +781,30 @@ function applyHlsMetaTo(it, m) {
   if (m.kind) it.listKind = m.kind;
   if (m.enc) it.enc = 1;
   if (m.variants > 0) it.variants = m.variants;
+  if (m.vlist && m.vlist.length) it.vlist = m.vlist;
+}
+
+/**
+ * 校验并归一化页面传来的清晰度档位。
+ *
+ * 页面是**不受信任的半边界**（那是站点的 JS 环境，我们的钩子跑在里面），
+ * 所以这里不信任任何字段形状：逐项重建，非字符串/超长的直接丢。
+ * 之所以值得写这么多行，是因为 `vlist` 会被 popup 拿去当下载地址 ——
+ * 一条被污染的 url 等于让站点决定我们下什么。
+ */
+function normVariants(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (let i = 0; i < raw.length && out.length < 8; i++) {
+    const v = raw[i];
+    if (!Array.isArray(v) || v.length < 3) continue;
+    const bw = Number(v[0]) || 0;
+    const res = String(v[1] || "").slice(0, 20);
+    const url = String(v[2] || "");
+    if (!/^https?:/i.test(url) || url.length > 2048) continue;
+    out.push({ bandwidth: bw, res: res, url: url });
+  }
+  return out;
 }
 
 /**
@@ -804,6 +828,7 @@ function recordHlsMeta(tabId, p) {
     dur: Number(p.dur) || 0,
     enc: Number(p.enc) || 0,
     variants: Number(p.variants) || 0,
+    vlist: normVariants(p.vlist),
   };
   if (!rec.hlsMeta) rec.hlsMeta = new Map();
   rec.hlsMeta.set(url, meta);
@@ -1672,6 +1697,10 @@ async function startNativeDownload(o) {
   const settings = await getSettings();
   const cookie = settings.useCookies ? await buildCookieHeader(o.url) : "";
   const id = "dl-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+  // 只接受 http(s) 的 variant：它是从清单正文里读出来的地址、要交给本地下载器
+  // 去取，形状不对就当作没选（回落宿主自己挑最好的），不要把它传下去碰运气。
+  const variant = (typeof o.variant === "string" && /^https?:/i.test(o.variant)
+    && o.variant.length <= 2048) ? o.variant : "";
   downloads.set(id, {
     url: o.url,
     status: "starting",
@@ -1681,6 +1710,7 @@ async function startNativeDownload(o) {
     filename: o.filename || "",
     referer: o.referer || "",
     headers: o.headers || {},
+    variant,
   });
   postNative({
     action: "download",
@@ -1696,6 +1726,9 @@ async function startNativeDownload(o) {
     headers: o.headers || {},
     concurrency: settings.concurrency || 16,
     outdir: settings.outdir || "",
+    // 用户选的清晰度。宿主用它去 match master 里的档位；
+    // 没这一项时宿主取画质最好那档（不是清单里第一条）。
+    variant,
   });
   return { id };
 }
@@ -2311,6 +2344,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             tabUrl: msg.tabUrl,
             headers: msg.headers,
             tabId: msg.tabId,
+            // 用户在主清单上选的清晰度（子清单 URL）。空 = 让宿主自己选最好的。
+            variant: msg.variant,
           });
           sendResponse({ ok: true, id: r.id });
         } catch (e) {

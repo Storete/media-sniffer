@@ -147,7 +147,41 @@ ok("mp4 → false", MSHlsMeta.looksLikeManifest("https://a.com/y.mp4") === false
 ok("空串 → false", MSHlsMeta.looksLikeManifest("") === false);
 ok("非字符串 → false", MSHlsMeta.looksLikeManifest(null) === false);
 
-section("[9] 时长取整口径（给 UI 用的短文案）");
+section("[9] 变体地址补全（S1 选清晰度要用它去下载）");
+
+// 传了 base 就把变体地址补成绝对。不补的话 popup 拿到的是 `v/1080.m3u8`，
+// 交给宿主根本打不开 —— 而 popup 自己并不知道清单在网络上的位置，
+// 只能靠这里补。三种写法都要认：相对、站内绝对、完整地址。
+const MASTER2 = [
+  "#EXTM3U",
+  "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080",
+  "v/1080.m3u8",
+  "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1280x720",
+  "/hls/720/index.m3u8",
+  "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=854x480",
+  "https://cdn.other.com/480.m3u8",
+].join("\n");
+
+const m2 = MSHlsMeta.parse(MASTER2, "https://a.com/live/master.m3u8");
+ok("三档都解析出来", m2.variants.length === 3, m2.variants);
+ok("相对路径 → 按清单地址补全",
+  m2.variants[0].url === "https://a.com/live/v/1080.m3u8", m2.variants[0].url);
+ok("站内绝对路径 → 只换 origin",
+  m2.variants[1].url === "https://a.com/hls/720/index.m3u8", m2.variants[1].url);
+ok("完整地址原样保留",
+  m2.variants[2].url === "https://cdn.other.com/480.m3u8", m2.variants[2].url);
+ok("带宽解析出来", m2.variants[1].bandwidth === 5000000, m2.variants[1]);
+ok("分辨率解析出来", m2.variants[0].res === "1920x1080", m2.variants[0].res);
+
+const m3 = MSHlsMeta.parse(MASTER2);
+ok("不传 base 时原样返回（纯解析保持向后兼容）",
+  m3.variants[0].url === "v/1080.m3u8", m3.variants[0].url);
+const m4 = MSHlsMeta.parse(MASTER2, "not a url");
+ok("base 是垃圾也不抛异常", m4.variants.length === 3);
+ok("resolveUrl 对外可用",
+  MSHlsMeta.resolveUrl("https://a.com/x/y.m3u8", "z.m3u8") === "https://a.com/x/z.m3u8");
+
+section("[10] 时长取整口径（给 UI 用的短文案）");
 
 ok("1074s → 17:54", MSHlsMeta.durText(1074) === "17:54", MSHlsMeta.durText(1074));
 ok("59s → 0:59", MSHlsMeta.durText(59) === "0:59", MSHlsMeta.durText(59));

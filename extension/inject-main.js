@@ -1793,13 +1793,31 @@
     try {
       const M = metaMod();
       if (!M || !text || text.length > MANIFEST_MAX) return;
-      const r = M.parse(text);
+      // 传 url 作 base：变体地址在这个函数里就被补成绝对地址，
+      // 否則 popup 拿到的 `v/1080.m3u8` 交给宿主根本打不开。
+      const r = M.parse(text, url);
       if (!r || r.kind === "unknown") return;
       // key 用响应最终地址：清单被重定向过时，用户列表里显示的是 final URL
-      post({
+      const msg = {
         cmd: "hlsmeta", key: url, kind: r.kind, segs: r.segs, dur: r.dur,
         enc: r.encrypted ? 1 : 0, variants: r.variants.length,
-      });
+      };
+      // 主清单的**每一档**都要传过去：popup 要让用户选清晰度，只传个数量
+      // 等于把选择权丢了（2026-10-24 之前就是这样，`variants` 只是个数字）。
+      //
+      // 三条约束：最多 8 档（够用，且防某些站点把清单写成上百档把消息撑大）、
+      // 只带必要字段（url/res/bandwidth）、单条 url 超长就截断丢弃 ——
+      // 这条消息走 postMessage，主线程上不能为它做大字符串拼接。
+      if (r.kind === "master" && r.variants.length) {
+        const vs = [];
+        for (let i = 0; i < r.variants.length && vs.length < 8; i++) {
+          const v = r.variants[i];
+          if (!v || typeof v.url !== "string" || !v.url || v.url.length > 2048) continue;
+          vs.push([Number(v.bandwidth) || 0, String(v.res || ""), v.url]);
+        }
+        if (vs.length) msg.vlist = vs;
+      }
+      post(msg);
     } catch (e) { /* 忽略 */ }
   }
 

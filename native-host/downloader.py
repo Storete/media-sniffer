@@ -115,6 +115,16 @@ def _replace_retry(tmp, path, attempts=10, first_delay=0.01):
         return False
 
 
+# 同一进程里至少三个线程会写状态文件（主流程 / stdout 读取线程 / 阶段 ticker），
+# 而 write_status 是「读-合并-写」。不加锁时「读到的旧值」与「写下去的新值」之间
+# 有条缝，两处都会出错：
+#   · 两个进度线程同时合并 → 后写的那个用的是旧快照，把对方刚写的字段冲掉；
+#   · ticker 拿旧 message 做判断 → 结束后还能盖掉 done 的文案（见 write_message_if）。
+# 用 RLock 而不是 Lock：write_message_if 持锁时还要调 write_status，
+# 走的是同一个临界区（可重入）。
+_STATUS_LOCK = threading.RLock()
+
+
 def write_status(job_id, **fields):
     """**合并式**写状态：读出旧内容、update 新字段、原子替换。
 
@@ -124,7 +134,14 @@ def write_status(job_id, **fields):
       · 写 .tmp 再 os.replace —— 宿主是另一个进程，正在轮询读这个文件，
         直接 open("w") 有窗口期读到空/半个 JSON，宿主会当成「没状态」
       · "updated" 每次刷新 —— 宿主据此判断任务是否还活着
+
+    外面套一把进程内锁，见 `_STATUS_LOCK` 的说明。
     """
+    with _STATUS_LOCK:
+        _write_status_locked(job_id, **fields)
+
+
+def _write_status_locked(job_id, **fields):
     os.makedirs(JOBS_DIR, exist_ok=True)
     path = status_path(job_id)
     data = {}
@@ -139,6 +156,30 @@ def write_status(job_id, **fields):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     _replace_retry(tmp, path)
+
+
+def write_message_if(job_id, expect, message):
+    """只有当 message 仍等于 `expect` 时才写它。返回是否真的写了。
+
+    这是「比较并写」的原子版本，专供阶段 ticker 自限用。原来的写法是
+    ticker 自己 `read_status` 比对、再调 `write_status` —— 两步之间有条缝：
+
+        ticker: 读到 message 还是「探测请求头 1/4」（是我写的，继续）
+        主流程: write_status(done, message="")      ← 缝在这里
+        ticker: write_status(message="探测请求头 1/4（已等 0 秒）")
+
+    结果是 status=done、message 却挂着一句阶段提示 —— 也就是 d-034 那个
+    「全程挂着解析播放列表」的界面症状，从另一个入口进来。真机上 tick 是 2 秒、
+    这条缝不到 1 毫秒，所以只在测试把 PHASE_TICK 踩到 0.05 时才**七分之一**地露头
+    （2026-10-25 复现：25 次里红 4 次，红的是 T3 或 T4 各一次）。
+    概率低不等于不存在：用户看到的是「下载完成了，但下面还写着正在探测请求头」。
+    """
+    with _STATUS_LOCK:
+        cur = read_status(job_id).get("message") or ""
+        if cur != expect:
+            return False
+        _write_status_locked(job_id, message=message)
+        return True
 
 
 def write_progress(job_id, percent, speed="", eta=""):
@@ -184,12 +225,13 @@ class Phase:
 
     def _run(self):
         while not self._stop.wait(PHASE_TICK):
-            cur = (read_status(self.job_id).get("message") or "")
-            if cur != self._mine:
-                return               # 别人接管了 message（进度/结束态），闭嘴
             try:
-                self._mine = "%s（已等 %d 秒）" % (self.text, int(time.time() - self._t0))
-                write_status(self.job_id, message=self._mine)
+                nxt = "%s（已等 %d 秒）" % (self.text, int(time.time() - self._t0))
+                # 「比较并写」必须是一步：先自己 read_status 比对、再 write_status
+                # 的话中间有缝，结束态会在缝里被盖掉（见 write_message_if 的注释）。
+                if not write_message_if(self.job_id, self._mine, nxt):
+                    return           # 别人接管了 message（进度/结束态），闭嘴
+                self._mine = nxt
             except Exception:
                 return
 
@@ -1131,7 +1173,8 @@ def parse_hls_playlist(text, base_url):
     """解析 m3u8，返回：
 
         kind       "master"（多码率）还是 "media"（分片清单）
-        child      master 里 BANDWIDTH 最大的子清单地址
+        child      master 里**画质最好**的子清单地址（分辨率高优先，其次带宽）
+        variants   master 的每一档 [{url, bandwidth, w, h}]
         segments   media 的分片地址（已按 base_url 补成绝对地址）
         init       EXT-X-MAP 的初始化段（fMP4 才需要）
         encrypted  是否有 EXT-X-KEY（METHOD 不是 NONE）
@@ -1150,9 +1193,10 @@ def parse_hls_playlist(text, base_url):
     info = {
         "kind": "media", "child": "", "segments": [], "init": "",
         "encrypted": False, "key_url": "", "byterange": False,
+        "variants": [],
     }
-    best_bw = -1
     pending_bw = None
+    pending_res = (0, 0)
     for raw in (text or "").splitlines():
         # 行首可能粘着 BOM / 零宽空格：这类字符不是 str.isspace()，strip() 去不掉，
         # 留着会让 "#EXTM3U" 变成 "\ufeff#EXTM3U"，于是被当成一个分片地址。
@@ -1164,6 +1208,10 @@ def parse_hls_playlist(text, base_url):
                 info["kind"] = "master"
                 m = re.search(r"BANDWIDTH=(\d+)", ln)
                 pending_bw = int(m.group(1)) if m else 0
+                # RESOLUTION 可能缺（纯音频档、或抠门的站）。缺就当 (0,0)，
+                # 排序时自然沉到最后 —— 不硬猜一个假分辨率。
+                r = re.search(r"RESOLUTION=(\d+)x(\d+)", ln)
+                pending_res = (int(r.group(1)), int(r.group(2))) if r else (0, 0)
             elif ln.startswith("#EXT-X-KEY"):
                 m = re.search(r"METHOD=([^,\s]+)", ln)
                 method = (m.group(1) if m else "").upper()
@@ -1181,13 +1229,74 @@ def parse_hls_playlist(text, base_url):
             continue
         url = urljoin(base_url, ln)
         if pending_bw is not None:
-            if pending_bw > best_bw:
-                best_bw = pending_bw
-                info["child"] = url
+            info["variants"].append({
+                "url": url, "bandwidth": pending_bw,
+                "w": pending_res[0], "h": pending_res[1],
+            })
             pending_bw = None
+            pending_res = (0, 0)
         else:
             info["segments"].append(url)
+
+    if info["variants"]:
+        # 默认取**画质最好**那一档：先比分辨率高度，再比带宽。
+        #
+        # 原来这里是「BANDWIDTH 最大」，两个坑：
+        #   · 有的站给高码率的 480p 和低码率的 1080p，纯按带宽排会挑到 480p；
+        #   · 同一条清单里可能出现重复档，谁先谁后取决于站方写法。
+        # 分辨率才是用户说的「清晰度」，带宽只在同分辨率时做 tie-break。
+        info["child"] = pick_variant(info["variants"])["url"]
     return info
+
+
+def pick_variant(variants, want=None):
+    """从 master 的多档里选一档。
+
+    `want` 三种形态，按可靠性排序：
+      · 完整 URL（popup 从清单里直接拿到的那条）→ 精确匹配；
+      · "1080" / "1080p" / "1920x1080" → 按高度匹配（同一高度取带宽最高）；
+      · 空 / None → 画质最好那一档。
+
+    **匹配不到时回落最佳，并把回落写进返回值**（`fell_back`），调用方要把这件事
+    告诉用户：用户点了 1080 却拿到 720，却不被告知，比直接报错更糟 ——
+    他会以为下对了。
+
+    这个函数是纯的（不碰网络、不碰文件），因为「选哪档」这件事必须能单测。
+    """
+    if not variants:
+        return {"url": "", "bandwidth": 0, "w": 0, "h": 0, "fell_back": False}
+    best = max(variants, key=lambda v: (v.get("h") or 0, v.get("bandwidth") or 0))
+    want = (want or "").strip() if isinstance(want, str) else ""
+    if not want:
+        out = dict(best)
+        out["fell_back"] = False
+        return out
+
+    # 1) 完整 URL
+    for v in variants:
+        if v.get("url") == want:
+            out = dict(v)
+            out["fell_back"] = False
+            return out
+
+    # 2) 分辨率标记。只认数字，别的一律当没给 —— 站点写的 "HD"/"4K" 没有统一定义，
+    #    按它匹配等于碰运气。
+    heights = [int(x) for x in re.findall(r"\d+", want)]
+    target_h = 0
+    if "x" in want.lower() and len(heights) >= 2:
+        target_h = heights[1]          # 1920x1080 → 取高度
+    elif heights:
+        target_h = heights[0]
+    if target_h:
+        same = [v for v in variants if (v.get("h") or 0) == target_h]
+        if same:
+            out = dict(max(same, key=lambda v: (v.get("bandwidth") or 0)))
+            out["fell_back"] = False
+            return out
+
+    out = dict(best)
+    out["fell_back"] = True
+    return out
 
 
 def _hls_get(url, headers, timeout=45, retries=2):
@@ -1329,11 +1438,32 @@ def run_hls_self(job, quiet=False):
         return bail(code, str(e)[:60] if code == errcode.INTERNAL else "")
 
     base = job["url"]
+    notes = []          # 「值得告诉用户、但不该被进度覆盖」的话（如清晰度回落）
     info = parse_hls_playlist(text, base)
     if info["kind"] == "master":
-        if not info["child"]:
+        if not info["variants"]:
             return bail("VERIFY_MISMATCH", "多码率清单里没有子清单")
-        base = info["child"]
+        # 选哪一档：popup 传的是用户点的那条子清单 URL（"variant"），
+        # 没传就取画质最好的。**选中哪档必须写进状态**，否则「选 1080 下到 720」
+        # 这种事只能在 ffprobe 里发现。
+        pick = pick_variant(info["variants"], job.get("variant"))
+        if not pick.get("url"):
+            return bail("VERIFY_MISMATCH", "多码率清单里没有可用的子清单")
+        base = pick["url"]
+        q = ("%dx%d" % (pick["w"], pick["h"])) if pick.get("h") else ""
+        if pick.get("fell_back") and job.get("variant"):
+            # 用户点的那档已经不在了（地址轮换 / CDN 换了清单）：**说出来**。
+            #
+            # 写进 notes 而不只是写一次 message：message 随后会被「已拼成视频」
+            # 覆盖，而「你选的档没了」是承诺问题，不能一闪而过。所以这里记一份，
+            # 收尾时拼进最终文案（测试钉的就是这条）。
+            want = str(job.get("variant"))
+            short = want.rsplit("/", 1)[-1][:40]
+            note = "你选的那一档已经不在这条清单里，改用最好的%s" % ((" " + q) if q else "")
+            notes.append(note)
+            write_status(job_id, err="", quality=q, message=note)
+        else:
+            write_status(job_id, err="", quality=q)
         try:
             text = _hls_get(base, headers).decode("utf-8-sig", "replace")
         except urllib.error.HTTPError as e:
@@ -1537,10 +1667,13 @@ def run_hls_self(job, quiet=False):
                 except OSError:
                     pass
                 write_status(job_id, status="done", percent=100, speed="", eta="",
-                             err="", file=out_mp4, message="已拼成完整视频")
+                             err="", file=out_mp4,
+                             message="已拼成完整视频" + ("；" + "；".join(notes) if notes else ""))
                 return True
 
     msg = "已拼成完整视频（TS 容器，播放器能直接放）"
+    if notes:
+        msg += "；" + "；".join(notes)
     if remux_err:
         msg += "；转 mp4 失败：" + remux_err
     write_status(job_id, status="done", percent=100, speed="", eta="",

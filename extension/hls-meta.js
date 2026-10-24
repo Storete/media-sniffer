@@ -31,10 +31,18 @@ var MSHlsMeta = (function () {
 
   /**
    * @param {string} text 清单正文
+   * @param {string} [base] 清单自己的地址。给了就把变体地址补成绝对地址 ——
+   *   popup 要拿这个地址去下载，相对路径（`v/1080.m3u8`）交给宿主是没法用的。
+   *   不给则原样返回（纯解析，测试里大量用到）。
    * @returns {{kind:"master"|"media"|"mpd"|"unknown", segs:number, dur:number,
    *            encrypted:boolean, variants:Array<{bandwidth:number,res:string,url:string}>}}
    */
-  function parse(text) {
+  function resolveUrl(base, rel) {
+    if (!base || !rel) return rel || "";
+    try { return new URL(rel, base).href; } catch (e) { return rel; }
+  }
+
+  function parse(text, base) {
     const out = EMPTY();
     if (typeof text !== "string" || !text) return out;
 
@@ -95,7 +103,13 @@ var MSHlsMeta = (function () {
 
       // ---- 非注释行：要么是分片地址，要么是变体地址
       if (pendingVariant) {
-        out.variants.push({ bandwidth: pendingBandwidth, res: pendingRes, url: line });
+        // 地址补成绝对：清单里写 `v/1080.m3u8` 和 `/hls/720/index.m3u8` 的站都很多，
+        // popup 拿到的必须是一条能直接交给下载器的完整地址。
+        out.variants.push({
+          bandwidth: pendingBandwidth,
+          res: pendingRes,
+          url: resolveUrl(base, line),
+        });
         pendingVariant = false;
         pendingBandwidth = 0;
         pendingRes = "";
@@ -141,7 +155,8 @@ var MSHlsMeta = (function () {
     return m + ":" + String(r).padStart(2, "0");
   }
 
-  return { parse: parse, looksLikeManifest: looksLikeManifest, durText: durText };
+  return { parse: parse, looksLikeManifest: looksLikeManifest, durText: durText,
+           resolveUrl: resolveUrl };
 })();
 
 if (typeof globalThis !== "undefined") globalThis.MSHlsMeta = MSHlsMeta;

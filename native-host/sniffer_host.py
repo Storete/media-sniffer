@@ -558,7 +558,10 @@ def poll_job(job_id):
     while time.time() < deadline:
         st = read_status(job_id)
         if st:
-            snapshot = {k: st.get(k) for k in ("status", "percent", "speed", "eta", "file", "message", "err")}
+            # snapshot 里必须**含所有要转发的字段**：它是去重用的，
+            # 少一个字段就意味着「这个字段变了但不同步发给扩展」。
+            snapshot = {k: st.get(k) for k in ("status", "percent", "speed", "eta",
+                                              "file", "message", "err", "quality")}
             if snapshot != last:
                 last = snapshot
                 send({
@@ -573,6 +576,10 @@ def poll_job(job_id):
                     # 错误码也要跟着走：popup 的「为什么失败」一行靠它分类，
                     # 只传 message 的话扩展侧只能拿中文句子做正则（d-054 之前那样）。
                     "err": st.get("err") or "",
+                    # 实际下载的清晰度（"1920x1080"）。用户选了 1080 却拿到 720 时，
+                    # 这是他唯一能看见的证据；也是诊断包里唯一能回答
+                    # 「到底下的是哪一档」的字段。
+                    "quality": st.get("quality") or "",
                     # 页面桥靠 inProgress 判断「这条 id 还会有后续消息」；
                     # 不带的话第一条 progress 就会把映射拆掉，后面全断
                     "inProgress": True,
@@ -596,6 +603,7 @@ def poll_job(job_id):
                       # 中间的宿主却不转发 —— 于是 UI 上永远没有错误码，两边都以为
                       # 对方没实现。字段穿过的每一跳都要有测试钉住。
                       "err": st.get("err") or "",
+                      "quality": st.get("quality") or "",
                       "trail": st.get("trail") or ""})
                 return
         time.sleep(0.4)

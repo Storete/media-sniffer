@@ -76,17 +76,21 @@ node test/range_parallel.test.js
 node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（21 套；缺「能跑的 ffmpeg」时相关套件自己报 SKIP=77）
+# Python（22 套；缺「能跑的 ffmpeg」时相关套件自己报 SKIP=77）
 python test/run_all.py
+
+# JS 全量 + 可复现的总数（**别再用 `grep -c "✓"` 手工数**）
+python test/run_js.py
 ```
 
-提示：`test/*.test.js` 全套共 **20** 个文件（上面 12 个之外还有 `icon_filter`、`blob_item`、
-`ui_card`、`focus_scope`、`group_key`、`review`、`hls_meta`、`naming`）；
-其中 `focus_scope` / `group_key` **成功时不打印任何汇总行**，
-`review.test.js` 由 `background.test.js` 引入执行、单独跑会提示跳过。
-所以「995 项」的口径是**只会打印汇总行的套件之和**，不含那两个静默套件 ——
-如果哪天又对不上，先看是不是这个原因。
-整套跑法：`for f in test/*.test.js; do node "$f"; done`。
+提示：`test/*.test.js` 全套共 **20** 个文件，其中 `focus_scope` / `group_key` / `review`
+三个是 **fragment**（只导出函数，由 `background.test.js` require 进来跑），单独跑输出为空。
+所以脚本的口径是**「17 个可单独跑的套件」之和 = 1021 项**。
+
+**为什么必须有 `run_js.py`**：JS 套件的汇总行有三种写法（`通过 N 项，失败 M 项`、
+`N 通过 / M 失败`、`PASS N`），`hls_meta`(64) 和 `naming`(24) 一个 ✓ 都不打。
+2026-10-24 那次「952 是低估」、2026-10-25 这次「993 / 995 / 1021 三个数」，
+根因都是**手工数只认一种格式**。**数不清总数本身就在掩盖红灯。**
 
 **统计断言数时注意三种汇总格式**：`通过 N 项，失败 M 项`、`N 通过 / M 失败`、
 `N 通过, M 失败`。只匹配其中一种会**静默漏算**（2026-10-24 实测漏了 43 项，
@@ -164,9 +168,14 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 12 套主 JS + 21 套 Python 全绿（JS 全套 **995** 项），数字记进 `DEVLOG.md`
+- [ ] 12 套主 JS + 22 套 Python 全绿（JS 全套 **1021** 项，用 `python test/run_js.py` 取数），数字记进 `DEVLOG.md`
   —— **「跳过」不算「全绿」**：`run_all.py` 的汇总行会自己打这句提醒。套件内部跳过用
   `sys.exit(77)`（automake 约定），**不要用 `exit(0)`**：那会被记成 PASS，等于把「没测」说成「过了」。
+- [ ] **从源码里切片/截取跑测试时，先确认切到的不是空串或半截。**
+  2026-10-25 实测：`manifest_classify.test.js` 用 `indexOf("\n}\n")` 切 `background.js`，
+  遇上 CRLF 返回 -1、`+3` 变 2，切成**空字符串**；空串在沙箱里不报错，报错落到下一行。
+  切**多**同样危险（大括号格式化后会滑到下一个函数的 `}`，测试照绿）。
+  规矩：用**数括号**求函数边界，并加「长度下限 / 关键标识必须存在 / 下一段哨兵不许出现」三道检查。
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

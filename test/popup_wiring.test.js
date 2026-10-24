@@ -148,6 +148,30 @@ check("原因行占满整行宽度（flex-basis:100%）",
 check("错误码进 title（诊断时能念出来），不占用可见行",
   /why\.title\s*=\s*\(it\.code/.test(JS));
 
+console.log("[?] 选清晰度（S1）的接线");
+
+// 这一刀最容易坏在「接了 UI 却没接到下载」：下拉框能选，点了下载还是 master，
+// 用户以为换了档、其实没有。所以三处必须同时钉住。
+check("有档位选择行（.vsel）",
+  /function variantRow\(it\)/.test(JS) && /el\("div", "vsel"\)/.test(JS));
+check("只对主清单出选择（变体/单清单不该有档位）",
+  /it\.listKind !== "master"/.test(JS));
+check("不足 2 档不出选择（一档的不给假选项）",
+  /vs\.length < 2/.test(JS));
+check("档位按高度降序排（与宿主 pick_variant 同序）",
+  /heightOf\(b\) - heightOf\(a\)/.test(JS));
+check("标签优先用分辨率（1080P），不是「第 N 档」",
+  /if \(h\) return h \+ "P"/.test(JS));
+check("选择存进 variantPick（本次会话有效）",
+  /variantPick\.set\(it\.u, sel\.value\)/.test(JS));
+// 这里必须带**行首锚**：第一版写的是 /variant: chosen/，而把这一行注释掉
+// （`// variant: chosen,`）也能匹配上 —— 反向验证照绿，等于没钉住。
+check("**下载时真的用了选中的档**（这是本刀的判据）",
+  /const chosen = variantPick\.get\(it\.u\)/.test(JS)
+  && /^\s*variant:\s*chosen,/m.test(JS));
+check("CSS 给了档位行的样式（.vsel-sel）",
+  /\.vsel-sel\s*\{/.test(CSS));
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

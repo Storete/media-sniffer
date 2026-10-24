@@ -17,6 +17,7 @@
 | **8 类分组** | 视频 / 音频 / 图片 / 文档 / 字体 / 其他 / 分片，按 tab 独立归档 |
 | **能抓 Blob / MSE 站点** | Telegram、以及一切把流解密后拼成 Blob 喂给 `<video>` 的站点 |
 | **B 站完整视频** | 读 `__playinfo__` 的 DASH 清单，音视频分别抓完用 ffmpeg 自动合并成单文件 |
+| **可选清晰度** | 多档 HLS 清单会列出 1080P / 720P…，选哪档就下哪档；默认给最高档，你选的那档已失效时会**回落并告诉你** |
 | **小红书** | 只列当前帖子自己的图（不含推荐流、头像、二维码），自动排序 |
 | **不限速、不限次** | 并发 16~64 可调，断点续传 |
 | **全本地** | 没有远程配置、没有埋点，数据不出机器 |
@@ -349,8 +350,9 @@ media-sniffer/
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
 │   ├── pattern_sync.test.js 扩展与宿主的正则同步校验（4 项）
-│   └── *.py                 宿主侧 Python 测试（21 套；含 errcode 码表 71 项、urllib 重试 29 项、
-│                             三路径收敛 44 项、任务超时 27 项）
+│   ├── run_js.py            JS 全量跑一次并给出可复现总数（认三种汇总格式）
+│   └── *.py                 宿主侧 Python 测试（22 套；含 errcode 码表 71 项、urllib 重试 29 项、
+│                             三路径收敛 44 项、任务超时 27 项、选档 28 项）
 ├── tools/
 │   ├── fuzz_host.py         变异/性质测试（喂畸形输入找边界 bug，见下）
 │   ├── live_check.mjs       真机取证（CDP 起真浏览器读扩展 storage / 渲染文案 / 下载记录 / 关 popup）
@@ -372,22 +374,29 @@ media-sniffer/
 ## 跑测试
 
 ```bash
-# JS（需要 Node 18+，不需要 npm install）—— 13 套 / 736 项
-node test/background.test.js       # 266 项（含 focus_scope / group_key / review）
+# JS（需要 Node 18+，不需要 npm install）—— 17 套 / 1021 项
+node test/background.test.js       # 275 项（含 focus_scope / group_key / review）
 node test/main-hook.test.js        # 195 项
 node test/site_registry.test.js    # 103 项
-node test/popup_wiring.test.js     # 47 项
+node test/session_model.test.js    # 69 项
+node test/popup_wiring.test.js     # 68 项
+node test/hls_meta.test.js         # 64 项（清单解析 + 变体地址补全）
 node test/ui_card.test.js          # 39 项
+node test/hls_same_movie.test.js   # 32 项
 node test/detect.test.js           # 30 项
+node test/manifest_classify.test.js # 28 项（清单分类 + 体积门槛豁免）
+node test/naming.test.js           # 24 项
+node test/hls_family.test.js       # 22 项
 node test/icon_filter.test.js      # 20 项
 node test/blob_item.test.js        # 18 项
+node test/native_done_history.test.js # 16 项
 node test/range_parallel.test.js   # 14 项
 node test/pattern_sync.test.js     # 4 项
 
-# 全跑一遍（bash）
-for f in test/*.test.js; do node "$f"; done
+# 全跑一遍并给出总数（推荐；手数容易漏，见 AGENTS.md）
+python test/run_js.py
 
-# Python（16 套，不需要 pytest，也不装任何依赖）
+# Python（22 套，不需要 pytest，也不装任何依赖）
 python test/run_all.py             # 一串跑完并汇总（没装 ffmpeg 的套件自动 SKIP）
 
 # 或单个跑

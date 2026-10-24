@@ -46,6 +46,10 @@ let lastDiag = null;   // background 给的抓取诊断（{seen, drop:{原因:�
 let focusInfo = null;  // 列表被「当前打开的那一条」收窄时，background 回传 {kind,id}；否则 null
 let selecting = false; // 批量选择模式
 const picked = new Set(); // 已选条目的 key（就是 it.u）
+// 用户选的清晰度：key 是主清单的 it.u，value 是那一档子清单的**绝对地址**。
+// 只活在这次打开 popup 期间 —— 写进 storage 会变成跨会话的隐藏状态，
+// 下次打开少了几档会解释不清（同 moviePick 的取舍）。
+const variantPick = new Map();
 // 同片折叠时用户点过「切换」的选择：groupKey → url。
 // 只活在 popup 这次打开期间 —— 它是一次「我现在想看哪条」的即时偏好，
 // 存进 storage 就变成跨会话的隐性状态，下次打开为什么少一条说不清。
@@ -814,6 +818,8 @@ function renderItem(it, no, hlsFamily, groupOf) {
   const sub = el("div", "sub", bits.filter(Boolean).join(" · "));
   if (grp) appendSwap(sub, grp);
   meta.append(sub);
+  const vrow = variantRow(it);
+  if (vrow) meta.append(vrow);
   row.append(meta);
 
   const ops = el("div", "ops");
@@ -907,6 +913,75 @@ function appendSwap(sub, grp) {
     + "默认取页面当前在用的那个，点「切换」可以换。";
   sub.append(document.createTextNode(" · "));
   sub.append(sp);
+}
+
+// ---------------------------------------------------------------- 选清晰度（S1）
+
+/**
+ * 主清单有多少档可选。
+ *
+ * 只认**主清单**（listKind === "master"）：变体条目自己就是一个档，
+ * 单条 media 清单没有档可选。`vlist` 为空说明页面没读到清单正文
+ * （CORS / 太大 / 不是页面自己请求的），这时宁可不给选择，也不要编档位。
+ */
+function pickableVariants(it) {
+  if (!it || !isHlsItem(it)) return [];
+  if (it.listKind !== "master") return [];
+  const vs = Array.isArray(it.vlist) ? it.vlist : [];
+  if (vs.length < 2) return [];
+  // 与宿主 pick_variant 同一套排序（高度降序 → 带宽降序）：
+  // 两处顺序必须一致，否则「默认那档」在 popup 上排第一、在宿主里却不是，
+  // 用户看到「默认 1080」却下到 720。
+  return vs.slice().sort((a, b) => (heightOf(b) - heightOf(a)) || ((b.bandwidth || 0) - (a.bandwidth || 0)));
+}
+
+/** "1920x1080" → 1080；读不出返回 0（不猜）。 */
+function heightOf(v) {
+  if (!v) return 0;
+  const m = /(\d+)\s*[x×]\s*(\d+)/i.exec(String(v.res || ""));
+  if (m) return Number(m[2]);
+  const one = /^(\d{3,4})p?$/i.exec(String(v.res || ""));
+  return one ? Number(one[1]) : 0;
+}
+
+/** 一档在界面上的名字：优先「1080P」，其次带宽，最后「第 N 档」。 */
+function variantLabel(v, i) {
+  const h = heightOf(v);
+  if (h) return h + "P";
+  const bw = Number(v.bandwidth) || 0;
+  if (bw > 0) return (bw / 1e6).toFixed(1) + " Mbps";
+  return "第 " + (i + 1) + " 档";
+}
+
+/**
+ * 档位选择行。没有可选档时返回 null（列表里就完全不出现这一行）。
+ *
+ * 用 `<select>` 而不是一排按钮：popup 宽度只有 380px 左右，四档以上按钮会换行，
+ * 把「下载」按钮挤下去；而 select 的原生下拉在小窗口里更好点。
+ */
+function variantRow(it) {
+  const vs = pickableVariants(it);
+  if (!vs.length) return null;
+  const wrap = el("div", "vsel");
+  const sel = document.createElement("select");
+  sel.className = "vsel-sel";
+  sel.title = "选清晰度：选定后点「下载」，下到的就是这一档";
+  for (let i = 0; i < vs.length; i++) {
+    const o = document.createElement("option");
+    o.value = vs[i].url;
+    o.textContent = variantLabel(vs[i], i);
+    sel.append(o);
+  }
+  sel.value = variantPick.get(it.u) || vs[0].url;
+  sel.addEventListener("change", () => {
+    // 选回第一档（也就是默认）时清掉记录，让宿主走它自己的默认逻辑 ——
+    // 这样「没选」和「选了第一档」在下游是同一条路径，少一种状态。
+    if (sel.value === vs[0].url) variantPick.delete(it.u);
+    else variantPick.set(it.u, sel.value);
+  });
+  const tip = el("span", "vsel-tip", "清晰度");
+  wrap.append(tip, sel);
+  return wrap;
 }
 
 /** 秒 → 「1:23」或「1:02:03」。0/空返回空串 */
@@ -1108,9 +1183,13 @@ async function saveAllPageItems(btn) {
 async function startDownload(it, btn) {
   btn.disabled = true;
   btn.textContent = "…";
+  // 用户选了清晰度就下那一档（直接下子清单；宿主会把它当 media 清单处理），
+  // 没选就交 master，由宿主挑画质最好的那档。
+  const chosen = variantPick.get(it.u) || "";
   const res = await chrome.runtime.sendMessage({
     type: "native:download",
     url: it.u,
+    variant: chosen,
     kind: it.k,
     // 文件名：**标题优先**，没有标题才退回 URL 推出的名字。
     //

@@ -186,6 +186,23 @@ h1 { margin: 0; font-size: 14px; font-weight: 600; }
 }
 .sub .swap:hover { text-decoration: underline; }
 
+/* 选清晰度：主清单有 2 档以上才出现这一行。
+   放在 sub 行下面而不是 ops 里 —— 它是「下载之前的一个参数」，
+   跟「下载」按钮是同一件事的两步，视觉上要挨着条目信息，不是另一个动作。 */
+.vsel { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+.vsel-tip { font-size: 11px; color: var(--text-dim); }
+.vsel-sel {
+  font-size: 11px;
+  padding: 1px 4px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--text);
+  max-width: 130px;
+  cursor: pointer;
+}
+.vsel-sel:focus { outline: none; border-color: var(--brand); }
+
 .ops { display: flex; gap: 6px; flex: 0 0 auto; }
 .btn {
   padding: 4px 10px;

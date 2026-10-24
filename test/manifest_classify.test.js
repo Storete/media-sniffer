@@ -34,7 +34,11 @@ function ok(name, cond, extra) {
 }
 function section(t) { console.log("\n" + t); }
 
-const bgsrc = fs.readFileSync(BG, "utf8");
+// 行尾先归一化。本仓库 core.autocrlf=true，检出后 background.js 是 CRLF，
+// 而下面用 "\n}\n" 找函数结尾——不归一化就匹配不到，indexOf 返回 -1，
+// 再 +3 变成 2，slice(1255, 2) 得到**空字符串**。空字符串在沙箱里当然不报错，
+// 于是错在下一行（classify is not defined），离真因隔了一层。
+const bgsrc = fs.readFileSync(BG, "utf8").replace(/\r\n/g, "\n");
 
 // 切出「分类规则」这一整块（EXT_TO_KIND / SEGMENT_EXT / extOf / kindFromMime / classify / isManifestUrl）。
 // 起点必须在 EXT_TO_KIND 之前：classify 末尾要遍历它，切漏了会在沙箱里 ReferenceError。
@@ -44,8 +48,51 @@ if (start < 0 || cStart < 0) {
   console.error("切不出分类代码块，测试文件需要跟着源码结构调整");
   process.exit(1);
 }
-const cEnd = bgsrc.indexOf("\n}\n", cStart) + 3;
-const slice = bgsrc.slice(start, cEnd);
+
+// 结尾不能靠 "\n}\n" 这种文本锚点：
+//   · 行尾一变（CRLF）就匹配不到 → indexOf 返回 -1，+3 变 2，切成空串；
+//   · 大括号被格式化（`} ` 多个空格）就一路滑到**后面某个函数**的 `}`，
+//     切片悄悄变长、把无关代码也吞进来，测试照样绿。
+// 两种都是「切错了却看不出来」。数括号才是唯一稳的判据。
+function bodyEnd(src, from) {
+  const open = src.indexOf("{", from);
+  if (open < 0) return -1;
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+const cEnd = bodyEnd(bgsrc, cStart);
+const slice = cEnd > cStart ? bgsrc.slice(start, cEnd) : "";
+
+// 切空了比切错更危险：空切片能跑通，却让后面每条断言都无从谈起。
+// 这类「什么都没测」必须当场炸，不能往下走。
+if (cEnd <= cStart || slice.length < 200) {
+  console.error("切片为空或明显不全（cStart=" + cStart + " cEnd=" + cEnd + " 长度=" + slice.length + "）");
+  console.error("大概率是行尾格式或源码结构变了；别让空切片冒充「跑通了」");
+  process.exit(1);
+}
+// 切多了同样要炸：一旦吞进后面的函数，这个文件测的就不再只是分类规则。
+// 用紧邻下一段的真实代码当哨兵 —— 它出现在切片里就说明终点算错了。
+if (slice.indexOf("function classify(") < 0) {
+  console.error("切片里没有 classify —— 起点或终点算错了");
+  process.exit(1);
+}
+if (slice.includes("new Map()") || slice.includes("function record(")) {
+  console.error("切片越界：把后面的代码也切进来了，长度 " + slice.length);
+  process.exit(1);
+}
+if (bgsrc[cEnd - 1] !== "}") {
+  console.error("切片没停在 classify 的收尾大括号上（cEnd-1 = " + JSON.stringify(bgsrc[cEnd - 1]) + "）");
+  process.exit(1);
+}
 
 const ctx = vm.createContext({
   URL,
