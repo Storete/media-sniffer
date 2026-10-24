@@ -23,11 +23,25 @@ sys.path.insert(0, os.path.join(HERE, "..", "native-host"))
 import brain  # noqa: E402
 
 
+import time
+
+_last = [0.0]   # 模块级限速：DeepSeek 对连续请求有速率限制（429），全量跑必撞
+
+
 def diagnose(case):
     endpoint = os.environ.get("MS_AI_ENDPOINT") or ""
     key = os.environ.get("MS_AI_KEY") or ""
-    model = os.environ.get("MS_AI_MODEL") or ""
-    r = brain.analyze(case, endpoint, key, model)
+    model = os.environ.get("MS_AI_MODEL") or "deepseek-chat"
+    r = {"ok": False, "error": ""}
+    for attempt in range(4):
+        wait = 2.0 - (time.time() - _last[0])     # 请求间隔 ≥2s
+        if wait > 0:
+            time.sleep(wait)
+        _last[0] = time.time()
+        r = brain.analyze(case, endpoint, key, model)
+        if r.get("ok") or "429" not in r.get("error", ""):
+            break
+        time.sleep(3 * (attempt + 1))              # 429 退避：3s/6s/9s
     if not r.get("ok"):
         # 评测场景下分析失败要**显性暴露**（方案不对≠考卷错）
         return {"diagnosis": "(分析失败) " + r.get("error", ""),

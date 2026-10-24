@@ -37,6 +37,22 @@ SYSTEM_PROMPT = (
     "1. 判断失败根因（一句话人话）；\n"
     "2. 从给定的策略词表里选一个最合适的下一步（只准用词表里的词）；\n"
     "3. 给一句具体的行动建议。\n"
+    "\n"
+    "判别指引（按顺序问自己）：\n"
+    "· URL 是视频站/直播站的首页或列表页（没有具体视频 id）？媒体在具体视频"
+    "页里 → specific-video-url；若是直播站（斗鱼/虎牙/抖音直播），直播没有固定"
+    "媒体文件 → record-live；\n"
+    "· URL 域名是已知要登录/加密的（音乐站网易云/QQ音乐、付费正片）？→ "
+    "login-required；\n"
+    "· URL 或错误信息带 DRM/Widevine？→ unsupported-drm；\n"
+    "· 错误是 403 且站点有反爬？→ anti-bot；\n"
+    "· 页面确认无媒体（纯图文社区/文档站）？→ not-applicable；\n"
+    "· 站点用 blob/MSE 播放（Telegram/抖音类）、或错误提示需要浏览器上下文？"
+    "→ page-parse；\n"
+    "· 错误是「伪装分片」「剥壳」类（分片内容异常）？→ self-hls；\n"
+    "· 三路轨迹里其实有成功路径、只是某一环出错？→ direct-download。\n"
+    "用 URL 的域名和路径形态判断站点类型——URL 本身是最强的证据。\n"
+    "\n"
     "只输出 JSON：{\"diagnosis\": \"...\", \"strategy\": \"词表里的词\", "
     "\"confidence\": 0到1, \"advice\": \"...\"}。不要输出 JSON 以外的任何内容。")
 
@@ -160,5 +176,13 @@ def analyze(case, endpoint, key, model, timeout=60):
         out = parse_analysis(text)
         out["model"] = data.get("model") or model
         return out
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx 的响应体里是端点的真实原因（model 不存在 / key 无效 / 字段
+        # 不合法）——HTTPError 的 str 只有状态码，body 不读就全丢了
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            detail = ""
+        return {"ok": False, "error": "HTTP %d: %s" % (e.code, detail or str(e)[:120])}
     except Exception as e:
         return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:120])}
