@@ -85,7 +85,7 @@ python test/run_js.py
 
 提示：`test/*.test.js` 全套共 **20** 个文件，其中 `focus_scope` / `group_key` / `review`
 三个是 **fragment**（只导出函数，由 `background.test.js` require 进来跑），单独跑输出为空。
-所以脚本的口径是**「18 个可单独跑的套件」之和 = 1091 项**。
+所以脚本的口径是**「18 个可单独跑的套件」+ 2 个独立套件 = 1153 项**（1.3.63，随套件增减更新）。
 
 **为什么必须有 `run_js.py`**：JS 套件的汇总行有三种写法（`通过 N 项，失败 M 项`、
 `N 通过 / M 失败`、`PASS N`），`hls_meta`(64) 和 `naming`(24) 一个 ✓ 都不打。
@@ -168,7 +168,7 @@ python test/run_js.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 12 套主 JS + 26 套 Python 全绿（JS 全套 **1091** 项，用 `python test/run_js.py` 取数），数字记进 `DEVLOG.md`
+- [ ] 20 套 JS + 29 套 Python 全绿（JS 全套 **1153** 项，用 `python test/run_js.py` 取数），数字记进 `DEVLOG.md`
   —— **「跳过」不算「全绿」**：`run_all.py` 的汇总行会自己打这句提醒。套件内部跳过用
   `sys.exit(77)`（automake 约定），**不要用 `exit(0)`**：那会被记成 PASS，等于把「没测」说成「过了」。
 - [ ] **从源码里切片/截取跑测试时，先确认切到的不是空串或半截。**
