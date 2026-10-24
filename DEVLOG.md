@@ -10,6 +10,48 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-072 · 2026-10-24 · 真机首验四项全过——外加三条探针基础设施的教训
+
+### 结果（headless Chrome 真实加载 1.3.62、真实下载链路，四项全绿）
+
+| 功能 | 判据 | 结果 |
+|---|---|---|
+| ① 保存直下 | 页面无 `__ms_sniffer_overlay` + 文件真实落盘 | ✓ 不弹浮层；`ms-probe-direct.mp4` 73821 字节落在「文件存放处」 |
+| ② 诊断按钮 | ms:diag 数据链路 | ✓ 回包带 version 1.3.62 + 内部错误数组 |
+| ③ 整页解析 | 任务打到宿主 | ✓ native:download-page 受理 → jobs 状态文件出现（本地页被 yt-dlp generic 下载成文档，done 无害） |
+| ④ 时间段截取 | 见下节 | ✓✓ 两半各自证实 |
+
+### ④ 的两半：能力证实 + 边界如实确认
+
+- **产品链**：本地 HLS + timeRange 跑产品 downloader → done（自实现 HLS 链整段下）
+  ——B27 方案的③层（自实现链按 EXTINF 挑分片）本来就是未做的边界，如实确认；
+- **yt-dlp 链能力**：同一条 HLS 直喂 yt-dlp `--download-sections "*1-3"` →
+  **ffprobe 实测产物 2.000 秒**，精确。②层在 yt-dlp 链上的能力没有疑问
+  （真实触发场景 = 整页解析 + 非 m3u8 的 yt-dlp 能解析的站）。
+
+**踩出一条上游边界**：无扩展名裸直链 + generic extractor 时，yt-dlp 的
+sections 输出名是 `file:xxx.unknown_video.part`——ffmpeg 推断不出输出格式
+直接报错（`Unable to choose an output format`）。真实场景（HLS/DASH/
+带扩展名直链）不踩；未做特判，记在这里。
+
+### 三条探针基础设施的教训（下次做真机自动化直接复用）
+
+1. **profile 必须每次清空**：`Extensions.loadUnpacked` 对同 ID 的已装扩展
+   静默跳过——复用旧 profile 时 SW 跑的是上一版代码，新 case（ms:diag）
+   落进 default 分支，症状是「回包 unknown message」，极易误判成代码 bug；
+2. **match pattern 不支持端口**：`*://127.0.0.1:18080/*` 是非法 pattern，
+   `chrome.tabs.query` 挂死（callback 不回、异常不出）——全量 query 后
+   JS 侧过滤才是对的；
+3. **SW 的 sendMessage 不回环给自己**：SW 里验「消息处理」要么直调函数
+   （top-level 函数声明就是 globalThis 属性），要么从 popup/页面发；
+   另外 CDP WS 的响应要按 id 匹配——keep-alive 线程和主流程并发 evaluate
+   会让响应交错，diag 读到 ping 的 `1`。
+
+### 数字
+
+探针（TEMP，不入仓库）；本地素材 ffmpeg 生成（mp4 + 2 段 HLS + 页面）；
+验证全程产品代码零改动，版本保持 1.3.62。
+
 ## d-071 · 2026-10-24 · B27 UI 接通 + 诊断包 + 空态「粘贴链接」——§6 产品件清掉两件
 
 ### 三件小活，一个共同点：都是「等到了前置条件」的动作
@@ -3066,6 +3108,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-072](#d-072) | 2026-10-24 | 真机首验四项全过 | 保存直下（无浮层+真实落盘 73821B）、诊断（1.3.62 回包）、整页解析（任务达宿主）、时间段（产品链边界确认 + yt-dlp 链 sections 实测 2.000s）；三条探针教训：profile 必须清空 / match pattern 不支持端口 / SW sendMessage 不回环；产品代码零改动 |
 | [d-071](#d-071) | 2026-10-24 | B27 UI + 诊断包 + 空态粘贴链接 | 时间段输入行接通宿主；「诊断」一键复制（版本/记录/错误码/脱敏日志）；空态「粘贴链接」借 B28 有了实体；host_timerange_test 24 项补齐；JS 1153 项；1.3.62 |
 | [d-070](#d-070) | 2026-10-24 | 保存直下：删确认浮层 | 浮层的手势理由已随 blob 改走 Native Host 消失，删整段（-160 行）换模块级队列 + dispatchSaveItem；顺带修批量路径 MSE 不分派；页面内进度卡即时反馈；反向验证 2 组全红；JS 1146 项；版本 1.3.61 |
 | [d-069](#d-069) | 2026-10-24 | B28 落地：整页解析 | popup 按钮 + 右键第四项 → native:download-page → Netscape 临时文件 → --cookies（jar 形态），同发抑制 legacy 头，finally 保证每条退出路径删登录态文件；测试折出「cmd 批处理转发 % 会炸」；反向验证 3 组全红；Python 干净副本 26/0、JS 1145 项；版本 1.3.60 |
