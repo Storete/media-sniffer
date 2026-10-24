@@ -10,6 +10,38 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-068 · 2026-10-24 · B28 可行性一小时：页面 URL → yt-dlp 的「传递层」设想成立，GO
+
+### 裸验三步（不经扩展，按 B28 既定判据）
+
+**① Netscape 转换器写通。** headless Chrome 访问 B 站视频页 → CDP `Storage.getCookies`
+（等价扩展侧 `chrome.cookies.getAll`）→ 七列 tab 分隔 + `# Netscape HTTP Cookie File`
+头 → yt-dlp `--cookies` 照单全收（回显服务器见 cookie 到达）。B28 拦路石的前半句
+「没有 Netscape 格式的 cookie 文件」从此不成立——转换就是十几行。
+
+**② 页面 URL 直接喂 yt-dlp。** B 站视频页 URL、零站点适配、零扩展改动：
+`yt-dlp --simulate <BV 页>` 直接提出 title + 1080p 格式。「1800+ extractor 接管解析，
+扩展退化成凭据 + URL 传递层」的设想**机械成立**。
+
+**③ cookie 形态判别（本地回显服务器 + generic extractor）。** 同一个 URL 两种形态：
+`--add-header Cookie:` 与 `--cookies` 的请求**都带上了 cookie**（2026.08.19 版 yt-dlp
+没有封 header）——传输层分不出胜负。但机制上 `_get_cookies()` 读的是 `self.cookiejar`
+（只有 `--cookies` 填充），extractor 内部自建 API 请求时 header 形态不可编程读取。
+**B28 原判断成立：产品应切到 `--cookies`**。现状 `downloader.py:704` 注释自认
+「我们没有 Netscape 格式的 cookie 文件，只能把整条 Cookie 头递过去」——该理由已失效。
+
+### 探测边界（如实记）
+
+抖音对 headless Chrome 直接弹**验证码中间页**，匿名裸验做不了。但这只是探测手段的
+局限：产品路径用的是**用户真浏览器**的 cookie（大概率已有 ttwid/登录态），
+B25 的「C 方案半天」估计维持不动。
+
+### 结论
+
+**GO**。落地 = 扩展 `chrome.cookies.getAll({url})` → Netscape 写临时文件 → job 传
+`cookiesFile` → downloader 传 `--cookies`（与现有 header 路径叠加，用完删文件），约半天。
+是否排期（在 B25 之前做，直接决定 B25 是半天还是两天）**留给用户拍板**——本刀只交可行性。
+
 ## d-067 · 2026-10-24 · B29 右键菜单：指哪打哪，测试顺手抓到一个「picture 优先级写反」
 
 ### 起点：T-D3，方案两年前就定了
@@ -2900,6 +2932,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-068](#d-068) | 2026-10-24 | B28 可行性一小时：GO | Netscape 转换器写通、B 站页面 URL 零适配提出 1080p、cookie 形态判别（jar 才是 extractor 可读形态，header 只到传输层）；抖音 headless 有验证码墙（探测局限，产品路径不受限）；落地约半天，排期待拍板 |
 | [d-067](#d-067) | 2026-10-24 | B29 右键菜单：指哪打哪 | 三类菜单+页面解析器（capture 记录，currentSrc/srcset/picture/懒加载/背景图）；blob 降级问页面、问不到不静默；测试抓到 picture `<source>` 优先级写反（右键常拿到降级格式），已修；JS 1133 项；版本 1.3.59 |
 | [d-066](#d-066) | 2026-10-24 | T-C10：主清单地址不再混进 variants | 判据复用 1.3.45 的 listKind，共享函数给构建/比较两端；新计数 masterSkipped（不是 missing 也不是 dropped）；反向验证三组全红；JS 1098 项全过、真机两页 shadow 仍绿；版本 1.3.58 |
 | [d-064](#d-064) | 2026-10-24 | 真机验证自动化：headless Chrome + CDP 打穿 E 组大半 | `Extensions.loadUnpacked` 加载 1.3.57，SW 内 MSSession 存活、回放真跑、B 站两页双跑 `ok:true`、选 720 档 ffprobe 实测 1280x720；ffmpeg 拦截形态从「启动崩」变为「写盘拦」，按 exe 所在目录标签定案；工具收编 `tools/verify_headless.py` |

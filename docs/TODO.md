@@ -47,7 +47,7 @@
 | # | 事项 | 判据 | 状态 |
 |---|---|---|---|
 | T-D1 | B27 按时间段截取下载 | 三层递进方案已定（见 DEVELOPMENT B27），未动代码 | ⬜ |
-| T-D2 | B28 页面 URL 交给 yt-dlp（把浏览器当登录态代理） | 先 1 小时可行性验证 | ⬜ |
+| T-D2 | B28 页面 URL 交给 yt-dlp（把浏览器当登录态代理） | 先 1 小时可行性验证 | ✅ **可行性验证完成（d-068）：GO，半天刀，待拍板排期**<br>裸验三步全做（不经扩展、纯命令行 + headless Chrome）：①Netscape 转换器写通（CDP `Storage.getCookies` 导出 16 个 B 站 cookie → 七列 tab 分隔，yt-dlp 照单全收）②B 站视频页 URL 直接喂 yt-dlp → **零站点适配提出 title + 1080p**（「传递层」设想成立）③本地回显服务器判别 cookie 形态：`--add-header Cookie:` 与 `--cookies` **都到达传输层**（新版 yt-dlp 未封 header）；但 `_get_cookies()` 读的 jar 只有 `--cookies` 填充——**B28 原判断成立：产品应切换/叠加 `--cookies`**（现状 `downloader.py:704` 注释自认「没有 Netscape 文件只能走 header」，该限制已不存在）<br>**探测边界**：抖音对 headless Chrome 弹验证码墙，匿名裸验做不了——但产品路径用的是用户真浏览器的 cookie（可能已登录），不受此限；B25 的半天估计维持<br>**落地工作量**：扩展 `chrome.cookies.getAll({url})` → Netscape 写临时文件 → job 传 `cookiesFile` → downloader 传 `--cookies` 用完删；约半天 |
 | T-D3 | B29 右键菜单「下载这个视频 / 图片」 | 与「喂链接」合并，约半天 | ✅ 1.3.59（d-067）<br>三类菜单按 contexts 分流：video/audio「下载这个视频/音频」、image「下载这张图片」、link「下载此链接的媒体」；**不做**「解析此页」（B28 未排期，不注册空转菜单项）<br>处理链：srcUrl 可用直接下（复用 startNativeDownload，记录/错误码/续传全在）；blob/空才回页面问（inject-main 在 contextmenu **capture** 阶段记录被点元素，解析 currentSrc→src→picture `<source>`→srcset 最大候选→懒加载属性→背景图）；问不到**不静默**——失败原因写进下载记录<br>命名优先元素上下文（alt→邻近标题→文档标题），不落 video.mp4<br>**测试挖出一个真缺陷**：picture 的 `<source>`（通常是更大的 webp/avif 变体）被排在 img src 之后，注释说「优先」实现却相反——右键拿到的常是降级格式，已修<br>测试：context_menu 19 项 + ctx_pick 16 项；反向验证 4 组全红（懒加载兜底丢失→对应断言崩、srcset 不取最大 1 红、去掉问页面降级 1 红、blob 静默 2 红）；JS 1098 → **1133 项 / 20 文件**；CI 接入 |
 | T-D4 | B5 点条目跳到页面里该媒体的位置 | 用户**待讨论**，先谈再动 | 🅿️ |
 | T-D5 | B4 B 站「上个视频的封面残留」 | 用户明确「放到最后优化」 | 🅿️ |
