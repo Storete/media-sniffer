@@ -41,6 +41,7 @@ _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import library  # noqa: E402  统一的下载目录定位（默认 D:/软件应用/DSH/文件存放处）
+import errcode  # noqa: E402  失败原因码表（L2-c）；重试预算写在码表里，不散在 if 里
 
 DEFAULT_OUT = library.library_dir()
 UA = (
@@ -574,7 +575,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
 
             if is_cancelled(job_id):
                 proc.terminate()
-                write_status(job_id, status="cancelled", message="用户取消")
+                write_status(job_id, status="cancelled", err="", message="用户取消")
                 return
     except Exception as e:
         write_status(job_id, status="error", message=("读取下载输出失败: " + str(e))[:300])
@@ -776,6 +777,29 @@ def _fmt_bytes(n):
     return "%.1f GB" % n
 
 
+def _sleep_watch(job_id, seconds, step=0.5):
+    """睡 `seconds` 秒，但每 `step` 秒问一次取消。返回 False = 被取消。
+
+    为什么分段：`time.sleep(30)` 期间用户点取消要等满 30 秒才生效 ——
+    和 d-050 里「取消要等在途分片把 3 轮退避跑完（实测 70 秒）」是同一个病。
+    退避等待是**我们**的决定，不该让用户等我们。
+    """
+    deadline = time.time() + float(seconds)
+    while True:
+        if is_cancelled(job_id):
+            return False
+        left = deadline - time.time()
+        if left <= 0:
+            return True
+        time.sleep(min(step, left))
+
+
+def _give_up(job_id, code, detail="", act=""):
+    """统一收尾：写码 + 一句人话。三条路径以后都走这里（P3' 的收敛点）。"""
+    write_status(job_id, status="error", err=code,
+                 message=errcode.describe(code, detail, act))
+
+
 def run_urllib(job):
     """自己发 HTTP 下直链。相比 yt-dlp 的好处：完全可控、支持断点续传、
     没有「把 URL 当网页爬」的误判。
@@ -835,7 +859,9 @@ def run_urllib(job):
     write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
 
     dropped = False      # 本轮任务里已经作废过一次断点？
+    attempt = 0          # 第几次**请求**（重试也算），交给 errcode.plan 判预算
     while True:
+        attempt += 1
         resp_headers = dict(headers)
         if resumed:
             resp_headers["Range"] = f"bytes={resumed}-"
@@ -887,7 +913,7 @@ def run_urllib(job):
                 with open(part, mode) as f:
                     while True:
                         if is_cancelled(job_id):
-                            write_status(job_id, status="cancelled", message="用户取消")
+                            write_status(job_id, status="cancelled", err="", message="用户取消")
                             return
                         chunk = resp.read(262144)
                         if not chunk:
@@ -916,11 +942,11 @@ def run_urllib(job):
             # 被报成「完成」，用户点开是坏的（V2 一票否决项）。这里改成判失败
             # 并**保留 .part**，下次点击从断点续，不用从头下。
             if total and done < total:
-                write_status(
-                    job_id, status="error",
-                    message="连接提前断开：只收到 %s / %s。已保留断点，"
-                            "再点一次会从断点继续。" % (_fmt_bytes(done), _fmt_bytes(total)),
-                )
+                # 归 VERIFY_MISMATCH 而不是 NET_TIMEOUT：这是「产物不完整」这个**事实**，
+                # 与「网络抖了一下」分开记 —— 统计时才知道是链路问题还是站方提前掐断。
+                _give_up(job_id, "VERIFY_MISMATCH",
+                         "只收到 %s / %s，断点已保留"
+                         % (_fmt_bytes(done), _fmt_bytes(total)))
                 return
 
             os.replace(part, path)
@@ -932,20 +958,50 @@ def run_urllib(job):
                     os.remove(path)
                 except OSError:
                     pass
-                write_status(
-                    job_id, status="error",
-                    message="只下到播放列表（#EXTM3U），不是视频。这条地址是 HLS 清单，"
-                            "得按分片下载；请用扩展列表里的「下载」交给本地下载器。",
-                )
+                # 同归 VERIFY_MISMATCH：「下到的东西不是视频」属于验证层第 4 层的事，
+                # 和 ffprobe 打不开是同一类，只是这一层不用调 ffprobe 就能判。
+                # 但**建议不一样**：这不是「再点一次会好」，重试一百次还是清单，
+                # 得换一条走分片下载的路径。所以这里覆盖 act，码不变。
+                _give_up(job_id, "VERIFY_MISMATCH",
+                         "拿到的是 #EXTM3U 播放列表，不是视频；这条地址是 HLS 清单，"
+                         "得按分片下载",
+                         act="用扩展列表里的「下载」按钮，它会按分片拼。")
                 return
             write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
-                         message="")
+                         err="", message="")
             return
         except urllib.error.HTTPError as e:
-            write_status(job_id, status="error", message=f"HTTP {e.code} {e.reason}")
+            # HTTP 状态码 → 码表。**重试预算来自码表**（errcode.CODES[码]["attempts"]），
+            # 不是这里临时决定的 if 分支 —— 「第几次开始降级」必须是表上的一个数字。
+            hdrs = getattr(e, "headers", None)
+            code = errcode.classify_http(e.code, hdrs)
+            again, delay, why = errcode.plan(code, hdrs, attempt)
+            if again:
+                # 重试对用户**可见**：不写这一句就变成「默默重试」，用户只看到进度条不动。
+                write_status(job_id, status="downloading", err=code,
+                             message=errcode.retry_note(code, attempt, delay))
+                if not _sleep_watch(job_id, delay):
+                    write_status(job_id, status="cancelled", err="", message="用户取消")
+                    return
+                continue          # 回到顶部：`resumed` 还在，所以续传语义不受影响
+            detail = "HTTP %d" % e.code
+            if why:
+                detail = "%s，%s" % (detail, why)
+            _give_up(job_id, code, detail)
             return
         except Exception as e:
-            write_status(job_id, status="error", message=str(e)[:400])
+            code = errcode.classify_exc(e)
+            again, delay, why = errcode.plan(code, None, attempt)
+            if again:
+                write_status(job_id, status="downloading", err=code,
+                             message=errcode.retry_note(code, attempt, delay))
+                if not _sleep_watch(job_id, delay):
+                    write_status(job_id, status="cancelled", err="", message="用户取消")
+                    return
+                continue
+            # 兜底桶才贴原始异常：已知异常已经有一句人话了，再贴英文只是噪音。
+            detail = str(e)[:60] if code == errcode.INTERNAL else ""
+            _give_up(job_id, code, detail)
             return
 
 

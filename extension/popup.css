@@ -307,6 +307,17 @@ footer {
 .history .h-item .s { color: var(--text-dim); flex: none; }
 .history .h-item .sp { flex: 1; }  /* 弹性占位：把操作按钮推到行尾 */
 .history .h-item .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 失败原因单独占一行：`.sp` 已经把第一行撑满，`flex-basis:100%` 就一定会换行。
+   不给它 `flex:1`，否则它会被拉宽到把按钮挤出可视区。 */
+.history .h-item.err { flex-wrap: wrap; }
+.history .h-item .h-why {
+  flex: 0 0 100%;
+  color: var(--err);
+  font-size: 10px;
+  line-height: 1.4;
+  padding-left: 34px;   /* 和时间戳同一条左边线，读起来是「这条的补充说明」 */
+  opacity: .9;
+}
 
 .jobs { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 84px; overflow-y: auto; }.job { font-size: 11px; color: var(--text-dim); }
 .job .bar {

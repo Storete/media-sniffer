@@ -137,6 +137,17 @@ check("批量模式下勾选框在最左（行号在它右边，两种模式同�
 check("CSS 给 .no 固定宽度（否则名字列宽随序号位数跳动）",
   /\.no\s*\{[\s\S]{0,160}flex:\s*0 0 \d+px/.test(CSS));
 
+// 下载记录里的失败原因：**必须可见**，不许只放在 title 里。
+// 「下不下来时告诉你为什么」是这产品唯一的卖点；塞进 tooltip 等于没做。
+check("失败记录把原因渲染成可见元素（.h-why），不是只挂 title",
+  /className\s*=\s*"h-why"/.test(JS) && /why\.textContent\s*=\s*it\.error/.test(JS));
+check("CSS 里失败行允许换行（否则原因会被挤成一团）",
+  /\.h-item\.err\s*\{\s*flex-wrap:\s*wrap/.test(CSS));
+check("原因行占满整行宽度（flex-basis:100%）",
+  /\.h-why\s*\{[\s\S]{0,120}flex:\s*0 0 100%/.test(CSS));
+check("错误码进 title（诊断时能念出来），不占用可见行",
+  /why\.title\s*=\s*\(it\.code/.test(JS));
+
 console.log("\n==============================================");
 console.log("通过 " + pass + " 项，失败 " + fail + " 项");
 process.exit(fail ? 1 : 0);

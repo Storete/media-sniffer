@@ -416,6 +416,7 @@ async function notifySaved(p) {
         size: p.size || 0,
         file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "",
         error: ok ? "" : (p.error || ""),
+        code: ok ? "" : String(p.code || ""),
         time: Date.now(),
       },
     });
@@ -425,7 +426,7 @@ async function notifySaved(p) {
   try {
     const { history } = await chrome.storage.session.get({ history: [] });
     const list = Array.isArray(history) ? history : [];
-    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
+    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), code: ok ? "" : String(p.code || ""), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
     while (list.length > 100) list.shift();
     await chrome.storage.session.set({ history: list });
   } catch (e) { /* 忽略 */ }
@@ -1828,6 +1829,9 @@ function connectNative() {
           filename: file || job.filename || job.url || "",
           size: Number(msg.size) || 0,
           error: ok ? "" : (msg.message || (msg.action === "cancelled" ? "已取消" : "下载失败")),
+          // 失败原因码（native-host/errcode.py 那张表）：只存不翻译，
+          // 展示用 message 那句中话，code 留给「诊断包」和用户报错时念。
+          code: ok ? "" : String(msg.err || ""),
           __tabId: job.tabId,
         });
       }

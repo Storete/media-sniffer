@@ -62,7 +62,7 @@ Chrome 扩展「资源嗅探 Media Sniffer」+ 本地 Python 宿主。
 # 语法
 for f in extension/*.js; do node --check "$f" || exit 1; done
 
-# JS 单元测试（主要 10 套；全套 17 个文件见下方提示）
+# JS 单元测试（主要 12 套；全套 20 个文件见下方提示）
 node test/background.test.js
 node test/detect.test.js
 node test/hls_family.test.js
@@ -76,14 +76,21 @@ node test/range_parallel.test.js
 node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（17 套，自动跳过缺 ffmpeg 的）
+# Python（19 套，自动跳过缺 ffmpeg 的）
 python test/run_all.py
 ```
 
-提示：`test/*.test.js` 全套共 20 个文件（上面之外还有 `icon_filter`、`blob_item`、`ui_card`、
-`focus_scope`、`group_key`、`review`、`hls_meta`、`naming`、`hls_same_movie`）；其中 `focus_scope` / `group_key` 只在失败时输出，
-`review.test.js` 由 `background.test.js` 引入执行，单独跑会提示跳过。
+提示：`test/*.test.js` 全套共 **20** 个文件（上面 12 个之外还有 `icon_filter`、`blob_item`、
+`ui_card`、`focus_scope`、`group_key`、`review`、`hls_meta`、`naming`）；
+其中 `focus_scope` / `group_key` **成功时不打印任何汇总行**，
+`review.test.js` 由 `background.test.js` 引入执行、单独跑会提示跳过。
+所以「995 项」的口径是**只会打印汇总行的套件之和**，不含那两个静默套件 ——
+如果哪天又对不上，先看是不是这个原因。
 整套跑法：`for f in test/*.test.js; do node "$f"; done`。
+
+**统计断言数时注意三种汇总格式**：`通过 N 项，失败 M 项`、`N 通过 / M 失败`、
+`N 通过, M 失败`。只匹配其中一种会**静默漏算**（2026-10-24 实测漏了 43 项，
+`ui_card` 和 `pattern_sync` 一直没被算进去，文档里记的 952 是低估的）。
 
 **真机取证的常规手段是 `tools/live_check.mjs`**（不是手动点）：`--history-test` 验下载记录、
 `--render-check` 把真实条目喂给 `renderItem` 读文案、`--download-test` 复现「下载中关标签页」、
@@ -157,7 +164,7 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 10 套主 JS + 17 套 Python 全绿（JS 全套 **952** 项，口径：各套件汇总行的「N 通过」求和），数字记进 `DEVLOG.md`
+- [ ] 10 套主 JS + 19 套 Python 全绿（JS 全套 **995** 项），数字记进 `DEVLOG.md`
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

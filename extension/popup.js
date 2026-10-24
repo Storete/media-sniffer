@@ -1422,6 +1422,16 @@ function renderHistory(items, hideNow) {
     del.textContent = "删除";
     del.addEventListener("click", () => deleteHistoryItem(it.time, box));
     row.append(rv, del);
+    // 失败原因**直接显示**，不藏在 title 里。
+    // 原来只有 ✗ + 文件名，用户得把鼠标悬上去才知道为什么失败 ——
+    // 而「下不下来时告诉你为什么」是这产品唯一的卖点，不能放在 tooltip 里。
+    if (!it.ok && it.error) {
+      const why = document.createElement("span");
+      why.className = "h-why";
+      why.textContent = it.error;
+      why.title = (it.code ? it.code + " · " : "") + it.error;
+      row.append(why);
+    }
     box.append(row);
   }
   box.classList.remove("hidden");
