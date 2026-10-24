@@ -35,7 +35,7 @@
 | T-C2 | S1-3/4/5/6 真机六条（页面不被读体搞坏 / 开关可回归 / 大清单不卡 / 失败静默） | 见 `ACCEPTANCE.md` §6 | ⬜ |
 | T-C3 | S0 Step2：`msBuildSession` 接进 `background.js` 与旧 `items` **双跑比对** | 三页字段级 diff 只有新增字段 | 🔄 1.3.52 接线完成，真机取证待做（T-E2/T-E3）<br>证据：d-058；`session_shadow` 49 项 + `background` 新增 15 项<br>判据落地：`ok = missing/changed/extra 全空`，`added` 由数据算<br>反向验证：去 images **3 红**、`ok` 恒真 **3 红**、mime 按数字比 **7 红**<br>取证入口：`{type:"ms:shadow", tabId}` 或省略 tabId 取全部<br>**顺带挖出两个洞**：会话原来没有 `images`（图集页面在会话里是空的）；测试沙箱缺 `URL` 导致 sid 静默空串还假绿 |
 | T-C10 | **会话 `variants` 里混进主清单地址**（`x36xhzz.m3u8` 被当成一条没有分辨率的变体） | S1 眼里是个假档位、S3 规划里会被当成可直下地址 | ⬜ 留给 S3 一起处理（旧模型同样把它当条目，所以双跑不报差异） |
-| T-C4 | S2 验证四层 + 12 错误码 | 删掉一个分片 → 界面说「分片缺失，已重试 3 次」 | ⬜ |
+| T-C4 | S2 验证四层 + 12 错误码 | 删掉一个分片 → 界面说「分片缺失，已重试 3 次」 | ✅ 1.3.53（验证四层落地，第 4 层真机待验）<br>证据：d-059；`host_verify_test` 36 项<br>四层收成一个纯函数 `verify_product(path, expect, ffprobe)` → `(ok, code, detail, extra)`；四条下载链（直链/yt-dlp/HLS/合并）收尾统一走 `finish_verified`，**done 必经验证**<br>反向验证：废清单检查 6 红、废 ffprobe returncode 2 红、废缺轨道 2 红、废时长 2 红<br>**判据后半句「删分片→界面报错」要真机复验**（本机无 ffmpeg，第 4 层用假 subprocess 验逻辑）；「12 错误码」已在前几刀升到 15 码并全接线 |
 | T-C5 | S3 规划表外置 + 表驱动测试 | 「这条为什么走 yt-dlp」能答 | ⬜ |
 | T-C6 | S4 工作站（队列 / 续传 / 历史，关浏览器照跑） | 关浏览器后任务继续 | ⬜（依赖 B 组） |
 | T-C7 | S5 知识库双通道 + CI | 同站失败 3 次自动出建议 | ⬜ |

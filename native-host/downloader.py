@@ -378,6 +378,23 @@ def find_tool(names):
     return None
 
 
+_FFPROBE_CACHE = [None, False]      # [path, 已探测过]
+
+
+def ffprobe_tool():
+    """拿一个「能跑」的 ffprobe，结果缓存。
+
+    与 find_tool(["ffprobe"]) 唯一的区别是**缓存 + 只查一次**：验证四层在每条
+    下载链收尾都要问一次，而 find_tool 每次都要真跑一遍 `-version`
+    （tool_runs 会起子进程），几十次下来是纯浪费。缓存的第二个值是
+    `False`（哨兵）用来区分「没查过」和「查过了但没有」。
+    """
+    if not _FFPROBE_CACHE[1]:
+        _FFPROBE_CACHE[0] = find_tool(["ffprobe"])
+        _FFPROBE_CACHE[1] = True
+    return _FFPROBE_CACHE[0]
+
+
 def is_cancelled(job_id):
     """取消靠「标记文件存在」传递：跨进程、不用 socket、worker 还没起来时
     写的标记也会在它起来后立刻被看到。"""
@@ -503,6 +520,126 @@ def looks_like_playlist(path):
         return head.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
     except Exception:
         return False
+
+
+def verify_product(path, expect=None, ffprobe=None):
+    """输出验证四层（L2-b 的落地）。返回 `(ok, code, detail, extra)`。
+
+    `ok=False` 时 `code` 一定是码表里的一个码（默认 VERIFY_MISMATCH），
+    调用方拿它走 `_give_up` —— **绝不把坏文件当成功**。这是唯一入口，
+    各下载链（直链 / HLS 自下 / yt-dlp / 合并 / MSE 落盘）收尾都要经过它。
+
+    四层（任一层不过就停，后面的不再看）：
+      1. 文件存在          → 不存在是「说完成但啥都没有」
+      2. 非空（size > 0）  → 0 字节是「跑完了但空手」
+      3. 内容符合预期      → 三件事：a) `looks_like_playlist`（把清单当文件下）
+                              b) `expect.min_bytes` 有值时 size 不够
+                              c) `expect.content_sniff`（可选回调）判「读到的不是这个类型」
+      4. ffprobe 能解析    → 只有 `ffprobe` 非空才做；解析失败 / 缺 expect 的
+                              轨道 / 时长偏差超 `expect.dur_tol` 秒 → 不过
+
+    设计要点：
+      · 纯函数 —— 不碰网络、不改文件，只读；`ffprobe` 是入参不是自己去找，
+        这样测试能塞一个假 ffprobe 验证逻辑，本机没有真 ffmpeg 也能全绿。
+      · 第 4 层「可跳过」：`ffprobe` 传 None 就只做前三层。本机（T-E5 之前）
+        没有能跑的 ffprobe，但不该因此整个验证退化 —— 前三层已经能拦住
+        「下到清单」「下到 0 字节」「下到半截」这三种最脏的假成功。
+      · 时长偏差只判「太短」不判「太长」：多下几秒能忍，少下几十秒是
+        真缺内容。`dur_tol` 默认 2 秒，与 PRODUCT-PLAN 的「偏差 < 2s」对齐。
+
+    `expect` 可空：空就只做「存在 + 非空 + 不是清单」这三条最底线，
+    对应「没有清单元数据、只有一条直链」的下载。
+    """
+    e = expect or {}
+    if not path or not os.path.isfile(path):
+        return (False, "VERIFY_MISMATCH", "下完的文件不存在", {})
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return (False, "VERIFY_MISMATCH", "读不到文件大小", {})
+    if size <= 0:
+        return (False, "VERIFY_MISMATCH", "下完的文件是 0 字节", {})
+    if looks_like_playlist(path):
+        # 单独一个 detail 而不是拼 code：直链 / yt-dlp 两路要同一句话（T-B5），
+        # 这里给「事实」，建议（act）由调用方按场景覆盖。
+        return (False, "VERIFY_MISMATCH", errcode.DETAIL_PLAYLIST, {})
+    if e.get("min_bytes") and size < int(e["min_bytes"]):
+        return (False, "VERIFY_MISMATCH",
+                "只有 %s，比预期短太多" % _fmt_bytes(size), {"size": size})
+    sniff = e.get("content_sniff")
+    if callable(sniff):
+        try:
+            bad = sniff(path, size)
+        except Exception:
+            bad = ""
+        if bad:
+            return (False, "VERIFY_MISMATCH", str(bad), {"size": size})
+
+    # 第 4 层：ffprobe。没有 ffprobe 就到此为止 —— 前三层已经拦住最脏的假成功。
+    if not ffprobe:
+        return (True, "", "", {"size": size, "probed": False})
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration:stream=codec_type,codec_name",
+             "-of", "default=noprint_wrappers=1", path],
+            capture_output=True, text=True, timeout=30, **_NO_WINDOW,
+        )
+    except Exception as exc:
+        # ffprobe 起不来是「本机缺依赖」，不是「文件坏」—— 别把工具问题算到产物头上。
+        # 这里放宽成「前三层已过」，让 done 能落；工具问题由 find_tool 那一层拦。
+        return (True, "", "", {"size": size, "probed": "skipped", "why": str(exc)[:40]})
+    if out.returncode != 0:
+        return (False, "VERIFY_MISMATCH", "ffprobe 打不开这个文件", {"size": size})
+
+    dur = None
+    codecs = set()
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("duration="):
+            try:
+                dur = float(line.split("=", 1)[1])
+            except ValueError:
+                dur = None
+        elif line.startswith("codec_type="):
+            codecs.add(line.split("=", 1)[1].strip())
+    extra = {"size": size, "probed": True, "duration": dur, "codecs": sorted(codecs)}
+
+    # 缺轨道：expect.tracks 说要有 audio，但 ffprobe 没看到 audio 流
+    for tr in (e.get("tracks") or []):
+        if tr not in codecs:
+            return (False, "VERIFY_MISMATCH",
+                    "少了 %s 轨道" % tr, extra)
+    # 时长偏差：只有 expect.min_duration 给了才判「太短」
+    if e.get("min_duration") and dur is not None and dur < float(e["min_duration"]):
+        return (False, "VERIFY_MISMATCH",
+                "时长 %.1fs，比预期短" % dur, extra)
+    return (True, "", "", extra)
+
+
+def finish_verified(job_id, path, message="", expect=None, notes=(), act=""):
+    """收尾统一出口：跑 `verify_product`，过了写 done，没过走 `_give_up`。
+
+    各下载链（直链 / yt-dlp / HLS 自下 / 合并）原来各自写 `write_status(done)`，
+    「验证产物」这一步要么没有、要么散落各处（有的查清单、有的查字节数、
+    有的连 ffprobe 都不碰）。这里收成一个口：**done 一定是验证过的 done**。
+
+    `act` 只在验证失败时用（不同链对同一码的建议不一样，比如「下到清单」在
+    直链要换分片路径、在 yt-dlp 要换 URL）；`notes` 是要拼进成功 message 的
+    额外提醒（如清晰度回落）。
+    """
+    ok, code, detail, _extra = verify_product(path, expect, ffprobe_tool())
+    if not ok:
+        _give_up(job_id, code, detail, act)
+        return False
+    msg = message
+    if notes:
+        msg = (msg + "；" if msg else "") + "；".join(notes)
+    write_status(job_id, status="done", percent=100, speed="", eta="",
+                 err="", file=path, message=msg)
+    return True
 
 
 def cleanup_ytdlp_junk(outdir, base):
@@ -686,13 +823,13 @@ def run_ytdlp(job, ytdlp, ffmpeg):
             # 原代码在这里直接写 done + file=""，用户看到「完成」但什么都没有。
             product = find_done_product(outdir, base)
             if product:
-                write_status(job_id, status="done", percent=100, speed="", eta="",
-                             err="", file=product, message="")
+                finish_verified(job_id, product)
             else:
                 _give_up(job_id, "VERIFY_MISMATCH", "yt-dlp 说完成了，但目录里找不到视频文件")
         else:
-            write_status(job_id, status="done", percent=100, speed="", eta="",
-                         err="", file=final_file, message="")
+            # yt-dlp 路径拿不到清单的时长/轨道，expect 只留空；ffprobe 在的时候
+            # 走第 4 层（解析失败 = 打不开的假成功），没有 ffprobe 就前三层。
+            finish_verified(job_id, final_file)
     else:
         # 尾部有 ERROR 行**不等于**失败（真机 2026-10-22 51cg1 第三次下载）：
         # yt-dlp 退出码 0、170MB 的真 mp4 已经下好，却打了一行内容为空的
@@ -701,8 +838,7 @@ def run_ytdlp(job, ytdlp, ffmpeg):
         # 判据改成「目录里有没有真视频」：有就是成了，那行 ERROR 只是噪声。
         product = find_done_product(outdir, base)
         if proc.returncode == 0 and product:
-            write_status(job_id, status="done", percent=100, speed="", eta="",
-                         err="", file=product, message="")
+            finish_verified(job_id, product)
             return
         # 失败：把 yt-dlp 的英文输出翻成码表里的一个码。
         # 看的是整段尾巴而不是那一行 ERROR —— 真机上「原因」常常在上一行，
@@ -1044,19 +1180,20 @@ def run_urllib(job):
 
             os.replace(part, path)
             drop_part_meta(part)
-            # 下完还得验内容：m3u8 地址被当成普通文件下，拿到的是**清单文本**。
-            # 真机 2026-10-22 就是这么把一个 29KB 的 #EXTM3U 报成「完成」的。
-            if looks_like_playlist(path):
+            # 下完统一走验证四层（L2-b）。直链只知道总长，没有清单元数据，
+            # 所以 expect 只给 min_bytes；ffprobe 在本机往往没有，没有就只验前三层。
+            ok, code, detail, _extra = verify_product(
+                path, {"min_bytes": total} if total else {}, ffprobe_tool())
+            if not ok:
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-                # 同归 VERIFY_MISMATCH：「下到的东西不是视频」属于验证层第 4 层的事，
-                # 和 ffprobe 打不开是同一类，只是这一层不用调 ffprobe 就能判。
-                # 但**建议不一样**：这不是「再点一次会好」，重试一百次还是清单，
-                # 得换一条走分片下载的路径。所以这里覆盖 act，码不变。
-                _give_up(job_id, "VERIFY_MISMATCH",
-                         errcode.DETAIL_PLAYLIST, act=errcode.ACT_PLAYLIST)
+                # 「下到的东西是清单」和「下到半截」是两种建议：
+                # 前者重试一百次还是清单，得换一条走分片下载的路径；
+                # 后者断点已保留（上面 done<total 的分支已经拦掉大半），再点会续。
+                act = errcode.ACT_PLAYLIST if detail == errcode.DETAIL_PLAYLIST else ""
+                _give_up(job_id, code, detail, act)
                 return
             write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
                          err="", message="")
@@ -1662,13 +1799,17 @@ def run_hls_self(job, quiet=False):
                 except OSError:
                     pass
             if ok:
+                # 验证 mp4 产物（四层：存在/非空/非清单/ffprobe 可解析）。
+                # 验证要在删 ts **之前**：验证不过时 TS 还能留作退路，删了才查
+                # 就等于把唯一的完整文件赌在一个还没验过的 mp4 上。
+                finished = finish_verified(
+                    job_id, out_mp4, "已拼成完整视频", notes=notes)
+                if not finished:
+                    return True   # 验证失败，状态已由 finish_verified 写好
                 try:
                     os.remove(ts_path)
                 except OSError:
                     pass
-                write_status(job_id, status="done", percent=100, speed="", eta="",
-                             err="", file=out_mp4,
-                             message="已拼成完整视频" + ("；" + "；".join(notes) if notes else ""))
                 return True
 
     msg = "已拼成完整视频（TS 容器，播放器能直接放）"
@@ -1676,8 +1817,7 @@ def run_hls_self(job, quiet=False):
         msg += "；" + "；".join(notes)
     if remux_err:
         msg += "；转 mp4 失败：" + remux_err
-    write_status(job_id, status="done", percent=100, speed="", eta="",
-                 err="", file=ts_path, message=msg)
+    finish_verified(job_id, ts_path, msg)
     return True
 
 
@@ -1859,14 +1999,19 @@ def run_merge(job):
 
     proc.wait()
     if proc.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+        # 合并产物也走验证四层；合并是「音+视频」两条流，期望产物至少带视频轨。
+        # 验证要在删源流**之前**：验不过时两条源流还能留着当退路。
+        finished = finish_verified(
+            job_id, out, "已合并为单文件",
+            expect={"tracks": ["video"]} if ffprobe_tool() else {})
+        if not finished:
+            return
         # 合并成功才删源流；失败/取消一律保留，用户还能自己用 ffmpeg 合
         for p in (video, audio):
             try:
                 os.remove(p)
             except OSError:
                 pass
-        write_status(job_id, status="done", percent=100, speed="", eta="",
-                     file=out, err="", message="已合并为单文件")
     else:
         tail = " ".join(err_tail[-4:])
         # 先看 ffmpeg 那句尾巴能不能对上已知原因（磁盘满 / 编码不支持）；

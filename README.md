@@ -352,7 +352,7 @@ media-sniffer/
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
 │   ├── pattern_sync.test.js 扩展与宿主的正则同步校验（4 项）
 │   ├── run_js.py            JS 全量跑一次并给出可复现总数（认三种汇总格式）
-│   └── *.py                 宿主侧 Python 测试（22 套；含 errcode 码表 71 项、urllib 重试 29 项、
+│   └── *.py                 宿主侧 Python 测试（23 套；含 errcode 码表 71 项、urllib 重试 29 项、
 │                             三路径收敛 44 项、任务超时 27 项、选档 28 项）
 ├── tools/
 │   ├── fuzz_host.py         变异/性质测试（喂畸形输入找边界 bug，见下）
@@ -398,7 +398,7 @@ node test/pattern_sync.test.js     # 4 项
 # 全跑一遍并给出总数（推荐；手数容易漏，见 AGENTS.md）
 python test/run_js.py
 
-# Python（22 套，不需要 pytest，也不装任何依赖）
+# Python（23 套，不需要 pytest，也不装任何依赖）
 python test/run_all.py             # 一串跑完并汇总（没装 ffmpeg 的套件自动 SKIP）
 
 # 或单个跑
