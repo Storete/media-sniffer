@@ -162,7 +162,7 @@ python test/run_all.py
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行
 - [ ] `DEVELOPMENT.md` 待办状态已更新
-- [ ] `manifest.json` 版本号已升
+- [ ] `manifest.json` 版本号已升（**例外**：只改 `tools/`、`docs/`、`test/` 且产品代码零改动的提交不必升——凑版本号反而让「装的人分不清新旧」这条规则失效）
 - [ ] 没有残留调试代码（`console.log` 探针、`__msDbg`、临时文件）
 - [ ] 没有本机绝对路径、账号、密钥
 
