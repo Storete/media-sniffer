@@ -55,8 +55,11 @@ check("popup 有 isHlsItem 判定", /function isHlsItem\(it\)/.test(JS));
 check("isHlsItem 认 hint=hls", /it\.hint === "hls"/.test(JS));
 check("isHlsItem 退回 URL 后缀判（老 state 没有 hint 也能认）", JS.indexOf("m3u8$/i") >= 0);
 check("displayName 里 HLS 走专用名字", /HLS 流（视频）/.test(JS));
-check("副行提示这是分片清单", /HLS 流 · 分片清单/.test(JS));
+// 名字里已经有「HLS 流（视频）」，副行不要再重复一次；三条并列时靠副行区分。
+check("副行提示这是分片清单", /bits\.push\("分片清单"\)/.test(JS));
 check("副行提示点下载会自动拼", /点下载自动拼成完整视频/.test(JS));
+check("主清单标注含几个清晰度清单", /主清单 · 含 /.test(JS));
+check("变体标注是同一视频的第几个清单", /同一视频的第 /.test(JS));
 
 // 真机 51cg1 的现象：有 m3u8 的页面同时存在 blob: 录制条目和 m1/m2 分片，
 // 同一条视频在列表里显示三份。hideRecorder 必须把它们一并隐掉。
@@ -101,8 +104,14 @@ console.log("[8] 列表行号：按出现顺序编号（用户 2026-10-23 51cg1 
 // 两条都叫「HLS 流（视频）」，用户看不出哪个是哪个 —— 点错了下到的是另一路流。
 // 行号必须是**当前列表的显示顺序**，不是 it.idx（那是 ①②③ 的池子，按消息分组编的）。
 check("renderList 把显示顺序传给 renderItem",
-  /for \(let i = 0; i < items\.length; i\+\+\)\s*\{\s*box\.append\(renderItem\(items\[i\], i \+ 1\)\);\s*\}/.test(JS));
-check("renderItem 接收行号", /function renderItem\(it, no\)/.test(JS));
+  /box\.append\(renderItem\(items\[i\], i \+ 1(?:, [^)]+)?\)\)/.test(JS));
+check("renderItem 接收行号", /function renderItem\(it, no(?:, [^)]+)?\)/.test(JS));
+// 同一页多条 m3u8 时必须能说出「哪条是主清单、哪条是第几档」，
+// 否则用户面对三条一模一样的「HLS 流（视频）」只能靠猜（2026-10-24 用户截图）。
+check("renderList 把清单族传给 renderItem",
+  /renderItem\(items\[i\], i \+ 1, hlsFamily\)/.test(JS));
+check("清单族按全量条目算，不按筛选后的可见列表",
+  /MSHlsFamily\.build\(allItems\)/.test(JS));
 check("行号建成独立的 .no 元素（不混进 displayName，否则会被标题截断吃掉）",
   /const noEl = el\("div", "no"/.test(JS));
 check("行号排在类型徽标之前", JS.indexOf('row.append(noEl)') >= 0

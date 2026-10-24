@@ -58,6 +58,9 @@ module.exports = function runReviewTests(check) {
         return hit ? String(hit.value || "") : "";
       },
       classify: () => "image",
+      // 清单豁免是 record 的新依赖。这三个用例只验 tabId 判定，不验豁免，
+      // 给 false 保持「没有豁免」的旧路径；豁免行为由 manifest_classify.test.js 覆盖。
+      isManifestUrl: () => false,
       MIN_MEDIA_BYTES: { video: 2048, audio: 10240, image: 512, seg: 0, doc: 0, font: 0, other: 0, icon: 0 },
       MAX_PER_TAB: 5000, MAX_SEGMENTS: 400,
       it_legacyHits: () => 0,

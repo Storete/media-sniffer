@@ -510,8 +510,19 @@ def poll_job(job_id):
                     "inProgress": True,
                 })
             if st.get("status") in ("done", "error", "cancelled"):
+                # 带上产物大小：扩展侧要用它写「下载记录」（记录里显示 12.3MB 还是
+                # 空着一栏，差别就是用户能不能一眼确认下对了）。状态文件本身不含
+                # size（downloader 的 write_status 从不写这个字段），所以在这里
+                # 直接量一次磁盘 —— 文件就在本机，比多传一路字段可靠。
+                f = st.get("file") or ""
+                sz = 0
+                if f:
+                    try:
+                        sz = os.path.getsize(f)
+                    except OSError:
+                        sz = 0
                 send({"id": job_id, "action": st.get("status"), "status": st.get("status"),
-                      "file": st.get("file") or "", "message": st.get("message") or ""})
+                      "file": f, "size": sz, "message": st.get("message") or ""})
                 return
         time.sleep(0.4)
     send({"id": job_id, "action": "error", "status": "error", "message": "任务超时"})

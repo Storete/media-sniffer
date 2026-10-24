@@ -44,6 +44,16 @@ const EXT_TO_KIND = {
 
 const SEGMENT_EXT = new Set(["ts", "m4s", "cmfv", "cmfa", "init", "key", "vtt", "srt", "aac"]);
 
+// 播放大清单（HLS / DASH）。这两个扩展名的判定必须压过 MIME，也必须豁免体量门槛：
+//
+// · MIME 不可靠：同一个 .m3u8 可能以 `audio/mpegurl`（mux 测试流）、
+//   `application/xml`、`text/plain`（51cg1）、`application/vnd.apple.mpegurl` 回来。
+//   靠 MIME 判，清单会被分到 audio 或 other 栏，用户根本看不到「这是个视频」。
+// · 体量更不可靠：master playlist 只有 752 字节、media playlist 只有 231 字节
+//   （curl 实测），远小于 video 的 2048 门槛，会被当成 1×1 像素级的假资源整条丢掉。
+//   表现是「网页在放 HLS，列表里全是分片，没有视频入口」。
+const MANIFEST_EXT = new Set(["m3u8", "mpd"]);
+
 const KIND_ORDER = ["video", "audio", "image", "icon", "doc", "font", "other", "seg"];
 
 function extOf(url) {
@@ -57,8 +67,14 @@ function extOf(url) {
   }
 }
 
-function kindFromMime(mime) {
-  if (!mime) return null;
+/** 这个地址是不是播放大清单（.m3u8 / .mpd）。
+ *  体量门槛要用它做豁免；判据与 isHlsUrl 一致 —— 只看 pathname，
+ *  不看 query（`?url=x.m3u8` 那种跳转的地址本身不是清单）。 */
+function isManifestUrl(u) {
+  return MANIFEST_EXT.has(extOf(String(u || "")));
+}
+
+function kindFromMime(mime) {  if (!mime) return null;
   const m = mime.toLowerCase().split(";")[0].trim();
   if (m === "application/vnd.apple.mpegurl" || m === "application/x-mpegurl") return "video";
   if (m === "application/dash+xml") return "video";
@@ -77,6 +93,9 @@ function kindFromMime(mime) {
 function classify(url, mime) {
   const ext = extOf(url);
   if (SEGMENT_EXT.has(ext)) return "seg";
+  // 清单扩展名压过 MIME：清单可能以 audio/mpegurl、text/plain、application/xml
+  // 任何形式回来（见 MANIFEST_EXT 的注释）。放在 kindFromMime 之前是这条的唯一要点。
+  if (MANIFEST_EXT.has(ext)) return "video";
   const byMime = kindFromMime(mime);
   if (byMime) return byMime;
   // 无扩展名的媒体端点（Telegram /progressive/document<id>、/k/stream/... 等）
@@ -289,7 +308,8 @@ function record(d) {
 
   // 最小体量门槛（见 MIN_MEDIA_BYTES 注释）：明确小于门槛的完整响应丢弃。
   // 206 分段响应跳过门槛（content-length 只是分段长度，真体量靠后续 existed 分支补）。
-  if (d.statusCode !== 206 && size > 0 && size < (MIN_MEDIA_BYTES[kind] || 0)) {
+  // 清单（m3u8/mpd）一律豁免：它是文本，几百字节才是常态，用视频门槛去量必然误杀。
+  if (!isManifestUrl(d.url) && d.statusCode !== 206 && size > 0 && size < (MIN_MEDIA_BYTES[kind] || 0)) {
     diagBump(d.tabId, "too-small:" + kind, d.url);
     return;
   }
@@ -1720,6 +1740,30 @@ function connectNative() {
       // 地址过期（m3u8 一次性）时自动刷新页面重取 —— 见 maybeStartHlsRetry 的注释
       maybeStartHlsRetry(msg);
     }
+
+    // 下载任务（popup 的「下载」按钮、以及地址过期后的自动重试）的收尾。
+    //
+    // 这一支长期缺失：以前只有页面浮层保存那条链（cmd:"saved"）会调 notifySaved，
+    // 而 native:download 这条链的回执只是被转发给 popup，**从不写「下载记录」**。
+    // 结果是用 popup 下载下来的东西永远不出现在记录面板里 —— 文件已经在磁盘上，
+    // 用户却以为「下载记录消失了」（2026-10-24 真机复现：240000 字节已落盘，
+    // history 0 → 0，lastResult 为 null）。
+    if (msg && msg.id && (msg.action === "done" || msg.action === "error" || msg.action === "cancelled")) {
+      const job = downloads.get(msg.id);
+      if (job) {
+        downloads.delete(msg.id);
+        const ok = msg.action === "done";
+        const file = String(msg.file || "");
+        notifySaved({
+          ok,
+          filename: file || job.filename || job.url || "",
+          size: Number(msg.size) || 0,
+          error: ok ? "" : (msg.message || (msg.action === "cancelled" ? "已取消" : "下载失败")),
+          __tabId: job.tabId,
+        });
+      }
+    }
+
     chrome.runtime.sendMessage({ type: "native:progress", msg }).catch(() => {});
   });
   nativePort.onDisconnect.addListener(() => {

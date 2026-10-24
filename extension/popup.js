@@ -550,6 +550,13 @@ function renderList() {
   const items = visibleItems();
   box.replaceChildren();
 
+  // 清单族要按**全量**条目算，不能用 visibleItems：用户切到「视频」筛选时，
+  // 分片被筛掉了，但主清单/变体的判定跟分片无关；反过来在「分片」筛选下
+  // 用可见列表算，会一条 m3u8 都看不到，标注全丢。
+  const hlsFamily = (typeof MSHlsFamily !== "undefined" && MSHlsFamily)
+    ? MSHlsFamily.build(allItems)
+    : new Map();
+
   if (!items.length) {
     let tip;
     if (filter === "seg") {
@@ -587,7 +594,7 @@ function renderList() {
   }
 
   for (let i = 0; i < items.length; i++) {
-    box.append(renderItem(items[i], i + 1));
+    box.append(renderItem(items[i], i + 1, hlsFamily));
   }
 }
 
@@ -663,7 +670,7 @@ function canPreviewSrc(it) {
  *   · 行号是「列表里的第几行」，随筛选/排序变，表达位置而不表达归属。
  * 所以行号单独占一列，在类型徽标左边。
  */
-function renderItem(it, no) {
+function renderItem(it, no, hlsFamily) {
   const row = el("div", "item");
   const isPage = !!it.page;
 
@@ -714,8 +721,24 @@ function renderItem(it, no) {
   if (isHlsItem(it)) {
     // m3u8 的大小是**播放列表文本**的大小（几 KB），不是视频大小。
     // 不写清楚的话用户看到「视频 29 KB」会以为下到了个坏文件。
-    bits.push("HLS 流 · 分片清单");
-    bits.push("点下载自动拼成完整视频");
+    //
+    // 同一页出现多条 m3u8 时（51cg1 三条、mux 测试流四条）必须说清关系：
+    // 它们不是几个视频，是同一个视频的主清单和清晰度变体。不标的话用户
+    // 点哪条都不确定，点错了下到的是另一档 —— 原话是「无法区分哪个是哪个」。
+    const fam = hlsFamily && hlsFamily.get(it.u);
+    if (fam && fam.role === "master") {
+      // 名字里已经有「HLS 流（视频）」了，这里不要再重复一次。
+      bits.push("主清单 · 含 " + fam.total + " 个清晰度清单");
+      bits.push("点下载自动拼成完整视频");
+    } else if (fam && fam.role === "variant") {
+      // 不写「第 N 档」：这一版只按体积排序，而实测 HQ 比 FHD 小，
+      // 档位 ≠ 清晰度。写「第几个清单」是准确的，等 S1 读清单内容再换成真档位。
+      bits.push("同一视频的第 " + fam.index + " / " + fam.total + " 个清单");
+      bits.push("整段下载请点主清单");
+    } else {
+      bits.push("分片清单");
+      bits.push("点下载自动拼成完整视频");
+    }
   } else if (isPage) {
     if (it.mid) bits.push("消息 " + it.mid);
     else bits.push("页面捕获");

@@ -10,6 +10,67 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-049 · 2026-10-24 · 一次真机取证挖出三个 bug：清单被体积门槛吃掉、三条 HLS 无法区分、下载记录从不写入
+
+用户提了三件事：①截图里三条「HLS 流（视频）」有什么区别；②下载时关标签页，下载记录消失；
+③真机打开插件，把列表和网页实际内容对比一下。三件都需要真机数据，所以先做工具再查。
+
+### 先解决「怎么取证」
+写了 `tools/live_check.mjs`：CDP 起真浏览器 → `Extensions.loadUnpacked` 加载扩展 →
+**开一个扩展页面（popup.html 当普通标签页）**，在扩展源下 `evaluate` 读 `chrome.storage.session`。
+绕开两个老坑：MV3 的 SW target 里 `chrome.storage` 是 undefined；扫 `Target.getTargets` 找
+`chrome-extension://` 会先撞上 Edge 自带扩展，打开它的 popup 得到的是没有扩展 API 的 404 页
+（表现为「扩展页里 chrome.storage 不可用」，而 URL 检查还是通过的）。必须用 `loadUnpacked`
+返回的 id，并且核对 `chrome.runtime.getManifest().name` 含「资源嗅探」。
+
+### bug 1：网页在放 HLS，列表里一条 m3u8 都没有
+本地搭 hls.js + mux 三档测试流复现。抓到的 23 条里全是分片和 MSE 录制条目，**清单一条没有**。
+curl 量了真实尺寸：master playlist **752 字节**、media playlist **231 字节**。
+两层叠加导致全丢：
+1. `classify` 先看 MIME 再看扩展名。清单 MIME 五花八门——`audio/mpegurl`（mux 就是）、
+   `application/xml`、`text/plain`（51cg1）、`application/vnd.apple.mpegurl`。看 MIME 必然
+   判成 audio（门槛 10240）或 other。
+2. `MIN_MEDIA_BYTES.video = 2048`。752 < 2048，**整条当成「1×1 像素级假资源」丢掉**。
+修法：新增 `MANIFEST_EXT = {m3u8, mpd}`，`classify` 里让它压过 MIME；`record` 里用
+`isManifestUrl()` 豁免体积门槛。清单是文本，几百字节才是常态，用视频门槛去量必然误杀。
+**用户那三条 5.1/4.2/4.0 KB 能显示，纯属侥幸过了 2048 线。**
+
+### bug 2：三条「HLS 流（视频）」到底是什么
+真机数据（mux 实测）：`x36xhzz.m3u8` 752B + 三个变体 3606/3670/3606B。
+**它们不是三个视频，是同一个视频的主清单和三档变体。** 用户点哪条都不确定，点错了下到另一档。
+新增 `extension/hls-family.js`（纯函数）：按「目录祖先 + 体积」把同页多条 m3u8 归族——
+主清单的目录是其它条目的目录前缀（`/x36xhzz/` 是 `/x36xhzz/url_6/` 的前缀，判定必须带尾斜杠，
+否则 `/hls` 会吞掉 `/hls-a/`）；没有唯一祖先时全部按体积降序当「第 N 个清单」。
+UI：主清单写「主清单 · 含 3 个清晰度清单」，变体写「同一视频的第 2/3 个清单 · 整段下载请点主清单」。
+**刻意不写「第 N 档」**：实测 HQ(3606B) 比 FHD(3670B) 小，按体积排出来的序号不等于清晰度。
+真档位要读清单内容，那是 S1 的活。
+
+### bug 3：下载记录从来不写（用户说的「消失」）
+`notifySaved`（写 `storage.session.history` + `lastResult` + 角标）**只挂在页面浮层保存那条链**
+（`cmd:"saved"`）上。`native:download`（popup 的「下载」按钮）的完成回执
+（宿主 `action:done/error/cancelled`）只被转发给 popup，**从不落地**。
+真机复现：240000 字节的文件已经落盘，`history 0 → 0`、`lastResult` 为 null。
+**跟关不关标签页没关系** —— 用户看到的现象是「记录消失」，实际是「这条链从来没记过」。
+修法两处：`nativePort.onMessage` 收到 done/error/cancelled 时调 `notifySaved` 并把任务从
+`downloads` 删掉；宿主 `sniffer_host.py` 的 done 消息带上 `size`（状态文件里没有这个字段，
+干脆在本机 `os.path.getsize` 量一次）。
+**修完真机复验**（仍然是在关掉标签页之后完成的）：`history 0 → 1`，
+`lastResult 成功 · 240000 字节`。
+
+### 顺手证伪一个猜测
+「关标签页会不会清下载记录」——写一条探测记录后关闭目标标签页，`storage.session` 里
+`history` 与 `tab:*` 都还在。**关标签页不清记录**，这条可以不用再查了。
+
+### 数字与状态
+- JS **829 项**（新增 `manifest_classify` 28 / `hls_family` 15 / `native_done_history` 16），
+  Python **16/16**，`node --check` 全过，版本 1.3.43 → **1.3.44**
+- 真机验证：清单分类修复后 mux 页面出现 4 条 m3u8（1 主 + 3 变体）；渲染文案已用真实条目
+  跑 `renderItem` 复核；下载记录写入已复验
+- 未做：51cg1 那三条**没有直接取证**（用 mux 三档流复现了同样的结构）。如果那站的三条
+  结构不同（比如三档平级目录），`hls-family` 会退化成分「第 1/2/3 个清单」，不会瞎标主清单
+
+---
+
 ## d-048 · 2026-10-24 · 产品化第一步：先立「会话」这个数据契约，行为一点不改
 
 用户说「想把插件做成真正的产品」（方案见 `docs/PRODUCT-PLAN.md`）。方案里 L0 是数据契约，
