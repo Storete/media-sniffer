@@ -180,24 +180,53 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
 REQS = []
-# 假分片不行：收尾的验证四层会拿真 ffprobe 探产物（钉着），占位字节过不了。
-# 用真 ffmpeg 生成 10 秒 TS，按 188 字节整数倍等分 5 片——拼接后仍是合法 TS。
+# 分片数据三档降级（本机依赖不许泄漏进 CI）：
+#   ① 有 ffmpeg（本机 TEMP 副本或 PATH）→ 生成真 TS 等分 5 片——验证四层全开时
+#      占位字节会被真 ffprobe 正确拒收（VERIFY_MISMATCH），所以有 ffprobe 就必须有真 TS；
+#   ② 无 ffmpeg 但也无 ffprobe（CI 容器）→ 占位分片即可：验证走前三层（魔数/大小），
+#      第 4 层自动跳过（probed: False）；
+#   ③ 无 ffmpeg 但有 ffprobe（什么都验不了）→ SKIP（exit 77，automake 约定）。
 import subprocess
-FFBIN = os.path.join(os.environ["LOCALAPPDATA"], "Temp", "ms-verify-bin", "ffmpeg.exe")
+import shutil
+
+
+def _find_bin(name):
+    """本机 TEMP 副本（ms-verify-bin）优先，其次 PATH。CI 上两处都没有 → None。"""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or ""
+    if base:
+        cand = os.path.join(base, "Temp", "ms-verify-bin", name + (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(cand):
+            return cand
+        cand2 = os.path.join(base, "ms-verify-bin", name + (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(cand2):
+            return cand2
+    return shutil.which(name)
+
+
+FFBIN = _find_bin("ffmpeg")
 os.makedirs(tmp, exist_ok=True)   # tmp 在 [2] 段的 finally 里被删了
 real_ts = os.path.join(tmp, "real.ts")
-subprocess.run([FFBIN, "-y", "-f", "lavfi", "-i", "testsrc=duration=10:size=160x90:rate=10",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=10",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-f", "mpegts", real_ts],
-               capture_output=True, timeout=120)
-ts_data = open(real_ts, "rb").read()
-if len(ts_data) % 188:
-    ts_data = ts_data[: len(ts_data) - (len(ts_data) % 188)]
+ts_data = b""
+if FFBIN:
+    subprocess.run([FFBIN, "-y", "-f", "lavfi", "-i", "testsrc=duration=10:size=160x90:rate=10",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=10",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-f", "mpegts", real_ts],
+                   capture_output=True, timeout=120)
+    if os.path.isfile(real_ts):
+        ts_data = open(real_ts, "rb").read()
+        if len(ts_data) % 188:
+            ts_data = ts_data[: len(ts_data) - (len(ts_data) % 188)]
+if not ts_data and _find_bin("ffprobe"):
+    print("SKIP 有 ffprobe（验证四层全开）但没有 ffmpeg 生成真 TS——占位分片会被正确拒收，"
+          "整段无法验证")
+    sys.exit(77)
+if not ts_data:
+    # CI 档：占位分片（0x47 开头过第三层魔数），第 4 层在无 ffprobe 环境自动跳过
+    ts_data = b"\x47" + bytes(187) * 40
 chunk = len(ts_data) // 5
 MEDIA = {
     "/v.m3u8": M3U8.replace("seg", "/seg/seg").replace("/seg//", "/seg/"),
-    "/init.mp4": b"\x00\x00\x00\x18ftypmp42",
 }
 for i in range(5):
     MEDIA["/seg/seg%d.ts" % i] = ts_data[i * chunk: (i + 1) * chunk]
