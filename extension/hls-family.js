@@ -43,6 +43,17 @@ var MSHlsFamily = (function () {
     return Number(it && it.s) || 0;
   }
 
+  /**
+   * 路径第一段，用来判断「是不是同一棵树」。
+   *   https://a.com/hls/1080/index.m3u8 → "hls"
+   *   https://a.com/m3m/x.m3u8          → "m3m"
+   *   https://a.com/x.m3u8（根下）      → ""
+   */
+  function firstSegOf(dir) {
+    const m = /^https?:\/\/[^/]+(\/[^/]*)/.exec(String(dir || ""));
+    return m ? m[1].replace(/\//g, "") : "";
+  }
+
   /** 体积降序（大→小），同体积用 URL 字典序定序 —— 保证输入顺序变化时结果不变。 */
   function bySizeDesc(list) {
     return list.slice().sort((a, b) => {
@@ -54,8 +65,10 @@ var MSHlsFamily = (function () {
 
   /**
    * @param {Array<{u:string,s?:number}>} items 当前标签页的条目（可含非 m3u8）
-   * @returns {Map<string, {role:"master"|"variant", index:number, total:number, size:number}>}
+   * @returns {Map<string, {role:"master"|"variant", index:number, total:number,
+   *                        size:number, hasMaster:boolean}>}
    *   key 是条目 URL。少于 2 条 m3u8 时返回空 Map —— 单条标「主清单」只会误导。
+   *   **不在 Map 里的条目 = 独立清单**（同目录下没有伙伴），调用方按中性文案显示。
    */
   function build(items) {
     const out = new Map();
@@ -87,19 +100,42 @@ var MSHlsFamily = (function () {
     if (masterIdx.length === 1) {
       const mi = masterIdx[0];
       const variants = bySizeDesc(uniq.filter((_, i) => i !== mi));
-      out.set(uniq[mi].u, { role: "master", index: 0, total: variants.length, size: sizeOf(uniq[mi]) });
+      out.set(uniq[mi].u, { role: "master", index: 0, total: variants.length, size: sizeOf(uniq[mi]), hasMaster: true });
       variants.forEach((it, k) => {
-        out.set(it.u, { role: "variant", index: k + 1, total: variants.length, size: sizeOf(it) });
+        out.set(it.u, { role: "variant", index: k + 1, total: variants.length, size: sizeOf(it), hasMaster: true });
       });
       return out;
     }
 
-    // 没有唯一主清单（各档平级，或页面压根没请求 master）：全部标成第 N 档。
-    // 体积只用来**排序线索**，不声称等价于清晰度 —— 高码率的档通常也更大。
-    const all = bySizeDesc(uniq);
-    all.forEach((it, k) => {
-      out.set(it.u, { role: "variant", index: k + 1, total: all.length, size: sizeOf(it) });
-    });
+    // ---- 没有唯一主清单：按**路径第一段**分组，只有同一棵树下的才算一族。
+    //
+    // 2026-10-24 真机（51cg1）为什么必须收紧：页面上同时有
+    //     /videos5/<md5>/<md5>.m3u8   5 KB
+    //     /m3m/<长hex>.m3u8          29 KB → 179 段、1074s（17:54），播放器真正在用的
+    // 两条同域名、同后缀、mime 都是 text/plain，唯一区别是目录。上一版把它们全塞进
+    // 一族、标成「第 1/2 档」，等于**编造**了一个并不存在的清晰度关系。
+    //
+    // 为什么不用「同父目录」而用「路径第一段」：
+    //   /hls/1080/index.m3u8 + /hls/720/index.m3u8 是同一视频的两档（共同祖先 /hls/），
+    //   父目录不同但必须归族；而 /videos5/… 和 /m3m/… 连第一段都不同，绝不该归族。
+    //   第一段是这两类的最小公共分母。
+    //
+    // 同树的多条确实可能是同一视频的多档（也可能是分段），保持归族，但记下
+    // hasMaster=false —— 调用方据此**不能**再说「整段下载请点主清单」（根本没有主清单）。
+    const groups = new Map();
+    for (let i = 0; i < uniq.length; i++) {
+      const seg = firstSegOf(dirs[i] || "");
+      if (!groups.has(seg)) groups.set(seg, []);
+      groups.get(seg).push(uniq[i]);
+    }
+    for (const list of groups.values()) {
+      if (list.length < 2) continue;   // 这个目录树下只有一条：不归族，不给序号
+      // 体积只用来排序线索，不声称等价于清晰度 —— 实测 HQ 比 FHD 小。
+      const sorted = bySizeDesc(list);
+      sorted.forEach((it, k) => {
+        out.set(it.u, { role: "variant", index: k + 1, total: sorted.length, size: sizeOf(it), hasMaster: false });
+      });
+    }
     return out;
   }
 

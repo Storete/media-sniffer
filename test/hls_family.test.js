@@ -115,5 +115,42 @@ ok("反转输入后主清单判定不变",
 ok("反转输入后变体序号不变",
   real.slice(1).every((it) => m5a.get(it.u)?.index === m5b.get(it.u)?.index));
 
+// ---------------------------------------------------------------- [6] 不同树绝不归族
+section("[6] 不同目录树不归族（51cg1 真机结构）");
+
+// 真机数据（2026-10-24，tools/net_dump.mjs + tools/live_check.mjs）：
+//   /videos5/<md5>/<md5>.m3u8   5153 B  ← 页面预载的小清单，用户点了这条
+//   /m3m/<长hex>.m3u8          29155 B  ← 179 段 × 6s = 1074s，播放器真正在用的正片
+// 上一版把它们标成「同一视频的第 1/2 档」，是编造关系。
+const cg = [
+  { u: "https://hls.example.cn/videos5/449820be/449820be.m3u8", s: 5153 },
+  { u: "https://hls.example.cn/m3m/31ab4879.m3u8", s: 29155 },
+];
+const m6 = build(cg);
+ok("不同目录树 → 不归族（Map 为空）", m6.size === 0, [...m6.keys()]);
+ok("绝不出现「第 N 档」序号", [...m6.values()].every((v) => !v.index), [...m6.values()]);
+
+// 同一棵树里两条 → 归族，但必须标明没有主清单
+const sameTree = [
+  { u: "https://hls.example.cn/videos5/abc/a.m3u8", s: 5153 },
+  { u: "https://hls.example.cn/videos5/abc/b.m3u8", s: 4200 },
+  { u: "https://hls.example.cn/m3m/zzz.m3u8", s: 29155 },
+];
+const m6b = build(sameTree);
+ok("同树两条归族、另一棵树不参与", m6b.size === 2, [...m6b.keys()]);
+ok("同树两条的 total=2（不含另一棵树的条目）",
+  m6b.get("https://hls.example.cn/videos5/abc/a.m3u8")?.total === 2,
+  m6b.get("https://hls.example.cn/videos5/abc/a.m3u8"));
+ok("没有主清单时 hasMaster=false（UI 不能再喊「请点主清单」）",
+  m6b.get("https://hls.example.cn/videos5/abc/a.m3u8")?.hasMaster === false);
+ok("不同树的条目不在结果里",
+  !m6b.has("https://hls.example.cn/m3m/zzz.m3u8"));
+
+// 有主清单时 hasMaster=true
+const withMaster = build(real);
+ok("有主清单时 hasMaster=true",
+  withMaster.get(M + "/url_0/193039199_mp4_h264_aac_hd_7.m3u8")?.hasMaster === true,
+  [...withMaster.values()].slice(0, 2));
+
 console.log("\n" + (fail ? "有失败：" : "全部通过：") + pass + " 通过 / " + fail + " 失败");
 process.exit(fail ? 1 : 0);

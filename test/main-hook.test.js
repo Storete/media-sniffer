@@ -1490,7 +1490,13 @@ function testFileNameChain() {
     }
     return "";
   };
-  const pctx = vm.createContext({ String, Number, Math, JSON, RegExp, Array, Object, console });
+  // shortTitle 的实现搬到了 extension/naming.js（规则只留一处），
+  // 所以沙箱里必须先加载它 —— 否则 grab("shortTitle") 抽出来的只是一行
+  // `return MSNaming.shortTitle(t)`，一跑就 ReferenceError。
+  const namingSrc = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "extension", "naming.js"), "utf8");
+  const pctx = vm.createContext({ String, Number, Math, JSON, RegExp, Array, Object, console, URL });
+  vm.runInContext(namingSrc, pctx, { filename: "naming.js" });
   vm.runInContext(grab("shortTitle"), pctx);
   vm.runInContext("const BILI_DASH_KEY = '__bili_dash__';" + grab("pageSaveItem"), pctx);
   const biliName = (t) => vm.runInContext(`pageSaveItem({ u: "__bili_dash__", title: ${JSON.stringify(t)} }).name`, pctx);

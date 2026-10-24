@@ -47,6 +47,11 @@ const BROWSER = String(argOf("browser", "edge"));
 const HISTORY_TEST = argOf("history-test", false) === true;
 const RENDER_CHECK = argOf("render-check", false) === true;
 const DOWNLOAD_TEST = argOf("download-test", false) === true;
+// 模拟用户真实路径：点完下载就关掉 popup，再回来查记录。
+// 为什么必须单独测：上一轮修完 notifySaved 后，我是在**扩展页一直开着**的情况下验的，
+// 那种测法下 SW 有活跃页面、port 不会断；用户关掉 popup 后 MV3 SW 可能被回收，
+// 宿主回执就没人接。用户报「退出界面后没有下载记录」正是这条路径。
+const CLOSE_POPUP = argOf("close-popup", false) === true;
 const DOWNLOAD_WAIT = Number(argOf("dl-wait", 25)) * 1000;
 const OUT = argOf("out", "");
 const KEEP = argOf("keep", false) === true;
@@ -285,10 +290,31 @@ async function openExtensionPage(browserCdp, id) {
   return { targetId: t.targetId, page };
 }
 
+/**
+ * 条目 → 可 JSON 化的纯对象。**只此一处**。
+ * 这份白名单漏字段的代价是「取证说没有、其实有」，已经踩过两次
+ * （dumpItems 和 renderCheck 各一份，改了一处忘了另一处）。
+ */
+const PLAIN_SRC = `function plainItem(it) {
+  return {
+    u: it.u, k: it.k, m: it.m || "", s: it.s || 0, hint: it.hint || "",
+    page: it.page || 0, title: (it.title || "").slice(0, 80),
+    mid: it.mid || "", mark: it.mark || "", f: it.f || "", t: it.t || 0,
+    dur: it.dur || 0, segs: it.segs || 0, listKind: it.listKind || "", enc: it.enc || 0,
+  };
+}`;
+// Node 侧用（renderCheck 在 Node 里 map）
+const plainItem = new Function("return " + PLAIN_SRC.replace(/^function plainItem/, "function"))();
+// 页面侧用：evaluate 是字符串，必须把源码拼进去，否则报 plainItem is not defined
+function plainInPage(listExpr) {
+  return PLAIN_SRC + "\n return (" + listExpr + ");";
+}
+
 /** 把 tab:<id> 的条目读出来，并整理成人类能看的形状。 */
 async function dumpItems(extPage, tabId) {
   const raw = await extPage.evaluate(`
     (async () => {
+      ${PLAIN_SRC}
       const all = await chrome.storage.session.get(null);
       const keys = Object.keys(all);
       const out = { keys: keys, tabs: {} };
@@ -299,11 +325,7 @@ async function dumpItems(extPage, tabId) {
           url: v.url || "",
           items: (v.items || []).map((pair) => {
             const it = Array.isArray(pair) ? pair[1] : pair;
-            return it ? {
-              u: it.u, k: it.k, m: it.m || "", s: it.s || 0, hint: it.hint || "",
-              page: it.page || 0, title: (it.title || "").slice(0, 80),
-              mid: it.mid || "", mark: it.mark || "", f: it.f || "", t: it.t || 0,
-            } : null;
+            return it ? plainItem(it) : null;
           }).filter(Boolean),
         };
       }
@@ -360,10 +382,10 @@ async function historyTest(browserCdp, extPage, victimTargetId) {
  * 直接调渲染函数既能验真实数据，又不受这个限制。
  */
 async function renderCheck(extPage, items) {
-  const payload = JSON.stringify(items.slice(0, 40).map((it) => ({
-    u: it.u, k: it.k, s: it.s, m: it.m, hint: it.hint, page: it.page,
-    title: it.title, mid: it.mid, mark: it.mark,
-  })));
+  // 统一走 plainItem()：以前这里是另一份独立字段白名单，加了 dur/segs 之后
+  // 只改了 dumpItems 那份，渲染探针还是旧的 —— 于是「条目里有 634 秒，
+  // 界面显示时长未知」，白排查了一轮。
+  const payload = JSON.stringify(items.slice(0, 40).map(plainItem));
   const res = await extPage.evaluate(`(async () => {
     const items = ${payload};
     if (typeof renderItem !== "function") return { err: "renderItem 不在全局（popup.js 没加载完）" };
@@ -403,7 +425,8 @@ async function renderCheck(extPage, items) {
 //   · Target.closeTarget 要的是 CDP 的 targetId（一串大写哈希）；
 //   · 发给扩展的 native:download 要的是 chrome.tabs 的 tabId（纯数字）。
 // 混用会得到 "Invalid parameters"（2026-10-24 实测踩过一次）。
-async function downloadTest(browserCdp, extPage, items, chromeTabId, cdpTargetId, tabUrl) {
+async function downloadTest(browserCdp, extPage, items, chromeTabId, cdpTargetId, tabUrl, extId) {
+  const page = extPage.page || extPage;
   const cand = items.find((it) => /^https?:/i.test(it.u) && it.k !== "seg" && !/\.m3u8$/i.test(it.u))
     || items.find((it) => /^https?:/i.test(it.u));
   if (!cand) {
@@ -412,18 +435,33 @@ async function downloadTest(browserCdp, extPage, items, chromeTabId, cdpTargetId
   }
   log("[7] 下载测试目标：" + shortUrl(cand.u, 80) + "（" + cand.k + "）");
 
-  const before = await extPage.evaluate(`(async () => {
+  // 用 popup 自己的命名函数算一次名字，确认「标题优先」在真机上成立。
+  // 直接调 downloadName 而不是在这里重写一份规则 —— 否则测的是我这份副本，
+  // 不是用户实际走的那条路。
+  let wantedName = "";
+  try {
+    const nr = await page.evaluate(`(() => {
+      try {
+        if (typeof downloadName !== "function") return { err: "downloadName 不在全局" };
+        return { name: downloadName(${JSON.stringify({ ...cand, tabUrl })}), title: String(${JSON.stringify(cand.title || "")}).slice(0, 40) };
+      } catch (e) { return { err: String((e && e.message) || e) }; }
+    })()`);
+    wantedName = (nr && nr.name) || "";
+    log("     命名探针：标题「" + ((nr && nr.title) || "") + "」→ 文件名「" + wantedName + "」" + (nr && nr.err ? " (" + nr.err + ")" : ""));
+  } catch (e) { log("     命名探针失败：" + e.message); }
+
+  const before = await page.evaluate(`(async () => {
     const v = await chrome.storage.session.get({ history: [] });
     return Array.isArray(v.history) ? v.history.length : -1;
   })()`);
 
-  const started = await extPage.evaluate(`(async () => {
+  const started = await page.evaluate(`(async () => {
     try {
       const r = await chrome.runtime.sendMessage({
         type: "native:download",
         url: ${JSON.stringify(cand.u)},
         kind: ${JSON.stringify(cand.k || "video")},
-        filename: "live-check-probe",
+        filename: ${JSON.stringify(wantedName || "live-check-probe")},
         referer: ${JSON.stringify(tabUrl)},
         tabUrl: ${JSON.stringify(tabUrl)},
         tabId: ${Number(chromeTabId) || 0},
@@ -439,15 +477,28 @@ async function downloadTest(browserCdp, extPage, items, chromeTabId, cdpTargetId
   log("     任务已下单 id=" + started.id + "，立刻关闭标签页并等 " + Math.round(DOWNLOAD_WAIT / 1000) + " 秒…");
 
   await browserCdp.send("Target.closeTarget", { targetId: cdpTargetId });
-  await sleep(DOWNLOAD_WAIT);
 
-  const after = await extPage.evaluate(`(async () => {
+  // 关键分支：先关掉扩展页面（= 用户关掉 popup），让 SW 进入空闲，
+  // 等下载完成后再开一个新扩展页查记录。这样才复现得出「关界面后记录还在吗」。
+  let probePage = extPage;
+  if (CLOSE_POPUP) {
+    log("     已关闭扩展页面（模拟用户关 popup），等 " + Math.round(DOWNLOAD_WAIT / 1000) + " 秒…");
+    await browserCdp.send("Target.closeTarget", { targetId: extPage.targetId }).catch(() => {});
+    await sleep(DOWNLOAD_WAIT);
+    probePage = (await openExtensionPage(browserCdp, extId)).page;
+    log("     重新打开扩展页面查记录");
+  } else {
+    await sleep(DOWNLOAD_WAIT);
+  }
+
+  const after = await (probePage.page || probePage).evaluate(`(async () => {
     const v = await chrome.storage.session.get({ history: [] });
     const list = Array.isArray(v.history) ? v.history : [];
     const last = await chrome.storage.local.get({ lastResult: null });
     return {
       count: list.length,
-      mine: list.filter((x) => x && String(x.name || "").indexOf("live-check-probe") >= 0),
+      // 只比对主干名：宿主遇到重名会加「(1)」，拿全名比会误判成「没写入」
+      mine: list.filter((x) => x && String(x.name || "").indexOf(${JSON.stringify((wantedName || "live-check-probe").replace(/\.[a-z0-9]{2,5}$/i, "").slice(0, 10))}) >= 0),
       lastResult: last.lastResult || null,
     };
   })()`);
@@ -613,7 +664,7 @@ async function main() {
   // 下载测试会关掉目标标签页，必须放在所有读 items 的步骤之后。
   let dl = null;
   if (DOWNLOAD_TEST) {
-    try { dl = await downloadTest(browserCdp, extPage.page, items, chromeTabId, target.targetId, TARGET_URL); }
+    try { dl = await downloadTest(browserCdp, extPage, items, chromeTabId, target.targetId, TARGET_URL, extId); }
     catch (e) { log("     下载测试失败：" + e.message); dl = { error: e.message }; }
   }
 

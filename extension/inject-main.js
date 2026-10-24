@@ -1767,6 +1767,54 @@
     if (mediaSeen.size > MAX_MEDIA) mediaSeen.delete(mediaSeen.keys().next().value);
   }
 
+  // ------------------------------------------------------------ 3b. 清单正文（读内容，不只读地址）
+  //
+  // 2026-10-24 用户截图（51cg1）：列表里四条「HLS 流（视频）」，5.1 / 5.0 / 4.2 / 4.2 KB，
+  // 文案一模一样，用户问「有什么区别、该点哪个」。真机取证（tools/net_dump.mjs）的答案：
+  //     /m3m/<hex>.m3u8        29 KB → 179 段 × 6s = 1074s = 17:54  ← 播放器真正在用的正片
+  //     /videos5/<md5>/…m3u8    5 KB → 页面预载的小清单，播放器根本没用它
+  // 用户点了后者，下到的文件名就是那个 md5。
+  //
+  // 只有地址时这两条**无从区分**：同域名、同后缀、mime 都是 text/plain。能区分的只有内容。
+  // 所以这里读清单正文，把「段数 + 总时长」补到条目上 —— 用户一眼就能看出哪条是正片。
+  //
+  // 三条硬约束，破一条就出事：
+  //   1. 必须 resp.clone()：不 clone 就直接把页面播放器的流吃掉了，视频当场卡死；
+  //   2. 只读 < 256KB：清单通常几 KB，超大响应是别的东西，不能往内存里搬；
+  //   3. 全程 try/catch：这段跑在页面主线程，抛一次可能把站点播放器带坏。
+  const MANIFEST_MAX = 256 * 1024;
+
+  function metaMod() {
+    try { return (typeof MSHlsMeta !== "undefined" && MSHlsMeta) || globalThis.MSHlsMeta || null; }
+    catch (e) { return null; }
+  }
+
+  function reportManifest(text, url) {
+    try {
+      const M = metaMod();
+      if (!M || !text || text.length > MANIFEST_MAX) return;
+      const r = M.parse(text);
+      if (!r || r.kind === "unknown") return;
+      // key 用响应最终地址：清单被重定向过时，用户列表里显示的是 final URL
+      post({
+        cmd: "hlsmeta", key: url, kind: r.kind, segs: r.segs, dur: r.dur,
+        enc: r.encrypted ? 1 : 0, variants: r.variants.length,
+      });
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function readManifestBody(resp, fallbackUrl) {
+    try {
+      const M = metaMod();
+      if (!M) return;
+      const url = (resp && resp.url) || fallbackUrl || "";
+      if (!M.looksLikeManifest(url)) return;
+      const len = Number((resp.headers && resp.headers.get("content-length")) || 0);
+      if (len > MANIFEST_MAX) return;
+      resp.clone().text().then((txt) => reportManifest(txt, url)).catch(() => {});
+    } catch (e) { /* 忽略 */ }
+  }
+
   const origFetch = window.fetch;
   if (typeof origFetch === "function") {
     window.fetch = function (input, init) {
@@ -1783,6 +1831,9 @@
             } catch (e) { /* 忽略 */ }
           }).catch(() => {});
         }
+        // 清单读体单独走一条：不看 MEDIA_HINT（51cg1 的 /m3m/ 路径里没有任何
+        // media 关键字，靠 MEDIA_HINT 永远进不来），只看后缀是不是 m3u8/mpd
+        p.then((resp) => readManifestBody(resp, url)).catch(() => {});
       } catch (e) { /* 忽略 */ }
       return p;
     };
@@ -1812,6 +1863,24 @@
             } catch (e) { /* 忽略 */ }
           });
         }
+        // 清单读体：hls.js 从 1.x 起默认用 fetch，但老播放器（videojs-contrib-hls、
+      // 部分站的自行实现）仍走 XHR。responseType 必须是空或 text 才能读 responseText，
+        // 其它类型（arraybuffer/blob）读了会抛，直接跳过。
+        try {
+          const M = metaMod();
+          if (M && M.looksLikeManifest(url)) {
+            this.addEventListener("loadend", () => {
+              try {
+                if (this.status < 200 || this.status >= 300) return;
+                const rt = this.responseType;
+                if (rt && rt !== "text" && rt !== "json") return;
+                let txt = "";
+                try { txt = this.responseText; } catch (e) { return; }
+                reportManifest(txt, url);
+              } catch (e) { /* 忽略 */ }
+            });
+          }
+        } catch (e) { /* 忽略 */ }
       } catch (e) { /* 忽略 */ }
       return origSend.apply(this, arguments);
     };

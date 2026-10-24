@@ -749,6 +749,75 @@ function applyHlsPageTitle(items) {
   return true;
 }
 
+/**
+ * 把「清单正文」里读出来的结构补到条目上（段数 / 总时长 / 是否加密 / 变体数）。
+ *
+ * 为什么需要这一层（2026-10-24 用户截图 51cg1）：
+ *   列表里四条「HLS 流（视频）」全是 5 KB 级，文案一模一样，用户问
+ *   「有什么区别、该点哪个」。真机取证给出答案 —— 其中
+ *   /m3m/<hex>.m3u8 那条 29 KB、179 段、1074 秒（17:54）才是播放器在用的正片，
+ *   而 /videos5/<md5>/…m3u8 那条 5 KB 只是页面预载的小清单。
+ *   用户点了后者，下到的文件名就是那个 md5。
+ *
+ * 时序上两件事谁先到都有可能：webRequest 记下 m3u8 地址（rec.items）和
+ * 页面 fetch 读到正文（hlsMeta）是两条独立的链。所以这里**不在收消息时直接改条目**，
+ * 而是先存进 rec.hlsMeta 这张按 URL 索引的表，渲染列表时再合并 —— 谁先谁后都不丢。
+ */
+function mergeHlsMeta(items, rec) {
+  if (!rec || !rec.hlsMeta || !rec.hlsMeta.size) return;
+  for (const it of items) {
+    if (!it) continue;
+    const m = rec.hlsMeta.get(it.u);
+    if (m) applyHlsMetaTo(it, m);
+  }
+}
+
+/** 把一条清单元数据写进条目（两处共用：收消息时补、渲染时补）。 */
+function applyHlsMetaTo(it, m) {
+  if (!it || !m) return;
+  if (m.dur > 0) it.dur = m.dur;
+  if (m.segs > 0) it.segs = m.segs;
+  if (m.kind) it.listKind = m.kind;
+  if (m.enc) it.enc = 1;
+  if (m.variants > 0) it.variants = m.variants;
+}
+
+/**
+ * 页面侧的清单元数据到达。
+ *
+ * 两条路都要走（2026-10-24 真机踩过）：
+ *   1. 条目**已经存在** → 当场补上并标 dirty。只改内存不标 dirty 的话，
+ *      storage 里那条没有 dur；popup 关掉重开后从 storage 恢复，时长就没了。
+ *      （我第一版就是只改内存，结果真机取证从 storage 读到的 dur 全是 0。）
+ *   2. 条目**还没到**（webRequest 和页面 fetch 两条链，谁先都有可能）→
+ *      存进 rec.hlsMeta，等渲染时 mergeHlsMeta 补。
+ */
+function recordHlsMeta(tabId, p) {
+  const url = String(p.key || "");
+  if (!url) return;
+  const rec = state.get(tabId);
+  if (!rec) return;
+  const meta = {
+    kind: String(p.kind || ""),
+    segs: Number(p.segs) || 0,
+    dur: Number(p.dur) || 0,
+    enc: Number(p.enc) || 0,
+    variants: Number(p.variants) || 0,
+  };
+  if (!rec.hlsMeta) rec.hlsMeta = new Map();
+  rec.hlsMeta.set(url, meta);
+
+  for (const it of rec.items.values()) {
+    if (!it || it.u !== url) continue;
+    applyHlsMetaTo(it, meta);
+    // 元数据本身不进 storage 的 hlsMeta（那是运行时缓存），但**条目上的 dur**
+    // 要持久化 —— 否则换一次 popup 时长就丢。
+    rec.dirty = true;
+    flushSoon(tabId);
+    break;
+  }
+}
+
 
 // Telegram 视频封面在页面结构里的特征（站点针对，不在通用层判断）。
 // 真机证据（2026-10-21）：封面 URL 和尺寸跟真照片完全一样（320×180 / 179×320），
@@ -2052,6 +2121,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // 为什么这么绕：页面侧只有 DOM（能读到 og:title，读不到 hls.js 内部地址），
         // 后台侧只有 webRequest（能读到 m3u8，读不到标题）——两边各有一半。
         applyHlsPageTitle(focused, tabUrl);
+        // 清单正文的结构（段数/时长）在渲染前合并：用户靠「17:54 / 179 段」
+        // 和「0:32 / 6 段」的区别就知道该点哪条，不用猜体积。
+        mergeHlsMeta(focused, rec);
         // 编号必须在**所有滤网之后**做（用户 m13975：序号超出内容数量、和内容对不上）。
         // 先编号再过滤的话，被剔掉的 icon / 被去重合并的缩略图照样占掉一个号，
         // 于是 6 条内容出现 ⑨、真图从 ③ 直接跳到 ⑥。
@@ -2131,6 +2203,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           recordPageMedia(tid, (sender.tab && sender.tab.url) || "", p);
           // 上一轮下载因「地址过期」触发了 reload，这里接住页面重新上报的新 m3u8
           if (p.cmd === "found") maybeUseRetriedHls(tid, p);
+        } else if (p.cmd === "hlsmeta") {
+          // 清单正文的结构（段数/时长）。只存，不在这里改条目 —— 它和 webRequest
+          // 记下地址是两条独立的链，谁先到都有可能，见 mergeHlsMeta 的注释。
+          recordHlsMeta(tid, p);
         } else if (p.cmd === "saved") {
           // 页面保存的成败都落进 host.log：失败以前只显示在页面右下角的进度卡里，
           // 用户一关页面就什么证据都不剩，排障无从下手（Telegram 首次真机排查就栽在这）

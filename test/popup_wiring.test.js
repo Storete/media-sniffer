@@ -59,7 +59,11 @@ check("displayName 里 HLS 走专用名字", /HLS 流（视频）/.test(JS));
 check("副行提示这是分片清单", /bits\.push\("分片清单"\)/.test(JS));
 check("副行提示点下载会自动拼", /点下载自动拼成完整视频/.test(JS));
 check("主清单标注含几个清晰度清单", /主清单 · 含 /.test(JS));
-check("变体标注是同一视频的第几个清单", /同一视频的第 /.test(JS));
+check("变体标注是「同目录第 N/M 个清单」", /同目录第 /.test(JS));
+// 2026-10-24 51cg1 真机：四条全是变体、页面上没有主清单，界面上却写着
+// 「整段下载请点主清单」，用户找不到那一行。这句必须挂在 hasMaster 后面。
+check("没有主清单时不喊「请点主清单」", /if \(fam\.hasMaster\) bits\.push\("整段下载请点主清单"\)/.test(JS));
+check("清单条目显示时长与段数", /bits\.push\(dur \+ \(segs \? " · " \+ segs \+ " 段" : ""\)\)/.test(JS));
 
 // 真机 51cg1 的现象：有 m3u8 的页面同时存在 blob: 录制条目和 m1/m2 分片，
 // 同一条视频在列表里显示三份。hideRecorder 必须把它们一并隐掉。
@@ -97,7 +101,14 @@ check("HLS 不挂预览（Chrome 的 video 不会放 HLS，点了必然失败）
 check("HLS 不许进「保存所选」批量（否则批量下一堆清单文本）",
   /if \(selecting && isPage && !isHlsItem\(it\)\)/.test(JS));
 check("页面条目下载时用标题当文件名（否则落盘是哈希名）",
-  /filename: it\.f \|\| \(it\.title \? shortTitle\(it\.title\) : ""\)/.test(JS));
+  /filename: downloadName\(it\)/.test(JS));
+// 这条以前写成 /filename: it\.f \|\| \(it\.title …/ —— 匹配的正是**有 bug 的写法**
+// （it.f 是 URL 末段的哈希，永远赢），等于把错误行为锁死了。
+// 2026-10-24 用户真机下到 449820be….mp4 才发现。现在反过来：不许再出现哈希优先。
+check("下载链不许再出现「URL 名优先」",
+  !/filename: it\.f \|\|/.test(JS));
+check("downloadName 委托给 naming.js（规则只留一处）",
+  /return MSNaming\.downloadName\(it\)/.test(JS));
 
 console.log("[8] 列表行号：按出现顺序编号（用户 2026-10-23 51cg1 截图）");
 // 51cg1 详情页有两条 m3u8：一条页面钩子上报（有站点标题）、一条 webRequest 抓的（无标题）。

@@ -79,13 +79,20 @@ node test/site_registry.test.js
 python test/run_all.py
 ```
 
-提示：`test/*.test.js` 全套共 17 个文件（上面 8 个之外还有 `icon_filter`、`blob_item`、`ui_card`、
-`focus_scope`、`group_key`、`review`、`manifest_classify`、`hls_family`、`native_done_history`）；
-其中 `focus_scope` / `group_key` 只在失败时输出，`review.test.js` 由 `background.test.js` 引入执行，
-单独跑会提示跳过。整套跑法：`for f in test/*.test.js; do node "$f"; done`。
+提示：`test/*.test.js` 全套共 19 个文件（上面 8 个之外还有 `icon_filter`、`blob_item`、`ui_card`、
+`focus_scope`、`group_key`、`review`、`manifest_classify`、`hls_family`、`hls_meta`、`naming`、
+`native_done_history`）；其中 `focus_scope` / `group_key` 只在失败时输出，
+`review.test.js` 由 `background.test.js` 引入执行，单独跑会提示跳过。
+整套跑法：`for f in test/*.test.js; do node "$f"; done`。
 
 **真机取证的常规手段是 `tools/live_check.mjs`**（不是手动点）：`--history-test` 验下载记录、
-`--render-check` 把真实条目喂给 `renderItem` 读文案、`--download-test` 复现「下载中关标签页」。
+`--render-check` 把真实条目喂给 `renderItem` 读文案、`--download-test` 复现「下载中关标签页」、
+**`--close-popup` 复现「点完下载就关掉 popup」**（不关扩展页的话 MV3 的 SW 有活跃页面，
+测不出用户真实路径）。
+
+**想看清单正文就用 `tools/net_dump.mjs`**：CDP `Network.getResponseBody`，不受 CORS 限制。
+真机踩过：`hls-meta` 之类的新字段加完，`live_check` 读不到时**先确认取证工具的字段白名单**
+（`plainItem` 是唯一一份，原来有两份，改一份忘另一份白排查过一轮）。
 判定注入是否生效看 `Extensions.loadUnpacked` 返回的 id，**不要**扫 target 列表猜。
 
 **说「通过」之前必须真的跑过，并贴出数字。** 不许写「应该能过」。
@@ -150,7 +157,7 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 10 套主 JS + 16 套 Python 全绿（全套 829 项），数字记进 `DEVLOG.md`
+- [ ] 10 套主 JS + 16 套 Python 全绿（全套 919 项），数字记进 `DEVLOG.md`
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

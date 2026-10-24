@@ -722,10 +722,15 @@ function renderItem(it, no, hlsFamily) {
     // m3u8 的大小是**播放列表文本**的大小（几 KB），不是视频大小。
     // 不写清楚的话用户看到「视频 29 KB」会以为下到了个坏文件。
     //
-    // 同一页出现多条 m3u8 时（51cg1 三条、mux 测试流四条）必须说清关系：
-    // 它们不是几个视频，是同一个视频的主清单和清晰度变体。不标的话用户
-    // 点哪条都不确定，点错了下到的是另一档 —— 原话是「无法区分哪个是哪个」。
+    // 2026-10-24 真机（51cg1）：四条 5 KB 级的清单文案一模一样，用户问
+    // 「有什么区别、该点哪个」。真相是页面同时有
+    //     /videos5/<md5>/…  5 KB  ← 预载的小清单，用户点了这个
+    //     /m3m/<hex>.m3u8  29 KB  ← 179 段 × 6s = 17:54，播放器真正在用的正片
+    // 所以文案第一项必须是**时长和段数**：这是唯一能让人一眼看出哪条是正片的
+    // 硬信息（体积不能——5 KB 的清单也可能很长，取决于分片地址写多短）。
     const fam = hlsFamily && hlsFamily.get(it.u);
+    const dur = fmtDur(it.dur);
+    const segs = Number(it.segs) || 0;
     if (fam && fam.role === "master") {
       // 名字里已经有「HLS 流（视频）」了，这里不要再重复一次。
       bits.push("主清单 · 含 " + fam.total + " 个清晰度清单");
@@ -733,10 +738,16 @@ function renderItem(it, no, hlsFamily) {
     } else if (fam && fam.role === "variant") {
       // 不写「第 N 档」：这一版只按体积排序，而实测 HQ 比 FHD 小，
       // 档位 ≠ 清晰度。写「第几个清单」是准确的，等 S1 读清单内容再换成真档位。
-      bits.push("同一视频的第 " + fam.index + " / " + fam.total + " 个清单");
-      bits.push("整段下载请点主清单");
+      if (dur) bits.push(dur + (segs ? " · " + segs + " 段" : ""));
+      else bits.push("时长未知");
+      bits.push("同目录第 " + fam.index + " / " + fam.total + " 个清单");
+      // 「请点主清单」只在**真的有主清单**时才说。51cg1 那四条全是变体、
+      // 页面上根本没有主清单，上一版照喊「整段下载请点主清单」，用户找不到那一行。
+      if (fam.hasMaster) bits.push("整段下载请点主清单");
     } else {
-      bits.push("分片清单");
+      // 独立清单（同目录下没有伙伴）—— 中性描述，不编造任何关系
+      if (dur) bits.push(dur + (segs ? " · " + segs + " 段" : ""));
+      else bits.push("分片清单");
       bits.push("点下载自动拼成完整视频");
     }
   } else if (isPage) {
@@ -902,16 +913,9 @@ function isHlsItem(it) {
  * 主世界那边的 finishName 还会再收一次——两边都要，因为「全部保存」「页面浮层
  * 里改名」这几条路径都不一定经过 finishName。
  */
+/** 显示名/文件名共用的截断规则，实现在 naming.js（与文件名优先级放一起，可单测）。 */
 function shortTitle(t) {
-  const s = String(t || "").replace(/\s+/g, " ").trim();
-  if (s.length <= 60) return s;
-  // 截断前先把扩展名摘出来：否则「…（完整版）.mp4」这种标题截到 60 字后
-  // 扩展名被砍掉，列表里名字看着对，存下来却成了无扩展名文件。
-  const m = /\.([a-z0-9]{2,5})$/i.exec(s);
-  const ext = m ? "." + m[1] : "";
-  const body = (ext ? s.slice(0, s.length - ext.length) : s).slice(0, 60)
-    .replace(/[\s_\-·,，、]+$/, "") + "…";
-  return body + ext;
+  return MSNaming.shortTitle(t);
 }
 
 /**
@@ -1044,10 +1048,16 @@ async function startDownload(it, btn) {
     type: "native:download",
     url: it.u,
     kind: it.k,
-    // 页面钩子上报的条目没有 it.f（那是 webRequest 侧按 URL 推出来的名字），
-    // 但通常**有标题**。不给名字的话落盘就是 `d41c6e6e…11260.mp4` 这种哈希，
-    // 用户下完根本认不出是哪一集（真机 2026-10-22 的现场就是这个文件名）。
-    filename: it.f || (it.title ? shortTitle(it.title) : ""),
+    // 文件名：**标题优先**，没有标题才退回 URL 推出的名字。
+    //
+    // 2026-10-24 用户真机：「下载下来的应该是标题，而不是 449820be…（32 位哈希）」。
+    // 现场原因：it.f 是 fileNameOf(it.u) —— 纯从 URL 末段推的，对
+    // /videos5/449820be.../449820be....m3u8 这种站就只能是哈希。原来写成
+    // `it.f || title`，哈希永远赢。
+    //
+    // 页面浮层那条链（pageSaveName）一直是标题优先，两条链行为还不一致 ——
+    // 现在统一成标题优先，用户从哪条路下都是认得出的名字。
+    filename: downloadName(it),
     referer: it.i || tabUrl,
     tabUrl,
     // background 需要它才能在「地址过期」时刷新对应标签页重取 m3u8
@@ -1062,9 +1072,20 @@ async function startDownload(it, btn) {
     setHost(false, res ? res.error : "本地下载器不可用");
     return;
   }
-  addJob(res.id, it.f || it.u);
+  addJob(res.id, downloadName(it) || it.u);
   btn.textContent = "已提交";
   setTimeout(() => { btn.disabled = false; btn.textContent = "下载"; }, 2500);
+}
+
+/**
+ * 落盘文件名：标题优先，其次 URL 推出的名字。
+ *
+ * 实现搬到了 extension/naming.js（纯函数、可单测）—— 这里只留转发，
+ * 因为「标题 vs URL 名」这个优先级被写反过一次（用户下到 449820be….mp4）。
+ * 规则集中一处、有测试盯着，比散在 popup 和 page 两条链里靠谱。
+ */
+function downloadName(it) {
+  return MSNaming.downloadName(it);
 }
 
 // 进度条容器：jobId → DOM 引用。native host 那边是独立进程，进度靠

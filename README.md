@@ -314,7 +314,9 @@ media-sniffer/
 │   ├── manifest.json        固定了 key，所以 ID 稳定
 │   ├── background.js        嗅探 + 分类 + 调宿主
 │   ├── session.js           会话数据契约（纯函数；把扁平条目整理成 tracks/variants/manifest）
-│   ├── hls-family.js        同页多条 m3u8 归族（主清单 / 同一视频的第 N 个清单）
+│   ├── hls-family.js        同页多条 m3u8 归族（主清单 / 同目录第 N 个清单；不同目录树不归族）
+│   ├── hls-meta.js          清单正文解析（段数 / 总时长 / 加密 / 变体，纯函数）
+│   ├── naming.js            落盘文件名的规则（标题优先，纯函数）
 │   ├── inject-main.js       ★ 页面主世界 hook（Blob / MSE / B 站 DASH / 小红书）
 │   ├── content.js           页面 ↔ 扩展的搬运层
 │   ├── popup.html/css/js    列表界面
@@ -338,7 +340,9 @@ media-sniffer/
 │   ├── detect.test.js       类型判定单测（30 项）
 │   ├── session_model.test.js 会话数据契约单测（69 项）
 │   ├── manifest_classify.test.js 清单分类与体量门槛单测（28 项）
-│   ├── hls_family.test.js   清单归族单测（15 项）
+│   ├── hls_family.test.js   清单归族单测（22 项）
+│   ├── hls_meta.test.js     清单正文解析单测（55 项）
+│   ├── naming.test.js       文件名规则单测（24 项）
 │   ├── native_done_history.test.js 下载完成写记录单测（16 项）
 │   ├── icon_filter.test.js  图标/噪声过滤单测（20 项）
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
@@ -347,7 +351,9 @@ media-sniffer/
 │   └── *.py                 宿主侧 Python 测试（16 套）
 ├── tools/
 │   ├── fuzz_host.py         变异/性质测试（喂畸形输入找边界 bug，见下）
-│   ├── live_check.mjs       真机取证（CDP 起真浏览器读扩展 storage / 渲染文案 / 下载记录）
+│   ├── live_check.mjs       真机取证（CDP 起真浏览器读扩展 storage / 渲染文案 / 下载记录 / 关 popup）
+│   ├── net_dump.mjs         抓页面自己请求的清单正文（CDP Network，不受 CORS 限制）
+│   ├── probe_ext.mjs        探针：扩展脚本有没有真进页面、hook 有没有发消息
 │   ├── site_audit.mjs       站点覆盖度审计（34 站批量量抓取能力）
 │   └── sites*.txt           审计用的站点清单
 ├── docs/                    截图 + 站点审计报告（site-audit.md）
