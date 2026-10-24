@@ -46,6 +46,10 @@ let lastDiag = null;   // background 给的抓取诊断（{seen, drop:{原因:�
 let focusInfo = null;  // 列表被「当前打开的那一条」收窄时，background 回传 {kind,id}；否则 null
 let selecting = false; // 批量选择模式
 const picked = new Set(); // 已选条目的 key（就是 it.u）
+// 同片折叠时用户点过「切换」的选择：groupKey → url。
+// 只活在 popup 这次打开期间 —— 它是一次「我现在想看哪条」的即时偏好，
+// 存进 storage 就变成跨会话的隐性状态，下次打开为什么少一条说不清。
+const moviePick = new Map();
 let blockedHosts = []; // 用户屏蔽的站点（hostname）
 
 const $ = (sel) => document.querySelector(sel);
@@ -450,7 +454,10 @@ function renderChips() {
   const nav = $("#chips");
   nav.replaceChildren();
 
-  const src = shownItems();
+  // 折叠掉同片清单之后才算数：列表只显示一条，chip 就不能还写 2
+  // （「视频 2、点进去 1 条」是用户反复报过的那类对不上）。
+  const hidden = movieDedupe().hidden;
+  const src = shownItems().filter((it) => !hidden.has(it.u));
   const totalAll = src.filter((it) => it.k !== "seg").length;
   const defs = [["all", "全部", totalAll]];
   for (const k of ["video", "audio", "image", "doc", "font", "other", "seg"]) {
@@ -547,15 +554,17 @@ function visibleItems() {
  */
 function renderList() {
   const box = $("#list");
-  const items = visibleItems();
-  box.replaceChildren();
 
   // 清单族要按**全量**条目算，不能用 visibleItems：用户切到「视频」筛选时，
   // 分片被筛掉了，但主清单/变体的判定跟分片无关；反过来在「分片」筛选下
   // 用可见列表算，会一条 m3u8 都看不到，标注全丢。
-  const hlsFamily = (typeof MSHlsFamily !== "undefined" && MSHlsFamily)
-    ? MSHlsFamily.build(allItems)
-    : new Map();
+  const hlsFamily = hlsFamilyMap();
+  // 同片折叠（2026-10-24 用户要求「只出现一条可下载吗」）：
+  // 时长精确相同的多条 m3u8 只留一条，其余折叠起来、那一条上给「切换」。
+  const movie = movieDedupe();
+
+  const items = visibleItems().filter((it) => !movie.hidden.has(it.u));
+  box.replaceChildren();
 
   if (!items.length) {
     let tip;
@@ -594,8 +603,27 @@ function renderList() {
   }
 
   for (let i = 0; i < items.length; i++) {
-    box.append(renderItem(items[i], i + 1, hlsFamily));
+    box.append(renderItem(items[i], i + 1, hlsFamily, movie.groupOf));
   }
+}
+
+/**
+ * build() 的薄封装。写成函数是因为它有两个调用点（列表 + chip 计数），
+ * 两处必须拿到同一份结论 —— 否则会出现「视频 2、列表 1 条」，
+ * 那正是用户最反感的那类对不上。
+ */
+function hlsFamilyMap() {
+  return (typeof MSHlsFamily !== "undefined" && MSHlsFamily)
+    ? MSHlsFamily.build(allItems)
+    : new Map();
+}
+
+/** 同片折叠的结论（见 hls-family.js 的 sameMovie）。 */
+function movieDedupe() {
+  if (typeof MSHlsFamily === "undefined" || !MSHlsFamily || !MSHlsFamily.sameMovie) {
+    return { groupOf: new Map(), hidden: new Set() };
+  }
+  return MSHlsFamily.sameMovie(allItems, hlsFamilyMap(), moviePick);
 }
 
 /**
@@ -670,7 +698,7 @@ function canPreviewSrc(it) {
  *   · 行号是「列表里的第几行」，随筛选/排序变，表达位置而不表达归属。
  * 所以行号单独占一列，在类型徽标左边。
  */
-function renderItem(it, no, hlsFamily) {
+function renderItem(it, no, hlsFamily, groupOf) {
   const row = el("div", "item");
   const isPage = !!it.page;
 
@@ -718,6 +746,7 @@ function renderItem(it, no, hlsFamily) {
   meta.append(name);
 
   const bits = [];
+  let grp = null;
   if (isHlsItem(it)) {
     // m3u8 的大小是**播放列表文本**的大小（几 KB），不是视频大小。
     // 不写清楚的话用户看到「视频 29 KB」会以为下到了个坏文件。
@@ -729,9 +758,18 @@ function renderItem(it, no, hlsFamily) {
     // 所以文案第一项必须是**时长和段数**：这是唯一能让人一眼看出哪条是正片的
     // 硬信息（体积不能——5 KB 的清单也可能很长，取决于分片地址写多短）。
     const fam = hlsFamily && hlsFamily.get(it.u);
+    grp = (groupOf && groupOf.get(it.u)) || null;
     const dur = fmtDur(it.dur);
     const segs = Number(it.segs) || 0;
-    if (fam && fam.role === "master") {
+    if (grp) {
+      // 同片折叠（用户 2026-10-24：「不能只出现一条可下载吗」）。
+      // 这一条是**代表**，其余时长相同的清单折叠在它后面，用 sub 行末尾的
+      // 「切换」换。不写「第 N 档」：时长相同说明覆盖的是同一段内容，
+      // 谁也不是「更高档」，编出档位只会让用户再选一次。
+      bits.push(dur ? dur + (segs ? " · " + segs + " 段" : "") : "时长未知");
+      bits.push("另有 " + grp.alts + " 个等长片源");
+      bits.push("点下载自动拼成完整视频");
+    } else if (fam && fam.role === "master") {
       // 名字里已经有「HLS 流（视频）」了，这里不要再重复一次。
       bits.push("主清单 · 含 " + fam.total + " 个清晰度清单");
       bits.push("点下载自动拼成完整视频");
@@ -774,6 +812,7 @@ function renderItem(it, no, hlsFamily) {
   // 条目标一个「大小未知」比不显示诚实
   if (isPage && !it.s) bits.push("大小未知");
   const sub = el("div", "sub", bits.filter(Boolean).join(" · "));
+  if (grp) appendSwap(sub, grp);
   meta.append(sub);
   row.append(meta);
 
@@ -843,6 +882,31 @@ function renderItem(it, no, hlsFamily) {
 
   row.append(ops);
   return row;
+}
+
+/**
+ * 同片折叠的「切换」入口。
+ *
+ * 只换 URL，不换行、不弹选择器 —— 用户要的就是「一条」；再给他一个下拉框
+ * 等于把问题原样退回去。切换是**可逆**的：点几次就转几圈，不会丢片源。
+ */
+function appendSwap(sub, grp) {
+  const sp = document.createElement("span");
+  sp.className = "swap";
+  sp.textContent = "切换";
+  const total = grp.urls.length;
+  sp.title = "共 " + total + " 个片源、时长都是 " + (fmtDur(grp.dur) || "未知")
+    + "，点一下换成下一个";
+  sp.addEventListener("click", (e) => {
+    e.stopPropagation();   // 别触发整行点击（批量勾选模式下会误勾）
+    const i = grp.urls.indexOf(grp.chosen);
+    moviePick.set(grp.key, grp.urls[(i + 1) % total]);
+    renderList();
+  });
+  sub.title = "这 " + total + " 个清单时长相同，视为同一个视频的不同片源；"
+    + "默认取页面当前在用的那个，点「切换」可以换。";
+  sub.append(document.createTextNode(" · "));
+  sub.append(sp);
 }
 
 /** 秒 → 「1:23」或「1:02:03」。0/空返回空串 */

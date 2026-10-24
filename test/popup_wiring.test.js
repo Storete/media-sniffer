@@ -119,8 +119,13 @@ check("renderList 把显示顺序传给 renderItem",
 check("renderItem 接收行号", /function renderItem\(it, no(?:, [^)]+)?\)/.test(JS));
 // 同一页多条 m3u8 时必须能说出「哪条是主清单、哪条是第几档」，
 // 否则用户面对三条一模一样的「HLS 流（视频）」只能靠猜（2026-10-24 用户截图）。
+// 只钉「传了 hlsFamily」这个事实，不钉参数个数：2026-10-24 加了同片折叠
+// （第四个参数 groupOf），旧断言写死 `renderItem(items[i], i + 1, hlsFamily)`
+// 直接变红 —— 那是断言把实现细节锁死了，不是实现错了。
 check("renderList 把清单族传给 renderItem",
-  /renderItem\(items\[i\], i \+ 1, hlsFamily\)/.test(JS));
+  /renderItem\(items\[i\], i \+ 1, hlsFamily[,)]/.test(JS));
+check("renderList 把同片折叠的结论也传给 renderItem（第二参数位）",
+  /renderItem\(items\[i\], i \+ 1, hlsFamily, movie\.groupOf\)/.test(JS));
 check("清单族按全量条目算，不按筛选后的可见列表",
   /MSHlsFamily\.build\(allItems\)/.test(JS));
 check("行号建成独立的 .no 元素（不混进 displayName，否则会被标题截断吃掉）",

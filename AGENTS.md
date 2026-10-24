@@ -66,6 +66,7 @@ for f in extension/*.js; do node --check "$f" || exit 1; done
 node test/background.test.js
 node test/detect.test.js
 node test/hls_family.test.js
+node test/hls_same_movie.test.js
 node test/main-hook.test.js
 node test/manifest_classify.test.js
 node test/native_done_history.test.js
@@ -79,9 +80,8 @@ node test/site_registry.test.js
 python test/run_all.py
 ```
 
-提示：`test/*.test.js` 全套共 19 个文件（上面 8 个之外还有 `icon_filter`、`blob_item`、`ui_card`、
-`focus_scope`、`group_key`、`review`、`manifest_classify`、`hls_family`、`hls_meta`、`naming`、
-`native_done_history`）；其中 `focus_scope` / `group_key` 只在失败时输出，
+提示：`test/*.test.js` 全套共 20 个文件（上面之外还有 `icon_filter`、`blob_item`、`ui_card`、
+`focus_scope`、`group_key`、`review`、`hls_meta`、`naming`、`hls_same_movie`）；其中 `focus_scope` / `group_key` 只在失败时输出，
 `review.test.js` 由 `background.test.js` 引入执行，单独跑会提示跳过。
 整套跑法：`for f in test/*.test.js; do node "$f"; done`。
 
@@ -157,7 +157,7 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 10 套主 JS + 16 套 Python 全绿（全套 919 项），数字记进 `DEVLOG.md`
+- [ ] 10 套主 JS + 16 套 Python 全绿（全套 **952** 项，口径：各套件汇总行的「N 通过」求和），数字记进 `DEVLOG.md`
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

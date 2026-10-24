@@ -178,6 +178,13 @@ h1 { margin: 0; font-size: 14px; font-weight: 600; }
   color: var(--text-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* 「切换」：同片折叠后换片源的唯一入口。做成文字链而不是按钮 ——
+   它是同一条目上的次要动作，加按钮会把「下载」的主次关系压掉。 */
+.sub .swap {
+  color: var(--brand);
+  cursor: pointer;
+}
+.sub .swap:hover { text-decoration: underline; }
 
 .ops { display: flex; gap: 6px; flex: 0 0 auto; }
 .btn {
