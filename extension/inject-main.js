@@ -3163,7 +3163,7 @@
   // ---- B 站站点对象（下载层钩子）----
   //
   // 以前 `startMediaDownload` 里写死 `const useBili = isBiliHost() && biliPlayinfo()`、
-  // `overlayShow` 里写死 `if (isBiliHost() && biliPlayinfo())`、
+  // 原 overlayShow（已移除）里写死 `if (isBiliHost() && biliPlayinfo())`、
   // `beginSaveBatch` 里写死 `biliSig = ""` —— 通用层认识 B 站，加第二个站点就得再改一遍。
   // 现在这些判断都收进这个对象，通用层只问 siteCanFeed()/siteSaveHint()/siteOnSaveStart()。
   SITES.push({
@@ -3880,182 +3880,54 @@
     }
   }
 
-  // ------------------------------------------------------------ 6. 页面内「保存」浮层（用户手势保留在这里）
+  // ------------------------------------------------------------ 6. 直接保存（不弹确认浮层）
+  //
+  // 2026-10-24 用户要求：popup 点「保存」直接开始下载，不再弹确认浮层。
+  // 浮层的历史理由是「让用户手势落在页面按钮上」——那时 blob 走 <a download>
+  // 模拟点击，没有手势会被 Chrome 拦。现在全部保存路径都是消息驱动
+  // （页面 fetch → Native Host），手势不再是必要条件，浮层只剩确认仪式，删。
+  // （MSE 条目仍走 downloadBlob 的 <a download>；Chrome 对同源单个 blob 的
+  // 程序化点击不拦，真机如有拦截反馈再单独处理。）
 
-  const OV = { root: null, wrap: null, name: null };
-
-  function overlayClose() {
-    try { if (OV.root) OV.root.remove(); } catch (e) { /* 忽略 */ }
-    OV.root = null;
-  }
-
-  function overlayShow(items) {
-    overlayClose();
-    const host = document.body || document.documentElement;
-    const root = document.createElement("div");
-    root.id = "__ms_sniffer_overlay";
-    root.style.cssText = [
-      "position:fixed", "inset:0", "z-index:2147483647", "background:rgba(0,0,0,.42)",
-      "display:flex", "align-items:center", "justify-content:center",
-      "font:14px/1.5 system-ui,'Segoe UI',sans-serif",
-    ].join(";");
-    const card = document.createElement("div");
-    card.style.cssText = [
-      "position:relative", "width:440px", "max-width:92vw", "max-height:76vh",
-      "display:flex", "flex-direction:column",
-      "padding:18px 20px", "box-sizing:border-box",
-      "border-radius:14px", "background:#17171c", "color:#f2f2f5", "box-shadow:0 18px 48px rgba(0,0,0,.5)",
-    ].join(";");
-
-    // ---- 关闭按钮：卡片右上角（用户第 2 点要求）----
-    // 用绝对定位而不是 flex 排进标题行：标题长度不定，绝对定位才能保证
-    // 「永远在右上角」这个位置在任何标题长度下都不动。
-    const closeBtn = document.createElement("button");
-    closeBtn.textContent = "✕";
-    closeBtn.title = "关闭";
-    closeBtn.style.cssText = [
-      "position:absolute", "top:10px", "right:10px",
-      "appearance:none", "border:0", "width:26px", "height:26px", "line-height:1",
-      "border-radius:7px", "cursor:pointer",
-      "background:rgba(255,255,255,.10)", "color:#d0d0d8", "font:14px system-ui",
-    ].join(";");
-    closeBtn.addEventListener("mouseenter", () => { closeBtn.style.background = "rgba(255,255,255,.2)"; });
-    closeBtn.addEventListener("mouseleave", () => { closeBtn.style.background = "rgba(255,255,255,.10)"; });
-    closeBtn.addEventListener("click", overlayClose);
-    card.append(closeBtn);
-
-    const h = document.createElement("div");
-    h.textContent = items.length > 1 ? `资源嗅探 · ${items.length} 个媒体` : "资源嗅探 · 保存媒体";
-    // 右边留出关闭按钮的位置，标题再长也不会被压到按钮底下
-    h.style.cssText = "font-size:15px;font-weight:600;margin-bottom:10px;padding-right:34px";
-    card.append(h);
-
-    // 串行队列：Range 链下载一次只跑一条，避免把带宽和 SW 打满
-    const queue = [];
-    let busy = false;
-    const runQueue = async () => {
-      if (busy) return;
-      busy = true;
-      while (queue.length) {
-        const job = queue.shift();
-        await new Promise((resolve) => startMediaDownload(job.key, job.name, job.ctx, () => resolve()));
-      }
-      busy = false;
-      overlayClose();
-    };
-
-    // 真正的「保存」动作抽出来：底部右下的保存按钮和每行的点击都走这里
-    const runSave = (it, btn) => {
-      // 关键：点击事件在手势栈里，直接发起保存
-      // 站点能接管下载时（B 站有 __playinfo__）：它那儿的 blob/MSE 只是「看到哪儿
-      // 就录到哪儿」，一律让站点走自己的完整流。通用层不再写 isBiliHost()。
-      if (siteCanFeed({ bili: "on" })) {
-        overlayClose();
-        startMediaDownload(it.key, it.name, { bili: "on" }, () => {});
-        return;
-      }
-      if (/^blob:/i.test(it.key)) {
-        overlayClose();
-        // blob: 不再走 doSaveBlob 的 <a download>。真机（Telegram，2026-10-21）证据：
-        //   __msRangeDownload → D:/…/文件存放处/tg-probe.mp4  72796 字节 ✅
-        //   <a download>      → C:/Users/l/Downloads/test-tg.jfif 72796 字节 ⚠️
-        // 数据其实都下下来了，但 <a download> 落在 **Chrome 默认下载目录**、
-        // 扩展名被 MIME 改写成 .jfif，用户在「文件存放处」找不到 → 看起来就是「下载失败」。
-        // 页面侧 fetch 读 blob: 完全可用（probeTotal 实测 72796 与 DOM 一致），
-        // 所以统一走 Range + Native Host，落到插件配置的目录、扩展名由内容嗅探决定。
-        startMediaDownload(it.key, it.name, {}, () => {});
-        return;
-      }
-      if (/^m\d+$/.test(it.key)) {
-        overlayClose();
-        doSaveMse(it.key, it.name);
-        return;
-      }
-      queue.push({ key: it.key, name: it.name, ctx: it.ctx || {} });
-      if (btn) {
-        btn.disabled = true;
-        btn.style.opacity = ".45";
-        btn.textContent = "排队中…";
-      }
-      runQueue();
-    };
-
-    // 条目区单独滚动，标题和底栏固定（不然 max-height 一撑，按钮会被滚出视野）
-    const listBox = document.createElement("div");
-    listBox.style.cssText = "overflow:auto;flex:1;min-height:0";
-
-    for (const it of items) {
-      const row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid rgba(255,255,255,.08)";
-      const label = document.createElement("div");
-      label.style.cssText = "flex:1;min-width:0;cursor:pointer";
-      const nm = document.createElement("div");
-      nm.textContent = it.name || "（未命名媒体）";
-      nm.style.cssText = "font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis";
-      nm.title = it.key;
-      const sub = document.createElement("div");
-      sub.textContent = it.sub || "";
-      sub.style.cssText = "font-size:11.5px;opacity:.6";
-      label.append(nm, sub);
-      // 只有一条时，点整行就等于点保存；多条时靠底部「全部保存」
-      label.addEventListener("click", () => {
-        if (items.length === 1) runSave(it, null);
-      });
-      row.append(label);
-      listBox.append(row);
+  const saveQueue = [];        // 串行队列：Range 链一次只跑一条，避免打满带宽和 SW
+  let saveBusy = false;
+  async function runSaveQueue() {
+    if (saveBusy) return;
+    saveBusy = true;
+    while (saveQueue.length) {
+      const job = saveQueue.shift();
+      await new Promise((resolve) => startMediaDownload(job.key, job.name, job.ctx, () => resolve()));
     }
-    card.append(listBox);
-
-    // ---- 底栏：说明文字在左，「保存到本地」在右下角（用户第 2 点要求）----
-    const foot = document.createElement("div");
-    foot.style.cssText = [
-      "display:flex", "align-items:flex-end", "justify-content:space-between",
-      "gap:14px", "margin-top:12px",
-    ].join(";");
-    const footText = document.createElement("div");
-    footText.style.cssText = "flex:1;min-width:0;font-size:11.5px;opacity:.55;line-height:1.45";
-    // 站点专属话术由站点对象给（siteSaveHint），通用层不认识任何站点
-    footText.textContent = siteSaveHint()
-      || "媒体由页面自己分段取回，直接写入本地下载器目录。多个文件会依次保存。";
-
-    const saveBtn = document.createElement("button");
-    saveBtn.textContent = items.length > 1 ? `全部保存（${items.length}）` : "保存到本地";
-    saveBtn.style.cssText = [
-      "appearance:none", "border:0", "border-radius:9px", "padding:9px 18px", "cursor:pointer",
-      "background:#2563eb", "color:#fff", "font:13px system-ui", "font-weight:600", "white-space:nowrap",
-      "flex:0 0 auto", "box-shadow:0 2px 10px rgba(37,99,235,.4)",
-    ].join(";");
-    saveBtn.addEventListener("click", () => {
-      if (items.length === 1) {
-        runSave(items[0], saveBtn);
-        return;
-      }
-      // 多条：全部排进队列（按钮交给 runQueue 统一推进度）
-      saveBtn.disabled = true;
-      saveBtn.style.opacity = ".55";
-      saveBtn.textContent = "保存中…";
-      for (const it of items) queue.push({ key: it.key, name: it.name, ctx: it.ctx || {} });
-      runQueue();
-    });
-    foot.append(footText, saveBtn);
-    card.append(foot);
-    root.append(card);
-    root.addEventListener("click", (e) => { if (e.target === root) overlayClose(); });
-    host.appendChild(root);
-    OV.root = root;
+    saveBusy = false;
   }
 
-  function onEsc(e) {
-    if (e.key === "Escape") overlayClose();
+  /** 单条分派（原浮层里 runSave 的正文，去掉浮层收尾）。
+   *  站点能接管下载时（B 站有 __playinfo__）：页面里的 blob/MSE 只是「看到哪儿
+   *  就录到哪儿」，一律让站点走自己的完整流。通用层不写 isBiliHost()。 */
+  function dispatchSaveItem(it) {
+    if (siteCanFeed({ bili: "on" })) {
+      startMediaDownload(it.key, it.name, { bili: "on" }, () => {});
+      return;
+    }
+    if (/^blob:/i.test(it.key)) {
+      // blob 不走 <a download>。真机（Telegram，2026-10-21）证据：
+      //   __msRangeDownload → D:/…/文件存放处/tg-probe.mp4  72796 字节 ✅
+      //   <a download>      → C:/Users/l/Downloads/test-tg.jfif 72796 字节 ⚠️
+      // 数据都下到了，但 <a download> 落在 Chrome 默认下载目录、扩展名被 MIME
+      // 改写成 .jfif，用户在「文件存放处」找不到 → 看起来就是「下载失败」。
+      // 页面侧 fetch 读 blob: 完全可用，统一走 Range + Native Host：
+      // 落到插件配置的目录、扩展名由内容嗅探决定。
+      startMediaDownload(it.key, it.name, {}, () => {});
+      return;
+    }
+    if (/^m\d+$/.test(it.key)) {
+      doSaveMse(it.key, it.name);
+      return;
+    }
+    saveQueue.push({ key: it.key, name: it.name, ctx: it.ctx || {} });
   }
-  document.addEventListener("keydown", onEsc, true);
 
-  function overlayOpen(items) {
-    if (!items || !items.length) return;
-    overlayShow(items);
-  }
-
-  /** popup 传来的媒体清单 → 打开页面浮层（popup 的通知只是兜底） */
+  /** popup 传来的媒体清单 → 逐条分派直接保存（多条自动串行排队） */
   function beginSaveBatch(list) {
     const items = (list || [])
       .filter((x) => x && x.key)
@@ -4067,12 +3939,8 @@
         ctx: { ct: x.ct || "", mid: x.mid || "", ref: x.ref || "" },
       }));
     if (!items.length) return;
-    if (items.length === 1) {
-      // 只有一个：仍然用浮层，让用户的手势落在按钮上
-      overlayShow(items);
-    } else {
-      overlayShow(items);
-    }
+    for (const it of items) dispatchSaveItem(it);
+    runSaveQueue();
   }
 
   // ------------------------------------------------------------ 7. 指令

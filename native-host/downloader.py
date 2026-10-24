@@ -693,6 +693,46 @@ def cleanup_ytdlp_junk(outdir, base):
     return removed
 
 
+# B27：时间段「1:30-2:45」「00:01:30-00:02:45」「90-165」的解析。
+# 只认 H:M:S / M:S / 纯秒三种形态 —— popup 输入框里用户会怎么写，比 RFC 宽松不了多少。
+_TR_PART = re.compile(r"^\d{1,2}(?::\d{1,2}){0,2}$")
+
+
+def _tr_norm(part):
+    """单段 → H:MM:SS；非法（分钟/秒超 59、段超 3）返回 None。"""
+    part = part.strip()
+    if not (_TR_COLON.match(part) or _TR_SEC.match(part)):
+        return None
+    nums = [int(x) for x in part.split(":")]
+    if len(nums) == 3 and (nums[1] > 59 or nums[2] > 59):
+        return None
+    if len(nums) == 2 and nums[1] > 59:
+        return None
+    while len(nums) < 3:
+        nums.insert(0, 0)
+    return "%02d:%02d:%02d" % tuple(nums)
+
+
+def parse_time_range(raw):
+    """B27：用户输入的时间段 → yt-dlp `--download-sections` 的值。
+
+    返回 `"*00:01:30-00:02:45"` 形态；None 表示没有/不合法 —— **不合法就当没有，
+    绝不把半个参数交给 yt-dlp**（它会把解析错误整单报失败，而用户只是手滑）。
+    HLS/DASH 只拉覆盖该区间的分片（省流量的来源）；直链由 yt-dlp 内部落盘再切；
+    直播流没有绝对时间轴，不适用（调用方 UI 上对 live 条目不显示输入框）。
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if "-" not in s:
+        return None
+    a, _, b = s.partition("-")
+    na, nb = _tr_norm(a), _tr_norm(b)
+    if not na or not nb or na >= nb:
+        return None
+    return "*%s-%s" % (na, nb)
+
+
 def write_cookie_netscape(cookies):
     """chrome.cookies.getAll 的结构化 cookie → Netscape cookies.txt 临时文件。
 
@@ -805,6 +845,13 @@ def _run_ytdlp(job, ytdlp, ffmpeg, cookie_file):
         {k: v for k, v in job.items() if k != "cookie"} if cookie_file else job)
     if cookie_file:
         cmd += ["--cookies", cookie_file]
+    # B27：时间段截取。parse_time_range 不合法返回 None，这里就不加参数 ——
+    # 宁可整段下，也不把半个参数交给 yt-dlp 让它整单报失败。
+    tr = parse_time_range(job.get("timeRange"))
+    if tr:
+        # --force-keyframes-at-cuts：切割点对齐关键帧（精确但要在切点重编码）；
+        # 不加则起点可能偏 0~2 秒。截取片段的用途下，精确比快重要。
+        cmd += ["--download-sections", tr, "--force-keyframes-at-cuts"]
     if ffmpeg:
         cmd += ["--ffmpeg-location", os.path.dirname(ffmpeg)]
         # 不要加 --merge-output-format mp4（2026-10-21 用户 m16052 排查 4kvm 时发现）。

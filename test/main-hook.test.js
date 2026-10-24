@@ -334,7 +334,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   listeners.forEach((fn) => fn({ source: win, data: { __ms_sniffer_cmd: true, cmd: "save", key: "https://web.telegram.org/a/progressive/document6208389833551777399", filename: LONG_TITLE } }));
   await sleep(80);
   const overCard = fakeDocument.getElementById("__ms_sniffer_overlay");
-  check("保存长标题时仍弹出浮层", !!overCard);
+  check("保存长标题直接开始，不再弹确认浮层", !overCard);
+  // 直下证据：产品自己发出的开始事件（进度卡阶段消息）
+  const started0 = messages.filter((m) => m && m.cmd === "progress");
+  check("保存已开始（progress 事件）", started0.length > 0, messages.map((m) => m && m.cmd));
   const dn = sandbox.window.__msFileNameTitle ? sandbox.window.__msFileNameTitle(LONG_TITLE) : "";
   check("文件名标题收在 60 字以内", dn.length <= 61, { len: dn.length, dn });
   check("截断后带省略号", /…$/.test(dn), dn);
@@ -1095,12 +1098,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   messages.length = 0; clicks.length = 0;
   listeners.forEach((fn) => fn({ source: win, data: { __ms_sniffer_cmd: true, cmd: "save", key: "https://web.telegram.org/a/progressive/document123", filename: "" } }));
   await sleep(80);
-  // http 媒体不再走 <a download>（那样在 Telegram 会是一场 800MB 的浏览器下载），
-  // 而是弹出页面内的「保存」浮层，等用户点按钮
+  // http 媒体不走 <a download>（那样在 Telegram 会是一场 800MB 的浏览器下载），
+  // 也不弹确认浮层了（1.3.61：popup 点保存直接开始）——直接进 Range 链
   const overlay1 = fakeDocument.getElementById("__ms_sniffer_overlay");
-  check("http 媒体弹出页面内浮层", !!overlay1);
-  const ovText1 = JSON.stringify(overlay1 && overlay1.children.map((c) => c.children.map((x) => x.children && x.children.map((y) => y.textContent))));
-  check("浮层里带文件条目", /progressive|video|媒体/.test(ovText1) || (overlay1 && overlay1.children.length > 0), ovText1.slice(0, 120));
+  check("http 媒体直接开始保存，不弹浮层", !overlay1);
+  const started1 = messages.filter((m) => m && m.cmd === "progress");
+  check("http 媒体保存已开始（progress 事件）", started1.length > 0, messages.map((m) => m && m.cmd));
   check("没有触发浏览器下载", clicks.length === 0, clicks);
 
   console.log("\n[6] 保存 Worker 创建的 blob（走 fetch + 格式嗅探）");

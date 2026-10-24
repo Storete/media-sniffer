@@ -96,7 +96,7 @@ check("有 siteCanFeed() 统一入口", /function siteCanFeed\(/.test(SRC));
 check("有 siteSaveHint() 统一入口", /function siteSaveHint\(/.test(SRC));
 check("有 siteResetReport() 统一入口", /function siteResetReport\(/.test(SRC));
 
-const DL_GENERIC = ["startMediaDownload", "overlayShow", "beginSaveBatch"];
+const DL_GENERIC = ["startMediaDownload", "dispatchSaveItem", "beginSaveBatch"];
 for (const fn of DL_GENERIC) {
   const body = bodyOf(fn);
   if (body === null) { check(`能定位到 ${fn}()`, false); continue; }
@@ -108,21 +108,20 @@ for (const fn of DL_GENERIC) {
   check(`${fn}() 里没有站点专属判断`, !hit, hit ? String(hit) : undefined);
 }
 
-// runSave 是 overlayShow 内部的闭包 —— 单独抠出来测
-const runSaveStart = SRC.indexOf("const runSave = (it, btn) =>");
-const runSaveEnd = runSaveStart < 0 ? -1 : SRC.indexOf("\n    };", runSaveStart);
-const runSaveBody = runSaveStart < 0 ? "" : SRC.slice(runSaveStart, runSaveEnd);
-check("能定位到 overlayShow 里的 runSave", runSaveStart >= 0 && runSaveEnd > runSaveStart);
-check("runSave 里没有站点专属判断",
-  !SITE_HINTS.find((re) => re.test(runSaveBody.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, ""))));
-check("runSave 走 siteCanFeed", /siteCanFeed\(/.test(runSaveBody));
+// 1.3.61 浮层移除后，单条分派是模块级的 dispatchSaveItem
+const dsiBody = bodyOf("dispatchSaveItem");
+check("能定位到 dispatchSaveItem", dsiBody !== null);
+check("分派里没有站点专属判断",
+  !SITE_HINTS.find((re) => re.test((dsiBody || "").replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, ""))));
+check("分派走 siteCanFeed", /siteCanFeed\(/.test(dsiBody || ""));
 
 console.log("\n[A0-5] 下载层钩子确实被通用函数用上了");
 
 check("startMediaDownload 走 siteCanFeed", /siteCanFeed\(/.test(bodyOf("startMediaDownload") || ""));
 check("startMediaDownload 走 site.feedDownload",
   /\.feedDownload\b/.test(bodyOf("startMediaDownload") || ""));
-check("overlayShow 底部文案走 siteSaveHint", /siteSaveHint\(\)/.test(bodyOf("overlayShow") || ""));
+// 浮层移除后 siteSaveHint 暂无 UI 消费点（API 保留）
+check("siteSaveHint 定义仍在", /function siteSaveHint\(/.test(SRC));
 check("hello/rescan 重报走 siteResetReport", /siteResetReport\(\)/.test(SRC));
 
 // d-018：内容归属与回放也走注册表。rescan 块 1.3.11 里还直调 reportBiliDash()，
@@ -331,8 +330,8 @@ console.log("\n[BLOB] blob: 用 Range + Native Host 落盘，不用 <a download>
 
 const inj = fs.readFileSync(path.join(ROOT, "extension", "inject-main.js"), "utf8");
 
-// runSave 里 blob 分支必须调 startMediaDownload，不能再调 doSaveBlob
-const rsStart = inj.indexOf("const runSave = (it, btn) => {");
+// dispatchSaveItem 里 blob 分支必须调 startMediaDownload，不能再调 doSaveBlob
+const rsStart = inj.indexOf("function dispatchSaveItem(it) {");
 // 不能用 indexOf("    };") —— runSave 里有多层 if/return，第一个缩进 4 的 };
 // 出现得很早，截出来的片段漏掉 blob 分支，红测就变成了假红。
 let rsEnd = rsStart, depth = 0;
@@ -340,7 +339,7 @@ for (let i = inj.indexOf("{", rsStart); i < inj.length; i++) {
   if (inj[i] === "{") depth++;
   else if (inj[i] === "}") { depth--; if (depth === 0) { rsEnd = i + 1; break; } }
 }
-const runSave = inj.slice(rsStart, rsEnd);
+const runSave = inj.slice(rsStart, rsEnd);  // 变量名沿用：就是分派函数体
 // 只取 blob 分支自己的花括号体：注释里会出现 doSaveBlob 字样（讲为什么不用它），
 // 用正则窗口扫整段会把注释当代码，红测就成了假红。
 let blobBody = "";
