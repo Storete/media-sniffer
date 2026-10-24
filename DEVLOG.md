@@ -10,6 +10,40 @@
 >
 > 条目编号规则：`#序号 · 日期 · 主题`，编号越大越新。锚点形如 `#d-013`。
 
+## d-078 · 2026-10-24 · T-F4 yt-dlp 器官化：从 CLI 黑盒到进程内的库
+
+### 起点：d-075 的架构结论落地
+
+「不拥有站点知识，但拥有驱动层」——把 yt-dlp 从「拼命令行 + 解析 stderr 文本」
+换成 `import yt_dlp` 的 Python API。CLI 路径**完整保留为兜底**（find_tool 那套
+不动）：run_ytdlp 分派按 `ytdlp_api.available()`，模块缺失时行为与旧版一致。
+
+### 交付三件
+
+- `native-host/ytdlp_api.py`：available()（带缓存）/ build_opts（与 CLI 参数
+  语义对齐）/ run_download（progress_hooks **直写状态**——CLI 时代的 MSPROG
+  stdout 解析整个消失）/ classify_api_error（结构化信号优先：DownloadError
+  的 exc_info 异常链是大脑要的真身；文本兜底复用 classify_ytdlp 同一张码表，
+  **API/CLI 分类对照测试钉死不许漂**）；
+- downloader.run_ytdlp 拆成三段：薄壳（cookie 生命周期，不变）→ 分派 →
+  `_run_ytdlp_api`（新）与 `_run_ytdlp`（CLI，不动）；
+- install.bat：`pip install yt-dlp==2026.8.19` 钉版本，失败不阻塞安装
+  （回退 CLI 模式）。版本更新 = 改版本号 + 跑回归。
+
+### 测试抓出两条真知识
+
+- **postprocessor_hooks 的 `d["postprocessor"]` 是后处理器的名字符串**，
+  不是 dict——按 dict 取 filepath 直接 AttributeError；
+- **假 mp4 字节（ftyp 头 + 全零，没有 moov atom）会被验证四层正确拒收**
+  （ffprobe: moov atom not found）——与 corpus/hls 测试的假 TS 分片同款教训：
+  夹具必须贴真实世界。两次都被验证层抓住，恰是验证层的价值证明。
+
+### 数字
+
+新增 `native-host/ytdlp_api.py` + `host_ytdlp_api_test` **19 项**
+（可用性/分类对照 7/结构化异常链/API 链真实下载/分派开关）；
+yt-dlp 钉 2026.8.19。产品行为零变化（API 链与 CLI 链收尾口径一致）。
+
 ## d-077 · 2026-10-24 · T-F3 考卷与考场：基线跑分 33%——「玩偶的智商」第一次被测量
 
 ### 起点：F2 判据里的「评测集」——做的时候发现考卷可以先落
@@ -3318,6 +3352,7 @@ https://www.4kvm.net/ 这两个网站不起作用，为之后的通过大部分�
 
 | # | 日期 | 主题 | 一句话结果 |
 |---|---|---|---|
+| [d-078](#d-078) | 2026-10-24 | T-F4 yt-dlp 器官化 | ytdlp_api.py（API 驱动 + 结构化错误分类 + CLI 兜底分派）+ install.bat 钉版 2026.8.19；host_ytdlp_api_test 19 项；两条夹具教训（postprocessor 是字符串 / 假 mp4 被验证层拒收） |
 | [d-077](#d-077) | 2026-10-24 | T-F3 考卷与考场（提前落地） | eval-cases 24 案（受控词表 10 strategy）+ corpus_eval 可插拔大脑 + 规则基线跑分 33%=玩偶智商；VERIFY_MISMATCH 泛化桶 16 错题=LLM 的岗位说明书；正样本 done×2 入库；15 案待用户批改 |
 | [d-076](#d-076) | 2026-10-24 | T-F1 语料采集器 + 第一跑 | 纯度闸门（direct/marked/clean/fetch-error）+ 纯宿主直灌 + JSONL/分布报告；第一跑 25 条：0 done / 14 VERIFY_MISMATCH / 0 INTERNAL（错误码表全接住）；三条教学：种子需分层、schema 补 trail、纯度闸门真实世界正常；corpus_harvest_test 11 项 |
 | [d-075](#d-075) | 2026-10-24 | 用户提议：真机模拟用户验收入流程 | AGENTS 7.5（人工勾单：点插件/列表匹配页面/逐 tab 计数/每链点下载验落盘可播/失败文案）；verify_headless --userflow 自动半实测全绿（列表匹配 + 73821B 落盘） |

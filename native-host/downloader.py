@@ -41,6 +41,7 @@ _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import library  # noqa: E402  统一的下载目录定位（默认 D:/软件应用/DSH/文件存放处）
+import ytdlp_api
 import errcode  # noqa: E402  失败原因码表（L2-c）；重试预算写在码表里，不散在 if 里
 
 DEFAULT_OUT = library.library_dir()
@@ -853,13 +854,14 @@ def write_cookie_netscape(cookies):
 
 
 def run_ytdlp(job, ytdlp, ffmpeg):
-    """薄壳：负责 cookie 临时文件的生命周期（B28），主体在 _run_ytdlp。
+    """分派：yt_dlp 可导入 → API 器官链（T-F4）；否则 CLI 兜底（原有路径）。
 
-    文件里有登录态 cookie，**必须**在每一条退出路径（含异常）上都删掉 ——
-    try/finally 收口在这里，主体函数内部的多个 return 就不用各自记着删。
+    两条路径共用 cookie 临时文件生命周期（薄壳 try/finally）与验证收尾。
     """
     cookie_file = write_cookie_netscape(job.get("cookies"))
     try:
+        if ytdlp_api.available():
+            return _run_ytdlp_api(job, ffmpeg, cookie_file)
         return _run_ytdlp(job, ytdlp, ffmpeg, cookie_file)
     finally:
         if cookie_file:
@@ -867,6 +869,54 @@ def run_ytdlp(job, ytdlp, ffmpeg):
                 os.remove(cookie_file)
             except OSError:
                 pass
+
+
+def _run_ytdlp_api(job, ffmpeg, cookie_file):
+    """T-F4 API 器官链：yt_dlp 以库形态在进程内下载，结构化错误直接分类。
+
+    与 CLI 路径的收尾口径一致（done 必经验证；目录里找不到真视频按
+    VERIFY_MISMATCH 处理）。
+    """
+    import ytdlp_api as YA
+
+    job_id = job["id"]
+    outdir = job.get("outdir") or DEFAULT_OUT
+    os.makedirs(outdir, exist_ok=True)
+    if is_cancelled(job_id):
+        write_status(job_id, status="cancelled", percent=0, message="用户取消")
+        return
+
+    base = sanitize(job.get("filename") or "", "video")
+    base = os.path.splitext(base)[0] or "video"
+    opts = YA.build_opts(job, outdir, cookie_file=cookie_file)
+    opts["outtmpl"] = {"default": os.path.join(outdir, base + ".%(ext)s")}
+
+    write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
+    phase = Phase(job_id, "交给 yt-dlp（器官链）解析清单（分片多时要等一会儿）")
+
+    def on_status(**fields):
+        write_status(job_id, **fields)
+
+    final_file, err_tail, ok = YA.run_download(
+        job, opts, on_status, lambda: is_cancelled(job_id))
+    phase.done()
+
+    if is_cancelled(job_id) or (not ok and err_tail and err_tail[0] == "cancelled"):
+        write_status(job_id, status="cancelled", err="", message="用户取消")
+        return
+    if ok and final_file and os.path.isfile(final_file):
+        finish_verified(job_id, final_file)
+        return
+    # 失败：结构化异常 → 码表；查目录兜底（有些 postprocess 后路径与 info 不同）
+    product = find_done_product(outdir, base)
+    if product:
+        finish_verified(job_id, product)
+        return
+    code, note = YA.classify_api_error(
+        Exception(err_tail[0]) if err_tail else Exception("unknown"))
+    cleanup_ytdlp_junk(outdir, base)
+    detail = (err_tail[0] if err_tail else note)[:70] if code == errcode.INTERNAL else note
+    _give_up(job_id, code, detail)
 
 
 def _run_ytdlp(job, ytdlp, ffmpeg, cookie_file):
