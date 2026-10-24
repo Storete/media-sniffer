@@ -103,16 +103,24 @@ const notifySaved = vm.runInContext("notifySaved", ctx);
   ok("失败也写记录（不能只记成功，失败才是排障素材）", h2.length === 2, h2.length);
   ok("失败记录带错误原文", h2[1] && /403/.test(String(h2[1].error)), h2[1] && h2[1].error);
 
+  // 站点级建议（解释库 L4）：advice/adviceTitle 要独立透传，不能并进 error 字符串
+  await notifySaved({ ok: false, filename: "D:\\down\\bad2.mp4", error: "分片 403", advice: "不是你的网络问题", adviceTitle: "这个站的分片经常断" });
+  const hAdv = store.session.history || [];
+  const advRec = hAdv[hAdv.length - 1];
+  ok("建议独立字段透传（advice 不并进 error）", advRec && advRec.advice === "不是你的网络问题" && /403/.test(String(advRec.error)), advRec);
+  ok("adviceTitle 透传", advRec && advRec.adviceTitle === "这个站的分片经常断", advRec && advRec.adviceTitle);
+  ok("lastResult 也带建议", store.local.lastResult && store.local.lastResult.advice === "不是你的网络问题", store.local.lastResult);
+
   // 宿主取消：action=cancelled → ok=false，错误文案要给一句人话
   await notifySaved({ ok: false, filename: "x", error: "已取消" });
   const h3 = store.session.history || [];
-  ok("取消也留痕", h3.length === 3 && h3[2].ok === false, h3.length);
+  ok("取消也留痕", h3[h3.length - 1] && h3[h3.length - 1].ok === false, h3.length);
 
   // 边界：filename 为空不能崩，也不能写出 undefined 名字
   await notifySaved({ ok: true, filename: "", size: 0 });
   const h4 = store.session.history || [];
-  ok("空 filename 不崩且名字有兜底", h4.length === 4 && typeof h4[3].name === "string" && h4[3].name.length > 0,
-    h4[3] && h4[3].name);
+  ok("空 filename 不崩且名字有兜底", h4[h4.length - 1] && typeof h4[h4.length - 1].name === "string" && h4[h4.length - 1].name.length > 0,
+    h4[h4.length - 1] && h4[h4.length - 1].name);
 
   ok("记录上限 100 条（超过丢最旧的）", /list\.length\s*>\s*100/.test(notifySrc) && /list\.shift\(\)/.test(notifySrc));
 

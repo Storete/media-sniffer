@@ -479,6 +479,8 @@ async function notifySaved(p) {
         file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "",
         error: ok ? "" : (p.error || ""),
         code: ok ? "" : String(p.code || ""),
+        advice: ok ? "" : String(p.advice || ""),
+        adviceTitle: ok ? "" : String(p.adviceTitle || ""),
         time: Date.now(),
       },
     });
@@ -488,7 +490,7 @@ async function notifySaved(p) {
   try {
     const { history } = await chrome.storage.session.get({ history: [] });
     const list = Array.isArray(history) ? history : [];
-    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), code: ok ? "" : String(p.code || ""), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
+    list.push({ ok, name, size: p.size || 0, time: Date.now(), error: ok ? "" : String(p.error || "").slice(0, 80), code: ok ? "" : String(p.code || ""), advice: ok ? "" : String(p.advice || "").slice(0, 120), adviceTitle: ok ? "" : String(p.adviceTitle || "").slice(0, 40), file: (p.filename && /[\\/]/.test(p.filename)) ? p.filename : "" });
     while (list.length > 100) list.shift();
     await chrome.storage.session.set({ history: list });
   } catch (e) { /* 忽略 */ }
@@ -1928,6 +1930,10 @@ function connectNative() {
           // 失败原因码（native-host/errcode.py 那张表）：只存不翻译，
           // 展示用 message 那句中话，code 留给「诊断包」和用户报错时念。
           code: ok ? "" : String(msg.err || ""),
+          // 站点级建议（解释库 L4）：同站+同码 ≥3 次时宿主带过来的「已知问题 + 怎么办」。
+          // 与 error（单次原因）分开存，popup 分两行展示。
+          advice: ok ? "" : String(msg.advice || ""),
+          adviceTitle: ok ? "" : String(msg.adviceTitle || ""),
           __tabId: job.tabId,
         });
       }

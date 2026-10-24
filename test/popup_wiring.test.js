@@ -148,6 +148,14 @@ check("原因行占满整行宽度（flex-basis:100%）",
 check("错误码进 title（诊断时能念出来），不占用可见行",
   /why\.title\s*=\s*\(it\.code/.test(JS));
 
+// 站点级建议（解释库 L4）：与「这一次为什么失败」分两行，带「已知问题」标题。
+check("站点级建议渲染成独立行（.h-advice），不并进 .h-why",
+  /className\s*=\s*"h-advice"/.test(JS) && /it\.advice/.test(JS));
+check("建议行带「已知问题」标题（adviceTitle 兜底成「已知问题」）",
+  /adviceTitle\s*\|\|\s*"已知问题"/.test(JS));
+check("CSS 给建议行整行宽度 + 琥珀色（与红色失败原因区分）",
+  /\.h-advice\s*\{[\s\S]{0,160}flex:\s*0 0 100%[\s\S]{0,80}color:\s*#92400e/.test(CSS));
+
 console.log("[?] 选清晰度（S1）的接线");
 
 // 这一刀最容易坏在「接了 UI 却没接到下载」：下拉框能选，点了下载还是 master，

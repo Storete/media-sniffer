@@ -335,6 +335,17 @@ footer {
   padding-left: 34px;   /* 和时间戳同一条左边线，读起来是「这条的补充说明」 */
   opacity: .9;
 }
+/* 站点级建议（解释库 L4）：也是整行，但用琥珀色区分「这不是本次报错，是已知问题」。
+   与 .h-why（红色、本次失败原因）并排时，一眼能看出「哪里错了」和「这个站的老毛病」。 */
+.history .h-item .h-advice {
+  flex: 0 0 100%;
+  color: #92400e;
+  font-size: 10px;
+  line-height: 1.4;
+  padding-left: 34px;
+  opacity: .95;
+}
+.history .h-item .h-advice b { font-weight: 600; }
 
 .jobs { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; max-height: 84px; overflow-y: auto; }.job { font-size: 11px; color: var(--text-dim); }
 .job .bar {

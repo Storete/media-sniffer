@@ -84,9 +84,9 @@ H.append_failure("https://a.com/z", "HTTP_403")
 adv = H.failure_advice("https://a.com/x", "HTTP_403")
 check("累计 3 次 → 有建议", adv is not None and adv.get("advice"), adv)
 
-# ---------------------------------------------------------------- 3. poll_job 失败收尾：记账 + 拼建议
+# ---------------------------------------------------------------- 3. poll_job 失败收尾：记账 + 独立字段出建议
 
-print("[3] poll_job 失败收尾：第 3 次失败时 message 里多一句站点级建议")
+print("[3] poll_job 失败收尾：第 3 次失败时 advice/adviceTitle 独立字段带站点级建议")
 
 # 先喂两次失败（同站同码），第三次 poll 时应该出建议
 H.append_failure("https://b.com/x", "SEGMENT_GAP")
@@ -111,10 +111,13 @@ finally:
 last = [m for m in sent if m.get("action") in ("error", "done", "cancelled")][-1]
 check("收尾消息是 error", last.get("status") == "error", last)
 check("err 原样转发", last.get("err") == "SEGMENT_GAP", last)
-check("第 3 次失败 → message 附了站点级建议（比单次建议更长）",
-      len(last.get("message") or "") > len("有分片一直取不到。换一条地址，或稍后再试。"),
-      last.get("message"))
-check("建议是 SEGMENT_GAP 那条（分片经常断）", "分片" in (last.get("message") or ""), last.get("message"))
+check("message 保持单次建议原样（不拼站点级建议进去）",
+      last.get("message") == "有分片一直取不到。换一条地址，或稍后再试。", last.get("message"))
+check("第 3 次失败 → advice 独立字段非空",
+      bool(last.get("advice")), last.get("advice"))
+check("adviceTitle 成对出现（「这个站的分片经常断」）",
+      "分片" in (last.get("adviceTitle") or ""), last.get("adviceTitle"))
+check("建议是 SEGMENT_GAP 那条（分片经常断）", "分片" in (last.get("advice") or ""), last.get("advice"))
 
 # 记完这次后，日志里应有 3 条 b.com|SEGMENT_GAP
 check("这次失败也被记进日志（第 3 条）",

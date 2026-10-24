@@ -668,19 +668,30 @@ def poll_job(job_id):
                     except OSError:
                         sz = 0
                 # 解释库（L4 自动通道）：失败时记一笔，再看「同站 + 同码」是不是
-                # 已经 ≥3 次，是则把站点级建议附到 message 后面。记账/查建议失败
-                # 都不影响收尾本身 —— 学习是锦上添花，不能反过来崩掉下载流程。
+                # 已经 ≥3 次，是则把站点级建议作为**独立字段**发出去（advice=怎么办、
+                # adviceTitle=已知问题标题），而不是拼进 message 字符串。
+                # 为什么独立字段：popup 要把「这一次为什么失败」（单次、describe 的
+                # 话）和「这个站为什么老失败」（跨任务累积、解释库的话）分成两行展示；
+                # 拼进一个字符串的话，扩展侧只能拿中文句子做正则拆，那是 d-054 之前
+                # 的老毛病。记账/查建议失败都不影响收尾 —— 学习是锦上添花，不能反过来崩掉下载流程。
                 final_msg = st.get("message") or ""
                 final_err = st.get("err") or ""
+                advice_text = ""
+                advice_title = ""
                 if st.get("status") == "error" and final_err:
                     job = read_job(job_id)
                     site = (job or {}).get("tabUrl") or ""
                     append_failure(site, final_err)
                     advice = failure_advice(site, final_err)
                     if advice and advice.get("advice"):
-                        final_msg = (final_msg + " " if final_msg else "") + advice["advice"]
+                        advice_text = advice["advice"]
+                        advice_title = advice.get("title") or ""
                 send({"id": job_id, "action": st.get("status"), "status": st.get("status"),
                       "file": f, "size": sz, "message": final_msg,
+                      # 站点级建议（解释库 L4）：同站+同码 ≥3 次才非空。title 是
+                      # 「已知问题」那句（「这个站的分片经常断」），advice 是「怎么办」。
+                      # 二者成对出现：有 advice 必有 title；没 title 的 advice 是表写漏了。
+                      "advice": advice_text, "adviceTitle": advice_title,
                       # **这条漏过一次**：download（downloader.py）早就把 err 写进状态
                       # 文件了，扩展侧也早就开始读 msg.err（background 里 code 字段），
                       # 中间的宿主却不转发 —— 于是 UI 上永远没有错误码，两边都以为

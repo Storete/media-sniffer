@@ -1511,6 +1511,19 @@ function renderHistory(items, hideNow) {
       why.title = (it.code ? it.code + " · " : "") + it.error;
       row.append(why);
     }
+    // 站点级建议（解释库 L4）单独一行，与「这一次为什么失败」分开：
+    // 前者是单次、通用（describe 的话），后者是「这个站老失败」的已知问题（解释库的话）。
+    // 带个标题（「已知问题」）让用户分清这不是本次下载的报错，而是累计出来的规律。
+    if (!it.ok && it.advice) {
+      const adv = document.createElement("span");
+      adv.className = "h-advice";
+      const ttl = document.createElement("b");
+      ttl.textContent = (it.adviceTitle || "已知问题") + " · ";
+      const body = document.createElement("span");
+      body.textContent = it.advice;
+      adv.append(ttl, body);
+      row.append(adv);
+    }
     box.append(row);
   }
   box.classList.remove("hidden");
