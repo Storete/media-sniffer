@@ -23,21 +23,44 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "180"))
 
-# 需要真实 ffmpeg 可执行文件的套件 → 没有就跳过
-NEEDS_FFMPEG = {"host_merge_test.py", "bili_stream_test.py"}
+# 需要真实 ffmpeg **才能验任何东西**的套件 → 没有就整条跳过。
+# 注意：能自己优雅降级的套件**不要**放进来（例如 host_merge_test：
+# 它的 A 段测的是「缺 ffmpeg 时报什么码」，没有 ffmpeg 反而正好能验；
+# 在这里提前跳过，等于把那半也一起丢了）。
+NEEDS_FFMPEG = {"bili_stream_test.py"}
 
 # 故意不纳入 CI 的：慢速大文件，本机手动跑即可
 SLOW = {"big_file_test.py"}
 
 
 def have_ffmpeg():
+    """**能启动才算有。**
+
+    老写法只做 `os.path.exists`，本机 2026-10-24 现场就骗了它一次：项目目录
+    被打了 Low Mandatory Level 标签后 `bin/ffmpeg.exe` 启动就 0xC0000409 崩掉，
+    而 exists 照样返回 True。于是 `have_ffmpeg()` 说「有」，套件被放进去跑，
+    内部再自己 SKIP 并 `exit(0)` —— **汇总行记成 PASS**。
+    一条断言都没跑的套件躺在「20/20 通过」里，比直接 FAIL 危险得多。
+    """
     import shutil
 
     root = os.path.dirname(HERE)
-    for cand in ("ffmpeg", "ffmpeg.exe"):
-        if os.path.exists(os.path.join(root, "bin", cand)):
-            return True
-    return shutil.which("ffmpeg") is not None
+    cands = [os.path.join(root, "bin", c) for c in ("ffmpeg", "ffmpeg.exe")]
+    p = shutil.which("ffmpeg")
+    if p:
+        cands.append(p)
+    for path in cands:
+        if not os.path.exists(path):
+            continue
+        try:
+            r = subprocess.run([path, "-version"], capture_output=True, timeout=10,
+                               stdin=subprocess.DEVNULL,
+                               **({"creationflags": 0x08000000} if os.name == "nt" else {}))
+            if r.returncode == 0 and ((r.stdout or b"") + (r.stderr or b"")).strip():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def suites():
@@ -72,8 +95,8 @@ def main(argv):
 
     for name in picked:
         if name in NEEDS_FFMPEG and not ffmpeg_ok:
-            results.append((name, "SKIP", "没有 ffmpeg"))
-            print("  SKIP  %-32s 没有 ffmpeg" % name)
+            results.append((name, "SKIP", "没有能跑的 ffmpeg"))
+            print("  SKIP  %-32s 没有能跑的 ffmpeg" % name)
             continue
 
         start = time.time()
@@ -94,7 +117,20 @@ def main(argv):
             out = (p.stdout or b"").decode("utf-8", "replace")
             err = (p.stderr or b"").decode("utf-8", "replace")
             dt = time.time() - start
-            if p.returncode == 0:
+            # 77 = SKIP（automake 约定）。套件自己判「环境不满足」时用它，
+            # 而不是 exit(0) —— 后者会被这里记成 PASS，等于把「没测」说成「过了」。
+            if p.returncode == 77:
+                why = [l for l in out.splitlines() if l.startswith("SKIP")]
+                # 部分跳过：套件里**不需要**那个依赖的断言已经跑过并通过了。
+                # 把这些也算成「什么都没验」是另一种失真 —— 所以在这里点名条数，
+                # 但套件整体仍然记 SKIP（不能进「全绿」）。
+                npass = out.count("PASS ")
+                note = (why[-1][:120] if why else "套件自报跳过")
+                if npass:
+                    note += "（另有 %d 条已通过）" % npass
+                results.append((name, "SKIP", note))
+                print("  SKIP  %-32s %s" % (name, note[:90]))
+            elif p.returncode == 0:
                 results.append((name, "PASS", "%.1fs" % dt))
                 print("  PASS  %-32s %.1fs" % (name, dt))
             else:
@@ -119,6 +155,12 @@ def main(argv):
         % (len(passed), len(skipped), len(failed), total)
     )
     print("=" * 56)
+    if skipped:
+        # 跳过的**不是通过**。这句话必须打出来：否则「20/20」会被顺手读成
+        # 「20 套都验过了」，而实际有套件一条断言都没跑（2026-10-24 教训）。
+        print("  注意：跳过的 %d 套**没有验证任何东西**，别把上面那行读成全绿。" % len(skipped))
+        for name, status, info in skipped:
+            print("    SKIP %s: %s" % (name, info[:160]))
     if failed:
         for name, status, info in failed:
             print(" %s %s: %s" % (status, name, info))

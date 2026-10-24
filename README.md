@@ -349,8 +349,8 @@ media-sniffer/
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
 │   ├── range_parallel.test.js  Range 并发下载单测（14 项）
 │   ├── pattern_sync.test.js 扩展与宿主的正则同步校验（4 项）
-│   └── *.py                 宿主侧 Python 测试（20 套；含 errcode 码表 71 项、urllib 重试 29 项、
-│                             三路径收敛 44 项）
+│   └── *.py                 宿主侧 Python 测试（21 套；含 errcode 码表 71 项、urllib 重试 29 项、
+│                             三路径收敛 44 项、任务超时 27 项）
 ├── tools/
 │   ├── fuzz_host.py         变异/性质测试（喂畸形输入找边界 bug，见下）
 │   ├── live_check.mjs       真机取证（CDP 起真浏览器读扩展 storage / 渲染文案 / 下载记录 / 关 popup）

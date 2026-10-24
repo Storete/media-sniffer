@@ -76,7 +76,7 @@ node test/range_parallel.test.js
 node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（20 套，自动跳过缺 ffmpeg 的）
+# Python（21 套；缺「能跑的 ffmpeg」时相关套件自己报 SKIP=77）
 python test/run_all.py
 ```
 
@@ -164,7 +164,9 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 10 套主 JS + 20 套 Python 全绿（JS 全套 **995** 项），数字记进 `DEVLOG.md`
+- [ ] 12 套主 JS + 21 套 Python 全绿（JS 全套 **995** 项），数字记进 `DEVLOG.md`
+  —— **「跳过」不算「全绿」**：`run_all.py` 的汇总行会自己打这句提醒。套件内部跳过用
+  `sys.exit(77)`（automake 约定），**不要用 `exit(0)`**：那会被记成 PASS，等于把「没测」说成「过了」。
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

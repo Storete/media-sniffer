@@ -33,6 +33,7 @@ WORKER = os.path.join(HERE, "downloader.py")
 
 sys.path.insert(0, HERE)
 import library  # noqa: E402  统一的下载目录定位
+import errcode  # noqa: E402  错误码表（超时收尾要说同一张表上的话）
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MediaSniffer")
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
 
@@ -439,8 +440,38 @@ def reap_stale_files():
 
 
 
+_TOOL_RUNS = {}
+
+
+def tool_runs(path):
+    """**能启动才算「有」。** 与 downloader.tool_runs 同一个道理，各留一份因为
+    宿主和 worker 是两个进程。
+
+    为什么非要有这一步：`os.path.exists()` 对「文件在、但启动即崩」的 exe
+    一律返回 True。本机现场（2026-10-24）：项目目录被打上 Low Mandatory Level
+    标签后，bin/ffmpeg.exe 启动就 0xC0000409，但 do_ping 照样报告「ffmpeg 就绪」——
+    用户看到环境正常，点合并报一个空消息的退出码。**两端对同一件事的认知不一致，
+    比两端都错更难查。**
+    """
+    if path in _TOOL_RUNS:
+        return _TOOL_RUNS[path]
+    n = os.path.basename(path).lower()
+    arg = ["--version"] if (n.startswith("yt-dlp") or n.startswith("youtube-dl")) else ["-version"]
+    ok = False
+    try:
+        r = subprocess.run([path] + arg, capture_output=True, timeout=8,
+                           stdin=subprocess.DEVNULL,
+                           **({"creationflags": 0x08000000} if os.name == "nt" else {}))
+        out = (r.stdout or b"") + (r.stderr or b"")
+        ok = r.returncode == 0 and bool(out.strip())
+    except Exception:
+        ok = False
+    _TOOL_RUNS[path] = ok
+    return ok
+
+
 def find_tool(names):
-    """找可执行文件，按优先级：项目 bin/ → PATH → 几个常见包管理器目录。
+    """找**能用**的可执行文件：项目 bin/ → PATH → 几个常见包管理器目录。
 
     为什么项目 bin/ 排第一：ffmpeg/ffprobe 随项目分发，不依赖系统 PATH，
     也不需要用户装。C 盘上的 winget 目录排最后，避免误用别的版本。
@@ -451,11 +482,11 @@ def find_tool(names):
     for n in names:
         for cand in (n, n + ".exe"):
             p = os.path.join(project_bin, cand)
-            if os.path.exists(p):
+            if os.path.exists(p) and tool_runs(p):
                 return p
     for n in names:
         p = shutil.which(n)
-        if p:
+        if p and tool_runs(p):
             return p
     for base in [
         os.path.join(os.path.expanduser("~"), ".venvs", "agent-reach", "Scripts"),
@@ -465,7 +496,7 @@ def find_tool(names):
         for n in names:
             for cand in (n, n + ".exe"):
                 p = os.path.join(base, cand)
-                if os.path.exists(p):
+                if os.path.exists(p) and tool_runs(p):
                     return p
     return None
 
@@ -484,12 +515,46 @@ def read_status(job_id):
         return None
 
 
+def mark_timeout(job_id, seconds):
+    """把「宿主等超时了」写进状态文件，再通知扩展。
+
+    为什么非要写文件：宿主放弃轮询 ≠ 下载进程结束了。只 send 一条消息的话，
+    状态文件还停在 `downloading 37%`，用户下次打开 popup 看到的是「还在下」，
+    而宿主这边早就没人管它了 —— 两边对同一件事的认知不一致，是最难查的一类 bug
+    （d-055 的 err 断链就是同一个病）。
+
+    码用 JOB_TIMEOUT 而不是 NET_TIMEOUT：后者会让用户「再等等」，
+    而这儿的正确动作是「换一条地址」。
+    """
+    p = status_file(job_id)
+    cur = read_status(job_id) or {}
+    if cur.get("status") in ("done", "error", "cancelled"):
+        return cur.get("err") or "", cur.get("message") or ""
+    hours = seconds / 3600.0
+    detail = "等了 %.0f 小时仍未结束" % hours if hours >= 1 else "等了 %d 分钟仍未结束" % (seconds // 60)
+    msg = errcode.describe("JOB_TIMEOUT", detail)
+    cur.update({"status": "error", "err": "JOB_TIMEOUT", "message": msg,
+                "percent": cur.get("percent") or 0, "speed": "", "eta": ""})
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+    return "JOB_TIMEOUT", msg
+
+
 # ---------------------------------------------------------------- 任务轮询
 
 def poll_job(job_id):
     """轮询状态文件，有变化就推给扩展；进程结束后收尾"""
     last = None
-    deadline = time.time() + 6 * 3600
+    # 6 小时是给「大文件 + 慢站」留的余量。允许环境变量覆盖不是给用户用的，
+    # 是给测试用的：不可配的超时等于不可测的超时，而这条路径一旦写错，
+    # 用户看到的是「进度条永远停在 37%」。
+    deadline_secs = int(os.environ.get("MS_JOB_TIMEOUT") or 6 * 3600)
+    deadline = time.time() + deadline_secs
     while time.time() < deadline:
         st = read_status(job_id)
         if st:
@@ -534,7 +599,9 @@ def poll_job(job_id):
                       "trail": st.get("trail") or ""})
                 return
         time.sleep(0.4)
-    send({"id": job_id, "action": "error", "status": "error", "message": "任务超时"})
+    code, msg = mark_timeout(job_id, int(deadline_secs))
+    send({"id": job_id, "action": "error", "status": "error",
+          "err": code, "message": msg})
 
 
 # ---------------------------------------------------------------- 动作

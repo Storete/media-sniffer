@@ -266,22 +266,62 @@ PROJECT_BIN = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin"
 )
 
+# path -> 能不能启动。一次任务内只探一次：ffmpeg -version 约 60ms，
+# 但 run_hls_self 里要调好几次，不该每次都付。
+_TOOL_RUNS = {}
+
+
+def _probe_args(path):
+    """yt-dlp 只认 `--version`，ffmpeg/ffprobe 只认 `-version`。"""
+    n = os.path.basename(path).lower()
+    if n.startswith("yt-dlp") or n.startswith("youtube-dl"):
+        return ["--version"]
+    return ["-version"]
+
+
+def tool_runs(path):
+    """**能启动才算「有」。**
+
+    这一条是拿真机现场换来的（2026-10-24）：本机项目目录被打了
+    `Mandatory Label\\Low Mandatory Level` 标签，里面的 `ffmpeg.exe`
+    一启动就 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN）直接崩掉 ——
+    而 `os.path.exists()` 高高兴兴返回 True。
+
+    结果是合并任务报出「ffmpeg 退出码 3221226505，输出为空」：用户完全看不懂，
+    我们也查不到（错误输出一个字都没有）。**存在性检查会骗人，可执行性不会。**
+    """
+    if path in _TOOL_RUNS:
+        return _TOOL_RUNS[path]
+    ok = False
+    try:
+        r = subprocess.run([path] + _probe_args(path), capture_output=True,
+                           timeout=8, stdin=subprocess.DEVNULL, **_NO_WINDOW)
+        # 只看「有没有正常打印版本」：有的构建 -version 写 stderr（老 ffmpeg），
+        # 有的工具退出码非 0 但确实可用，所以两个流一起看。
+        out = (r.stdout or b"") + (r.stderr or b"")
+        ok = r.returncode == 0 and bool(out.strip())
+    except Exception:
+        ok = False
+    _TOOL_RUNS[path] = ok
+    return ok
+
 
 def find_tool(names):
     """三级查找：项目 bin/ → 系统 PATH → 常见包管理器目录。
 
-    与 sniffer_host.find_tool 逻辑一致（宿主和 worker 是不同进程，
-    不能共用模块级函数，只能各留一份）。
+    每个候选都要过 `tool_runs`：**找不到和跑不起来是同一件事**
+    （对调用方都是「没有可用的 ffmpeg」），但对用户要说成 MISSING_DEP，
+    而不是把一个看不懂的退出码丢给他。
     """
     # 优先用项目自带的 bin/（随插件一起分发，不依赖系统 PATH 和 C 盘）
     for n in names:
         for cand in (n, n + ".exe"):
             p = os.path.join(PROJECT_BIN, cand)
-            if os.path.exists(p):
+            if os.path.exists(p) and tool_runs(p):
                 return p
     for n in names:
         p = shutil.which(n)
-        if p:
+        if p and tool_runs(p):
             return p
     for base in [
         os.path.join(os.path.expanduser("~"), ".venvs", "agent-reach", "Scripts"),
@@ -291,7 +331,7 @@ def find_tool(names):
         for n in names:
             for cand in (n, n + ".exe"):
                 p = os.path.join(base, cand)
-                if os.path.exists(p):
+                if os.path.exists(p) and tool_runs(p):
                     return p
     return None
 
@@ -1572,14 +1612,25 @@ def run_merge(job):
     video, audio = job.get("video") or "", job.get("audio") or ""
     for p in (video, audio):
         if not (os.path.isfile(p) and os.path.getsize(p) > 0):
-            write_status(job_id, status="error",
-                         message=f"输入文件不存在或为空: {p}")
+            # 双流合并只有一种成立条件：两条流都在。少一条时用户看到的
+            # 「合并失败」其实不是合并的问题，是上一步没下全 —— 码用
+            # VERIFY_MISMATCH（产物不完整），建议覆盖成「重新下载」。
+            # 表里那句「再点一次会重试」在这里是错的：合并任务没有 URL，
+            # 再点一次还是同一对（缺一条的）文件。
+            _give_up(job_id, "VERIFY_MISMATCH",
+                     "音视频流文件缺一个或为空：%s" % os.path.basename(p),
+                     act="回页面重新下这条视频，两条流都下完才能合并。")
             return
 
     ffmpeg = find_tool(["ffmpeg"])
     if not ffmpeg:
-        write_status(job_id, status="error",
-                     message="找不到 ffmpeg（项目 bin/ 目录缺失？）")
+        # 「没有」和「有但跑不起来」对用户是同一件事（都合不了），
+        # 但对我们完全不同：前者是用户杀软删了 bin/，后者是这个 exe 本身
+        # 起不来。detail 里点明是哪种，别再让人猜。
+        hit = os.path.join(PROJECT_BIN, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+        _give_up(job_id, "MISSING_DEP",
+                 "bin/ 里那个 ffmpeg 启动即崩，不是缺文件" if os.path.exists(hit)
+                 else "项目 bin/ 里没有 ffmpeg")
         return
     ffprobe = find_tool(["ffprobe"])
     duration = probe_duration(ffprobe, video) if ffprobe else 0.0
@@ -1593,7 +1644,7 @@ def run_merge(job):
         out = os.path.join(outdir, f"{root} ({n}){ext}")
         n += 1
 
-    write_status(job_id, status="merging", percent=0, message="合并音视频", file=out)
+    write_status(job_id, status="merging", percent=0, err="", message="合并音视频", file=out)
 
     cmd = [
         ffmpeg, "-y",
@@ -1664,10 +1715,12 @@ def run_merge(job):
                     os.remove(out)
                 except OSError:
                     pass
-                write_status(job_id, status="cancelled", message="用户取消合并")
+                write_status(job_id, status="cancelled", err="", message="用户取消合并")
                 return
     except Exception as e:
-        write_status(job_id, status="error", message=("读取合并输出失败: " + str(e))[:300])
+        # 读 ffmpeg 的 stdout 失败，通常是管道被异常关闭 —— 分类交给码表，
+        # 但保留原文：这条路径的异常种类不明，detail 是唯一线索。
+        _give_up(job_id, errcode.classify_exc(e), ("读取合并输出失败: " + str(e))[:200])
         proc.terminate()
         return
 
@@ -1680,11 +1733,18 @@ def run_merge(job):
             except OSError:
                 pass
         write_status(job_id, status="done", percent=100, speed="", eta="",
-                     file=out, message="已合并为单文件")
+                     file=out, err="", message="已合并为单文件")
     else:
-        msg = " | ".join(err_tail[-8:]) or ("ffmpeg 退出码 %s" % proc.returncode)
-        write_status(job_id, status="error",
-                     message=("合并失败，视频/音频两个源文件已保留: " + msg)[:600])
+        tail = " ".join(err_tail[-4:])
+        # 先看 ffmpeg 那句尾巴能不能对上已知原因（磁盘满 / 编码不支持）；
+        # 对不上就是容器层面的搬流失败，归 CODEC_UNSUPPORTED —— 这一路
+        # 只做 `-c copy`，不做重编码，失败原因几乎总是「这两条流的封装合不到一起」。
+        code = errcode.classify_ytdlp(tail) if tail else errcode.INTERNAL
+        if code in (errcode.INTERNAL, "NET_TIMEOUT", "NET_DNS"):
+            code = "CODEC_UNSUPPORTED"
+        _give_up(job_id, code,
+                 ("ffmpeg 退出码 %s：%s" % (proc.returncode, _short(tail, 160))).strip("："),
+                 act="视频/音频两个源文件已保留在下载目录，可以换播放器或用别的工具合。")
 
 
 MEDIA_EXT = re.compile(
@@ -1711,6 +1771,11 @@ def main():
 
         # 相对地址（Telegram 的 /a/progressive/document…、blob:、data:）外部进程根本取不到：
         # yt-dlp 会把它当网页去爬，然后报 HTTP 302。这种一律交回页面保存。
+        #
+        # **这条刻意不进码表**（T-B6 时特意确认过）：它不是「失败原因」，
+        # 而是「这条地址不该被派给外部下载器」—— 属于路由判断。等 T-C5 的规划表
+        # 建好，这类地址在 popup 里就不该出现「下载到本地」按钮，连踩都踩不到。
+        # 在路由修好之前留一句话，比给它编一个码更诚实。
         url = (job.get("url") or "").strip()
         if not re.match(r"^https?://", url, re.I):
             write_status(

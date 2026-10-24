@@ -37,20 +37,26 @@ def check(name, cond, extra=""):
 # ---------------------------------------------------------------- 1. 码表完整性
 print("[1] 码表：承诺的码一个都不能少")
 
-# PRODUCT-PLAN 原来的 12 码。**HTTP_429 是后来补的**：原案里根本没有限速码，
-# 而 429 恰恰是最常见的失败（ENGINE-EVAL §4-P0 实测吃到过）。缺它的话
-# 「站点在限速」只能落进 NET_TIMEOUT，用户看到「连接超时」就不停重试，越试越被封。
+# PRODUCT-PLAN 原来的 12 码，后来补了三个，各有各的现场：
+#   · HTTP_429    原案没有限速码，而 429 是唯一在自家机器上撞见过的失败
+#                 （ENGINE-EVAL §4-P0）。缺它 →「站点在限速」落进 NET_TIMEOUT
+#                 → 用户看到「连接超时」→ 立刻再点 → 被限得更狠。
+#   · MISSING_DEP 缺 ffmpeg / yt-dlp。落 INTERNAL 等于把「你没装东西」说成
+#                 「我们写错了」，用户会来报 bug 而不是去装。
+#   · JOB_TIMEOUT 宿主 6 小时没等到终点。落 NET_TIMEOUT 等于把「任务卡死」
+#                 说成「网络慢」，用户会一直重试同一条地址。
+# 三个都是**可预见、会真实发生、且动作唯一**的失败，不是分类洁癖。
 PROMISED = [
     "NET_DNS", "NET_TIMEOUT", "HTTP_403", "HTTP_404",
     "TOKEN_EXPIRED", "SEGMENT_GAP", "INIT_MISSING", "CODEC_UNSUPPORTED",
     "DRM_PROTECTED", "AUTH_REQUIRED", "DISK_FULL", "VERIFY_MISMATCH",
-    "HTTP_429",
+    "HTTP_429", "MISSING_DEP", "JOB_TIMEOUT",
 ]
 
 missing = [c for c in PROMISED if c not in E.CODES]
-check("承诺的 13 个码全在表里", not missing, missing)
-check("表里的码数 = 13 + 1（多出来的只许是兜底桶）",
-      len(E.CODES) == 14 and E.INTERNAL in E.CODES,
+check("承诺的 15 个码全在表里", not missing, missing)
+check("表里的码数 = 15 + 1（多出来的只许是兜底桶）",
+      len(E.CODES) == 16 and E.INTERNAL in E.CODES,
       [c for c in E.CODES if c not in PROMISED])
 
 bad_spec = []
@@ -64,7 +70,10 @@ for code in PROMISED:
 check("每个码都带 phase/retryable/attempts/backoff/say/act", not bad_spec, bad_spec)
 
 phases = sorted({E.CODES[c]["phase"] for c in PROMISED})
-check("阶段值都在约定的集合里", set(phases) <= {"connect", "transfer", "write", "verify"}, phases)
+# setup 是 1.3.50 加的：缺依赖不是「连不上/传不动/写不进/验不过」里的任何一件事，
+# 它发生在下载开始之前。硬塞进四个老阶段会让「阶段」这个词失去意义。
+check("阶段值都在约定的集合里",
+      set(phases) <= {"setup", "connect", "transfer", "write", "verify"}, phases)
 
 
 # ---------------------------------------------------------------- 2. describe 文案

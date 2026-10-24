@@ -10,7 +10,7 @@
 
 本模块的约定（与 `docs/PRODUCT-PLAN.md` 的 L2-c 一致）：
 
-  · **13 个码**，每个带「阶段 / 能不能重试 / 重试几次 / 隔多久 / 一句原因 / 一句建议」；
+  · **15 个码**，每个带「阶段 / 能不能重试 / 重试几次 / 隔多久 / 一句原因 / 一句建议」；
   · **重试预算写在码表里**，不散落在 if 里 —— 这样「第几次开始降级」不是黑箱，
     而是这张表上的一个数字；
   · 重试对用户**可见**：每次重试前写一条 message（`retry_note`），不静默重试。
@@ -24,6 +24,19 @@
 > 缺了它，「站点在限速」只能落进 `NET_TIMEOUT` → 用户看到「连接超时」，
 > 于是不停重试，越重试越被封。**码表是按真实失败场景列的，不是凑数**，
 > 所以补 `HTTP_429`，总数 13。数字改了，承诺没改。
+>
+> 为什么又是 15
+> ------------
+> 1.3.50（T-B6）把第四、第五条路径接进码表时，发现两种失败原来只能落进
+> `INTERNAL` 或 `NET_TIMEOUT`，而两者的**用户动作完全不同**：
+>
+> · `MISSING_DEP`：缺 ffmpeg / yt-dlp。落 `INTERNAL` 等于把「你没装东西」
+>   说成「我们写错了」，用户会来报 bug 而不是去装。合并双流时这是**最常见**的失败。
+> · `JOB_TIMEOUT`：宿主轮询 6 小时仍未结束。落 `NET_TIMEOUT` 等于把
+>   「这个任务卡死了」说成「网络慢」，用户会一直重试同一条地址。
+>
+> 两个都是**可预见、会真实发生、且动作唯一**的失败，不是「分类洁癖」。
+> 所以 13 → 15，仍然按场景列。
 
 几个刻意的取舍
 --------------
@@ -33,7 +46,7 @@
    需要代理都归它。URLError 的本质都是「包没送出去」，对用户的动作也一样。
 3. 表外的状态码**原样保留**成 `HTTP_<code>`，不塞进一个 `HTTP_OTHER`：
    诊断包里那个数字是唯一能查到原因的东西，合并掉就再也查不到了。
-4. `INTERNAL` 是**兜底桶，不属于对用户承诺的 13 个原因**。它出现就代表分类器
+4. `INTERNAL` 是**兜底桶，不属于对用户承诺的 15 个原因**。它出现就代表分类器
    漏了一种异常 —— 所以测试里专门断言「已知异常不许落进 INTERNAL」。
    单独成一类而不是混进 NET_TIMEOUT，就是为了让这个信号不被掩盖。
 """
@@ -127,6 +140,20 @@ CODES = {
         phase="verify", retryable=False, attempts=1, backoff=0.0,
         say="文件不完整或内容不对",
         act="再点一次会重试；反复这样换一条地址。",
+    ),
+    # 依赖缺失：用户要动手装东西，和自己的下载行为无关。
+    # 单独成码的理由见模块开头「为什么又是 15」—— 落 INTERNAL 会让人以为是我们的 bug。
+    "MISSING_DEP": dict(
+        phase="setup", retryable=False, attempts=1, backoff=0.0,
+        say="本机缺少必需的程序（ffmpeg / yt-dlp）",
+        act="装好后重新点下载；插件自带的 bin/ 目录别删。",
+    ),
+    # 任务级超时：宿主最多等 6 小时。这不是网络波动，是这个任务卡住了 ——
+    # 用户该做的是「换一条地址」而不是「再等等」。
+    "JOB_TIMEOUT": dict(
+        phase="transfer", retryable=True, attempts=2, backoff=2.0,
+        say="这个任务跑了太久还没结束",
+        act="重开一次；反复这样说明这一站的分片太慢，换一条地址。",
     ),
     # ---- 兜底（不属于 12 码）
     INTERNAL: dict(
@@ -255,9 +282,10 @@ def classify_ytdlp(text):
 # 例：DRM 保护比 403 更具体（403 可以刷新页面重来，DRM 永远放不了）；
 # INTERNAL 永远垫底 —— 它是「我们没认出」，不该盖住别人给出的真原因。
 _PRIORITY = [
-    "DRM_PROTECTED", "AUTH_REQUIRED", "CODEC_UNSUPPORTED", "TOKEN_EXPIRED",
+    "DRM_PROTECTED", "AUTH_REQUIRED", "CODEC_UNSUPPORTED", "MISSING_DEP",
+    "TOKEN_EXPIRED",
     "HTTP_403", "HTTP_404", "SEGMENT_GAP", "DISK_FULL", "VERIFY_MISMATCH",
-    "HTTP_429", "NET_TIMEOUT", "NET_DNS", INTERNAL,
+    "JOB_TIMEOUT", "HTTP_429", "NET_TIMEOUT", "NET_DNS", INTERNAL,
 ]
 
 

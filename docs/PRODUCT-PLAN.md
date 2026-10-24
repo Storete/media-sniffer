@@ -136,18 +136,26 @@ planDownload(session) -> {
 
 任一层不过 → 输出明确错误码，**绝不把坏文件当成功**。这条直接治「下完了打不开」。
 
-**L2-c 错误码字典**（**13 个**，每个带阶段/可恢复性/重试预算/用户可读建议）：
+**L2-c 错误码字典**（**15 个**，每个带阶段/可恢复性/重试预算/用户可读建议）：
 
 ```
 NET_DNS  NET_TIMEOUT  HTTP_403  HTTP_404        HTTP_429
 TOKEN_EXPIRED  SEGMENT_GAP  INIT_MISSING  CODEC_UNSUPPORTED
 DRM_PROTECTED  AUTH_REQUIRED  DISK_FULL  VERIFY_MISMATCH
+MISSING_DEP  JOB_TIMEOUT
 ```
 
-> **为什么从 12 变 13**：原案里没有 `HTTP_429`，而它恰恰是最常见的失败 ——
-> 2026-10-24 量多连接吞吐时 `proof.ovh.net` 单连接正常、4 连接那轮直接吃 429
-> （`ENGINE-EVAL.md` §4-P0）。缺这个码，「站点在限速」只能落进 `NET_TIMEOUT`，
-> 用户看到「连接超时」就不停重试，越试越被封。**码表按真实失败场景列，不凑数**。
+> **为什么从 12 一路加到 15**：每次加都是被一次真实失败推着加的，不是凑数。
+>
+> · `HTTP_429`（1.3.48）：原案没有限速码。2026-10-24 量多连接吞吐时
+>   `proof.ovh.net` 单连接正常、4 连接那轮直接吃 429（`ENGINE-EVAL.md` §4-P0）。
+>   缺它 →「站点在限速」落进 `NET_TIMEOUT` → 用户看到「连接超时」→ 立刻再点
+>   → 被限得更狠。**分类错了，用户的下一步动作就错了。**
+> · `MISSING_DEP`（1.3.50）：缺 ffmpeg / yt-dlp。落 `INTERNAL` 等于把
+>   「你没装东西」说成「我们写错了」，用户会来报 bug 而不是去装。
+>   合并双流时这是最常见的失败。
+> · `JOB_TIMEOUT`（1.3.50）：宿主最多等 6 小时。落 `NET_TIMEOUT` 等于把
+>   「这个任务卡死了」说成「网络慢」，用户会一直重试同一条地址。
 >
 > 另有 `INTERNAL` 是**分类器的兜底桶，不属于对用户承诺的原因**：它出现就代表
 > 我们漏了一种异常，测试里专门断言「已知异常不许落进 INTERNAL」。
@@ -160,11 +168,14 @@ DRM_PROTECTED  AUTH_REQUIRED  DISK_FULL  VERIFY_MISMATCH
 （`attempts` / `backoff`），不散在 `if` 里 —— 「第几次开始降级」必须是表上的一个数字。
 重试对用户**可见**（每次重试前写一条 message），不做静默重试。
 
-**验收**：13 个码每个至少一条测试路径；人为制造 3 种失败（断网 / 删一个分片 / 塞 DRM 清单），popup 显示对应建议。
+**验收**：15 个码每个至少一条测试路径；人为制造 3 种失败（断网 / 删一个分片 / 塞 DRM 清单），popup 显示对应建议。
 已做部分：HTTP 路径全部接线（429 重试、403 不重试、5xx 重试、Retry-After 夹取），
 HLS / yt-dlp 两条路径 1.3.49 已接完（T-B5 / P3'）：
 「同一个原因 → 同一个码 → 同一句话」，三条路的话**逐字相同**；
 三条都失败时对外只留最具体的那一个码一句话，三句原话进 `trail` 给诊断包。
+第五个入口（`run_merge` 双流合并）与宿主 6 小时超时 1.3.50 也接完了（T-B6）：
+合并失败按 ffmpeg 尾巴分类（对不上就 `CODEC_UNSUPPORTED`，因为这一路只做 `-c copy`），
+缺 ffmpeg 是 `MISSING_DEP`，超时是 `JOB_TIMEOUT` 且**同步改状态文件**。
 
 ---
 

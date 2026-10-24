@@ -2,13 +2,19 @@
 # -*- coding: utf-8 -*-
 """离线自测：B 站「下载完自动合并」的宿主侧链路。
 
-覆盖两层：
-  1. sniffer_host.py 的 msfile_merge 动作——路径校验（只允许文件存放处里的文件、
-     输入必须存在且非空）、job 文件 / 状态文件是否正确建立（worker 真的被拉起）。
-  2. downloader.py 的 run_merge——用真实 ffmpeg 把「视频-only mp4 + 音频 m4a」
-     合成一个双流 mp4，成功后删除两条源流；输入缺失时给出可读错误且不删源流。
+覆盖三层：
+  A. **不需要 ffmpeg 也能验的部分**（2026-10-24 重排：原来这些被 ffmpeg 的
+     SKIP 一起带走了，等于本机 ffmpeg 一坏就什么都验不到）
+       · 输入缺失 → `VERIFY_MISMATCH`，且建议被覆盖成「重新下载」
+       · 缺 ffmpeg → `MISSING_DEP`（不是 INTERNAL：让用户去装东西）
+       · `tool_runs()`：存在但启动即崩的 exe 必须判「没有」
+  B. run_merge 真实合并（要有能跑的 ffmpeg）：视频-only + 音频-only → 双流 mp4，
+     成功后删两条源流；搬流失败保留源流并给 CODEC_UNSUPPORTED。
+  C. sniffer_host.py 的 msfile_merge 动作——路径校验（只允许文件存放处里的文件、
+     输入必须存在且非空）、job/状态文件是否正确建立（worker 真的被拉起）。
 
 用法： python test/host_merge_test.py
+     退出码 0=全过  1=有失败  77=环境不满足（没 ffmpeg），A 段已跑过
 """
 import json
 import os
@@ -66,15 +72,20 @@ def read_status(jid):
         return {}
 
 
+def place(name, content=b"x"):
+    p = os.path.join(TMP, name)
+    with open(p, "wb") as f:
+        f.write(content)
+    return p
+
+
 def make_streams(dirpath):
-    """用项目自带的 ffmpeg 造两段 1 秒的测试流，返回 (video, audio, ffmpeg) 路径。"""
+    """用项目自带的 ffmpeg 造两段 1 秒的测试流；ffmpeg 不可用时返回 (None, None, None)。"""
     ffmpeg = D.find_tool(["ffmpeg"])
     if not ffmpeg:
-        print("SKIP 没找到 ffmpeg，跑不了真实合并（bin/ 目录缺失？）")
-        sys.exit(0)
+        return None, None, None
     video = os.path.join(dirpath, "t-video.mp4")
     audio = os.path.join(dirpath, "t-audio.m4a")
-    # POSIX 上传 creationflags 会 ValueError，只有 Windows 需要
     cf = _no_window()
 
     def make_video(codec):
@@ -89,9 +100,8 @@ def make_streams(dirpath):
     if r.returncode != 0:
         r = make_video("mpeg4")
     if r.returncode != 0:
-        print("SKIP ffmpeg 没有可用的视频编码器（libx264/mpeg4 都失败）")
-        print((r.stderr or b"")[-400:].decode("utf-8", "replace"))
-        sys.exit(0)
+        print("（ffmpeg 没有可用视频编码器，B/C 段会跳过）")
+        return None, None, None
 
     subprocess.run(
         [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
@@ -111,16 +121,78 @@ def probe_streams(ffprobe, path):
     return [s.get("codec_type") for s in data.get("streams", [])]
 
 
-# ---------------------------------------------------------------- 1) run_merge 真实合并
+# ================================================================ A. 不需要 ffmpeg
 
-print("[1] run_merge：真实 ffmpeg 合并")
+print("[A1] 输入缺失 → VERIFY_MISMATCH（建议覆盖成「重新下载」）")
+keep = place("keep.m4a", b"placeholder")
+D.run_merge({"id": "merge-missing", "mode": "merge",
+             "video": os.path.join(TMP, "不存在-video.mp4"), "audio": keep, "outdir": TMP})
+st2 = read_status("merge-missing")
+check("状态转为 error", st2.get("status") == "error", st2)
+check("错误信息可读", "不存在" in (st2.get("message") or ""), st2.get("message"))
+check("没碰另一条源流", os.path.exists(keep))
+os.remove(keep)
+# 「少一条流」不是合并的问题，是上一步没下全 → VERIFY_MISMATCH，
+# 但建议必须覆盖：表里那句「再点一次会重试」在这里是错的（合并任务没有 URL，
+# 再点一次还是同一对缺一条的文件）。
+check("缺流 → 码是 VERIFY_MISMATCH", st2.get("err") == "VERIFY_MISMATCH", st2.get("err"))
+check("缺流 → 建议是「重新下载」不是「再点一次会重试」",
+      "重新下" in (st2.get("message") or "") and "会重试" not in (st2.get("message") or ""),
+      st2.get("message"))
+
+print("[A2] 缺 ffmpeg → MISSING_DEP（不是 INTERNAL）")
+_real_find = D.find_tool
+D.find_tool = lambda names: None if "ffmpeg" in names else _real_find(names)
+nf_v = place("nf-v.mp4")
+nf_a = place("nf-a.m4a")
+try:
+    D.run_merge({"id": "merge-noffmpeg", "mode": "merge",
+                 "video": nf_v, "audio": nf_a, "outdir": TMP})
+    st_nf = read_status("merge-noffmpeg")
+    check("缺 ffmpeg → 码是 MISSING_DEP", st_nf.get("err") == "MISSING_DEP", st_nf)
+    check("缺 ffmpeg → 文案告诉用户去装，不出现英文异常",
+          "ffmpeg" in (st_nf.get("message") or "") and "Error" not in (st_nf.get("message") or ""),
+          st_nf.get("message"))
+    check("缺 ffmpeg → detail 说清是「启动即崩」还是「缺文件」",
+          ("启动即崩" in (st_nf.get("message") or "")) or ("没有 ffmpeg" in (st_nf.get("message") or "")),
+          st_nf.get("message"))
+    check("缺 ffmpeg → 两条源流都留着（没白删）",
+          os.path.exists(nf_v) and os.path.exists(nf_a), None)
+finally:
+    D.find_tool = _real_find
+
+print("[A3] tool_runs：存在但启动即崩 == 没有")
+# 造一个「看起来像 exe、其实是垃圾字节」的文件。os.path.exists 会对它说 True，
+# 这就是本机 2026-10-24 的现场：项目目录被打了 Low Mandatory Level 标签后，
+# bin/ffmpeg.exe 启动即 0xC0000409，而存在性检查高高兴兴放行，
+# 最后报给用户的是「ffmpeg 退出码 3221226505，输出为空」。
+junk = place("junk.exe", b"MZ" + b"\x00" * 200)
+D._TOOL_RUNS.pop(junk, None)
+check("垃圾 exe：exists 说在", os.path.exists(junk))
+check("垃圾 exe：tool_runs 说跑不起来", D.tool_runs(junk) is False)
+check("探测结果被缓存（第二次不再起进程）", junk in D._TOOL_RUNS)
+
+real_ffmpeg = D.find_tool(["ffmpeg"])
+check("本机 ffmpeg：find_tool 的结论与 tool_runs 一致",
+      (real_ffmpeg is not None) == (bool(D.tool_runs(real_ffmpeg)) if real_ffmpeg else False),
+      real_ffmpeg)
+
+# ================================================================ B. 需要真实 ffmpeg
+
 video, audio, ffmpeg = make_streams(TMP)
+if not ffmpeg:
+    # 退出码 77 = SKIP（automake 约定）。**不能用 0**：run_all 把 0 记成 PASS，
+    # 「一条断言都没跑」的套件就会出现在「N/N 通过」里（2026-10-24 教训）。
+    print("SKIP B/C 段需要能跑的 ffmpeg；A 段已跑完（上面的 PASS 是真的）")
+    print("RESULT:", "A 段通过，B/C 段未验" if ok else "HAS FAILURES")
+    sys.exit(77 if ok else 1)
+
+print("[B1] run_merge：真实 ffmpeg 合并")
 ffprobe = D.find_tool(["ffprobe"])
 check("测试前置：两条源流都在", os.path.getsize(video) > 0 and os.path.getsize(audio) > 0)
 
-job = {"id": "merge-ok", "mode": "merge", "video": video, "audio": audio,
-       "out": "合并成功案例", "outdir": TMP}
-D.run_merge(job)
+D.run_merge({"id": "merge-ok", "mode": "merge", "video": video, "audio": audio,
+             "out": "合并成功案例", "outdir": TMP})
 st = read_status("merge-ok")
 merged = st.get("file") or ""
 check("状态转为 done", st.get("status") == "done", st)
@@ -131,25 +203,29 @@ if ffprobe and merged:
     check("产物含视频流", "video" in kinds, kinds)
     check("产物含音频流", "audio" in kinds, kinds)
 check("成功后删除两条源流", not os.path.exists(video) and not os.path.exists(audio))
+check("成功时 err 被清空（不残留上一步的码）", st.get("err") in ("", None), st.get("err"))
 
-# ---------------------------------------------------------------- 2) run_merge 输入缺失
+print("[B2] 搬流失败（输入不是媒体）→ CODEC_UNSUPPORTED，源流都留着")
+bad_v = place("bad-v.mp4", b"this is not a video at all\n" * 50)
+v_ok, a_ok, _ = make_streams(TMP)
+if v_ok and a_ok:
+    D.run_merge({"id": "merge-badcodec", "mode": "merge", "video": bad_v,
+                 "audio": a_ok, "out": "坏输入", "outdir": TMP})
+    st_bad = read_status("merge-badcodec")
+    check("搬流失败 → 码是 CODEC_UNSUPPORTED", st_bad.get("err") == "CODEC_UNSUPPORTED", st_bad)
+    check("搬流失败 → 保留了 ffmpeg 的原话（诊断用）",
+          "ffmpeg" in (st_bad.get("message") or ""), st_bad.get("message"))
+    check("搬流失败 → 两条源流都留着（没白下）",
+          os.path.exists(bad_v) and os.path.exists(v_ok), None)
+    for p in (bad_v, v_ok, a_ok):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
-print("[2] run_merge：输入缺失")
-# 第 1 段成功时把两条源流都删了；这里造个占位文件当「不该被碰的输入」
-keep = os.path.join(TMP, "keep.m4a")
-open(keep, "wb").write(b"placeholder")
-job2 = {"id": "merge-missing", "mode": "merge",
-        "video": os.path.join(TMP, "不存在-video.mp4"), "audio": keep, "outdir": TMP}
-D.run_merge(job2)
-st2 = read_status("merge-missing")
-check("状态转为 error", st2.get("status") == "error", st2)
-check("错误信息可读", "不存在" in (st2.get("message") or ""), st2.get("message"))
-check("没碰另一条源流", os.path.exists(keep))
-os.remove(keep)  # 清场，别影响下一段
+# ================================================================ C. msfile_merge
 
-# ---------------------------------------------------------------- 3) msfile_merge 路径校验
-
-print("[3] msfile_merge：路径校验（起一个真宿主进程喂协议帧）")
+print("[C] msfile_merge：路径校验（起一个真宿主进程喂协议帧）")
 proc = subprocess.Popen(
     [PY, "-c",
      "import sys; sys.path.insert(0, r'%s'); import sniffer_host as h; "
