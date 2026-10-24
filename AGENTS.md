@@ -76,7 +76,7 @@ node test/range_parallel.test.js
 node test/session_model.test.js
 node test/site_registry.test.js
 
-# Python（16 套，自动跳过缺 ffmpeg 的）
+# Python（17 套，自动跳过缺 ffmpeg 的）
 python test/run_all.py
 ```
 
@@ -157,7 +157,7 @@ python test/run_all.py
 
 - [ ] 改动的每个行为都有对应测试，且测试名写明期望
 - [ ] `node --check` 全部 JS 文件通过
-- [ ] 10 套主 JS + 16 套 Python 全绿（全套 **952** 项，口径：各套件汇总行的「N 通过」求和），数字记进 `DEVLOG.md`
+- [ ] 10 套主 JS + 17 套 Python 全绿（JS 全套 **952** 项，口径：各套件汇总行的「N 通过」求和），数字记进 `DEVLOG.md`
 - [ ] 验收记录按 `docs/ACCEPTANCE.md` 的模板写，含「未做」一节
 - [ ] 有一把不依赖自己断言的尺子（`git diff` 结构证据 / 真实数据回放 / 反向验证三选一）
 - [ ] `DEVLOG.md` 有 `#d-NNN` 新条目 + 索引行

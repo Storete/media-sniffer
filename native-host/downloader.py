@@ -667,6 +667,115 @@ def ytdlp_header_args(job):
 
 # ---------------------------------------------------------------- 普通文件路径
 
+# ---- 断点指纹（P1，2026-10-24）--------------------------------------------
+#
+# 为什么要它：续传原来只认 `.part` 的**长度**。长度对得上就接着写 —— 可这期间
+# 服务端完全可能换了内容（视频重新转码、CDN 换切片、签名直链换批次）。拼出来的
+# 是「前半段 A + 后半段 B」，而 **ffprobe 往往还能打开**，于是验证层会放它过去。
+# 这是「错并且不自知」，比慢一百倍都严重，所以修它排在提速前面
+# （`docs/ENGINE-EVAL.md` §4-P1）。
+#
+# 存三样：`ETag` / `Last-Modified` / 总长度。任一变化就**作废 `.part` 整单重下**，
+# 不试图续 —— 续错的代价远大于重下的时间。
+PART_META_SUFFIX = ".part.meta"
+
+
+def _parse_content_range_total(value):
+    """'bytes 100-999/1000' → 1000。总长是 '*' 或格式不对 → 0。"""
+    m = re.search(r"/\s*(\d+)\s*$", str(value or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _resp_total(resp, resumed):
+    """这条响应对应的**整份文件**长度（不是本次要传的字节数）。
+
+    206 的 `Content-Length` 只算「剩下的那截」，直接用会让进度条从 90% 跳回 10%；
+    优先用 `Content-Range` 里的总数，没有才退回 `Content-Length + 已下长度`。
+    """
+    cl = int(resp.headers.get("Content-Length") or 0)
+    if resp.status == 206:
+        tot = _parse_content_range_total(resp.headers.get("Content-Range"))
+        if tot:
+            return tot
+        return (cl + resumed) if cl else 0
+    return cl
+
+
+def _norm_etag(v):
+    """`W/"abc"` 与 `"abc"` 是同一内容的强弱标记差别，不是内容变了。
+    不剥掉 `W/` 会让「服务器今天改成弱校验」被误判成换文件，白下一次。"""
+    v = (v or "").strip()
+    return v[2:].strip() if v[:2].upper() == "W/" else v
+
+
+def fingerprint_of(resp, total, url=""):
+    return {
+        "etag": (resp.headers.get("ETag") or "").strip(),
+        "lm": (resp.headers.get("Last-Modified") or "").strip(),
+        "len": int(total or 0),
+        "url": url or "",
+    }
+
+
+def fingerprint_mismatch(old, new):
+    """返回「不能续传」的人话原因；空串 = 可以续。
+
+    判据强弱：长度 > ETag > Last-Modified。
+    三项都拿不到时**允许续传**：绝大多数 CDN 分片和签名直链不给校验头，
+    一律拒绝续传等于把它们变成「每次断了都从 0 开始」——那比冒险更糟。
+    """
+    if not isinstance(old, dict):
+        return ""
+    olen, nlen = int(old.get("len") or 0), int(new.get("len") or 0)
+    if olen and nlen and olen != nlen:
+        return "文件长度从 %d 变成 %d" % (olen, nlen)
+    oet, net = _norm_etag(old.get("etag")), _norm_etag(new.get("etag"))
+    if oet and net and oet != net:
+        return "ETag 变了（%s → %s）" % (oet[:40], net[:40])
+    olm, nlm = (old.get("lm") or "").strip(), (new.get("lm") or "").strip()
+    if olm and nlm and olm != nlm:
+        return "Last-Modified 变了（%s → %s）" % (olm[:40], nlm[:40])
+    return ""
+
+
+def read_part_meta(part):
+    try:
+        with open(part + PART_META_SUFFIX, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def write_part_meta(part, meta):
+    """指纹写失败**不能**让下载失败：它只决定「下次能不能安全续传」。"""
+    p = part + PART_META_SUFFIX
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def drop_part_meta(part):
+    for p in (part + PART_META_SUFFIX, part + PART_META_SUFFIX + ".tmp"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _fmt_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "%.1f GB" % n
+
+
 def run_urllib(job):
     """自己发 HTTP 下直链。相比 yt-dlp 的好处：完全可控、支持断点续传、
     没有「把 URL 当网页爬」的误判。
@@ -675,6 +784,10 @@ def run_urllib(job):
       · 重跑时看到 .part 就带 `Range: bytes=<已有长度>-` 继续
       · 服务器回 206 才追加；回 200 说明对方不支持 Range（可能整个重发），
         必须 wb 重写，否则拼接出来是坏的
+      · **续传前先比指纹**（见文件上方 PART_META_SUFFIX 的说明）：ETag /
+        Last-Modified / 总长任一变化 → 作废 `.part` 从头下，绝不拼两份内容
+      · 只有「收到的字节数 == 总长」才算完成，提前 EOF 判失败并**保留** `.part`
+        （原来会 `break` 出去然后 os.replace，把半截文件报成 done）
       · 正式文件永远只有「完整」这一种状态，用户不会看到半截图
     """
     job_id = job["id"]
@@ -707,11 +820,7 @@ def run_urllib(job):
         headers[name_k] = hv
 
     part = path + ".part"
-    resumed = 0
-    if os.path.exists(part):
-        resumed = os.path.getsize(part)
-        if resumed:
-            headers["Range"] = f"bytes={resumed}-"
+    resumed = os.path.getsize(part) if os.path.exists(part) else 0
 
     # 兜底前先认现有产物。这一路是「yt-dlp 失败后换个办法再试」，而 yt-dlp 的
     # 「失败」经常是假的（退出码 0、真视频已下好、尾部一行空 ERROR）。真机
@@ -724,69 +833,120 @@ def run_urllib(job):
         return
 
     write_status(job_id, status="downloading", percent=0, speed="", eta="", file="")
-    req = urllib.request.Request(job["url"], headers=headers)
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            if resp.status == 206 and resumed:
-                total += resumed
-            elif total == 0:
-                total = 0
+    dropped = False      # 本轮任务里已经作废过一次断点？
+    while True:
+        resp_headers = dict(headers)
+        if resumed:
+            resp_headers["Range"] = f"bytes={resumed}-"
+        req = urllib.request.Request(job["url"], headers=resp_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                total = _resp_total(resp, resumed)
+                mode = "ab" if (resp.status == 206 and resumed) else "wb"
+                if mode == "wb":
+                    resumed = 0
 
-            mode = "ab" if (resp.status == 206 and resumed) else "wb"
-            if mode == "wb":
-                resumed = 0
-
-            done = resumed
-            last_t = time.time()
-            last_b = done
-            with open(part, mode) as f:
-                while True:
-                    if is_cancelled(job_id):
-                        write_status(job_id, status="cancelled", message="用户取消")
-                        return
-                    chunk = resp.read(262144)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-
-                    now = time.time()
-                    if now - last_t >= 0.6:
-                        speed = (done - last_b) / (now - last_t)
-                        pct = (done / total * 100) if total else 0
-                        eta = ""
-                        if total and speed > 0:
-                            eta = str(int((total - done) / speed)) + "s"
+                fp = fingerprint_of(resp, total, job["url"])
+                if mode == "ab":
+                    why = fingerprint_mismatch(read_part_meta(part), fp)
+                    if why:
+                        if dropped:
+                            # 已经重下一次还是对不上：说明服务端在抖动（或者每条
+                            # 请求给不同的 CDN 节点）。停下来把原因说清楚，
+                            # 不要无限重试烧流量。
+                            write_status(
+                                job_id, status="error",
+                                message="源文件一直在变（%s），无法可靠地拼接。"
+                                        "请稍后重试，或换一条地址。" % why,
+                            )
+                            return
+                        dropped = True
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+                        drop_part_meta(part)
+                        resumed = 0
+                        # 这句要留着让用户看到：进度会从 0 重来，不给说法等于
+                        # 「下载器抽风了」。message 是合并写的，会在 done 时被清掉。
                         write_status(
-                            job_id,
-                            percent=pct,
-                            speed=fmt_speed(speed),
-                            eta=eta,
+                            job_id, status="downloading", percent=0, speed="", eta="",
+                            file="",
+                            message="服务器上的文件变了（%s），之前的断点作废，正在从头重下。"
+                                    % why,
                         )
-                        last_t, last_b = now, done
+                        continue      # 回到循环顶部，这次不带 Range 重新请求
+                    write_part_meta(part, fp)   # 首次补写，或刷新 mtime 无关，图个确定
+                else:
+                    write_part_meta(part, fp)
 
-        os.replace(part, path)
-        # 下完还得验内容：m3u8 地址被当成普通文件下，拿到的是**清单文本**。
-        # 真机 2026-10-22 就是这么把一个 29KB 的 #EXTM3U 报成「完成」的。
-        if looks_like_playlist(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            write_status(
-                job_id, status="error",
-                message="只下到播放列表（#EXTM3U），不是视频。这条地址是 HLS 清单，"
-                        "得按分片下载；请用扩展列表里的「下载」交给本地下载器。",
-            )
+                done = resumed
+                last_t = time.time()
+                last_b = done
+                with open(part, mode) as f:
+                    while True:
+                        if is_cancelled(job_id):
+                            write_status(job_id, status="cancelled", message="用户取消")
+                            return
+                        chunk = resp.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+
+                        now = time.time()
+                        if now - last_t >= 0.6:
+                            speed = (done - last_b) / (now - last_t)
+                            pct = (done / total * 100) if total else 0
+                            eta = ""
+                            if total and speed > 0:
+                                eta = str(int((total - done) / speed)) + "s"
+                            write_status(
+                                job_id,
+                                percent=pct,
+                                speed=fmt_speed(speed),
+                                eta=eta,
+                            )
+                            last_t, last_b = now, done
+
+            # ---- 完整性：读到的字节必须等于总长
+            #
+            # 原来的写法在这里直接 os.replace → 服务器提前关连接时，半截文件会
+            # 被报成「完成」，用户点开是坏的（V2 一票否决项）。这里改成判失败
+            # 并**保留 .part**，下次点击从断点续，不用从头下。
+            if total and done < total:
+                write_status(
+                    job_id, status="error",
+                    message="连接提前断开：只收到 %s / %s。已保留断点，"
+                            "再点一次会从断点继续。" % (_fmt_bytes(done), _fmt_bytes(total)),
+                )
+                return
+
+            os.replace(part, path)
+            drop_part_meta(part)
+            # 下完还得验内容：m3u8 地址被当成普通文件下，拿到的是**清单文本**。
+            # 真机 2026-10-22 就是这么把一个 29KB 的 #EXTM3U 报成「完成」的。
+            if looks_like_playlist(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                write_status(
+                    job_id, status="error",
+                    message="只下到播放列表（#EXTM3U），不是视频。这条地址是 HLS 清单，"
+                            "得按分片下载；请用扩展列表里的「下载」交给本地下载器。",
+                )
+                return
+            write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
+                         message="")
             return
-        write_status(job_id, status="done", percent=100, speed="", eta="", file=path,
-                     message="")
-    except urllib.error.HTTPError as e:
-        write_status(job_id, status="error", message=f"HTTP {e.code} {e.reason}")
-    except Exception as e:
-        write_status(job_id, status="error", message=str(e)[:400])
+        except urllib.error.HTTPError as e:
+            write_status(job_id, status="error", message=f"HTTP {e.code} {e.reason}")
+            return
+        except Exception as e:
+            write_status(job_id, status="error", message=str(e)[:400])
+            return
 
 
 # ---------------------------------------------------------------- HLS 自下载（伪装分片）
