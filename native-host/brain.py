@@ -67,6 +67,31 @@ USER_TMPL = (
     "页面媒体标记: {markers}")
 
 
+# 经验库雏形（d-082 错题主因之二：站点知识不在 prompt 里）。
+# 每条 = 域名片段 → 一句站点事实。来源：20 站审计 + DEVLOG 实锤。
+SITE_KNOWLEDGE = [
+    ("bilibili.com", "B 站：具体视频页的 DASH 双流下载与合并链已支持，应 direct-download"),
+    ("4kvm", "该站分片是伪装壳（PNG 壳 + 真 TS），需自实现 HLS 剥壳 → self-hls"),
+    ("51cg1", "该站 DPlayer 播放 HLS 正片，自实现 HLS 可下 → self-hls"),
+    ("douyu.com", "斗鱼：直播流，无固定媒体文件 → record-live"),
+    ("huya.com", "虎牙：直播流 → record-live"),
+    ("live.douyin.com", "抖音直播：MSE + 登录态 → record-live"),
+    ("douyin.com", "抖音视频页：MSE 分段解密，无裸地址，需浏览器嗅探 → page-parse"),
+    ("music.163.com", "网易云：音频加密 + 需登录 → login-required"),
+    ("y.qq.com", "QQ音乐：音频加密逐曲接口 → login-required"),
+    ("v.qq.com", "腾讯视频：正片为私有 JSON 清单（部分有 DRM），需浏览器上下文 → page-parse"),
+    ("web.telegram.org", "Telegram：blob/MSE，只能页面保存（Range 链）→ page-save"),
+    ("sohu.com", "搜狐：具体视频页才有媒体，首页没有 → specific-video-url"),
+    ("miguvideo.com", "咪咕：需登录态看正片，首页无媒体 → specific-video-url 或 login-required"),
+]
+
+
+def site_notes(url):
+    """URL → 命中的站点知识条目（经验库的检索雏形）。"""
+    u = (url or "").lower()
+    return [note for dom, note in SITE_KNOWLEDGE if dom in u]
+
+
 def build_prompt(case):
     """case（考卷同形）→ (system, user)。纯函数。"""
     obs = case.get("observed") or {}
@@ -78,6 +103,9 @@ def build_prompt(case):
         trail=obs.get("trail") or "(无)",
         message=obs.get("message") or "(无)",
         markers="、".join(case.get("markers") or []) or "(无)")
+    notes = site_notes(case.get("url"))
+    if notes:
+        user += "\n\n已知站点知识（优先采信）：\n" + "\n".join("- " + x for x in notes)
     return SYSTEM_PROMPT, user
 
 
