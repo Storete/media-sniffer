@@ -50,6 +50,9 @@ const picked = new Set(); // 已选条目的 key（就是 it.u）
 // 只活在这次打开 popup 期间 —— 写进 storage 会变成跨会话的隐藏状态，
 // 下次打开少了几档会解释不清（同 moviePick 的取舍）。
 const variantPick = new Map();
+// B27：按条目记用户填的时间段（「1:30-2:45」），点下载时随 native:download 透传。
+// 合法性在宿主 parse_time_range 再把一道——这里只做「填了就带」。
+const timeRangePick = new Map();
 // 同片折叠时用户点过「切换」的选择：groupKey → url。
 // 只活在 popup 这次打开期间 —— 它是一次「我现在想看哪条」的即时偏好，
 // 存进 storage 就变成跨会话的隐性状态，下次打开为什么少一条说不清。
@@ -557,6 +560,22 @@ function visibleItems() {
  * 用户需要知道「为什么空」以及「下一步该做什么」。
  */
 function renderList() {
+  // 1.3.62 的教训：渲染路径上任何一个 ReferenceError 都会让用户看到「纯空白」
+  // （replaceChildren 已清空、行还没建），既没有空态也没有错误，无从报告。
+  // 这里把异常兜在列表区：用户能截图一句话，我们不用盲猜。
+  try {
+    renderListInner();
+  } catch (e) {
+    try {
+      console.warn("[资源嗅探] 列表渲染出错：", e);
+      $("#list").replaceChildren(
+        el("div", "empty", "列表渲染出错：" + String((e && e.message) || e)
+          + "<br>请截图这行字反馈。"));
+    } catch (_) { /* 兜底都失败就保持原样 */ }
+  }
+}
+
+function renderListInner() {
   const box = $("#list");
 
   // 清单族要按**全量**条目算，不能用 visibleItems：用户切到「视频」筛选时，
