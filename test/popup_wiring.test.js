@@ -40,6 +40,10 @@ check("诊断有脱敏口径（URL 去查询串）", /pathname/.test(JS) && /ori
 check("空态有「粘贴链接」入口", /或粘贴视频页\/媒体链接/.test(JS));
 check("粘贴链接走 native:download-page（cookiejar 形态）",
       (JS.match(/native:download-page/g) || []).length >= 2);
+// T-F5 设置 UI：⚙ 按钮存/清 aiConfig
+check("#aiCfg 按钮在 HTML 里", /id="aiCfg"/.test(HTML));
+check("#aiCfg 绑定了点击处理", /#aiCfg"\)\.addEventListener\("click"/.test(JS));
+check("AI 配置存 storage.local.aiConfig", /aiConfig: cfg/.test(JS) && /storage\.local\.remove\("aiConfig"\)/.test(JS));
 check("#pageDl 按钮在 HTML 里", /id="pageDl"/.test(HTML));
 check("#pageDl 绑定了点击处理", /#pageDl"\)\.addEventListener\("click"/.test(JS));
 check("整页解析发 native:download-page", /type: "native:download-page"/.test(JS));

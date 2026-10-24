@@ -1716,6 +1716,26 @@ $("#aiBtn").addEventListener("click", async function () {
   setTimeout(() => ($("#hint").textContent = ""), 8000);
 });
 
+/**
+ * 「⚙」AI 配置（T-F5 的设置 UI）：endpoint / key / model 三项，
+ * 存 chrome.storage.local.aiConfig。留空 = 删除该项（全空 = 关闭 AI 分析）。
+ */
+$("#aiCfg").addEventListener("click", async () => {
+  const { aiConfig } = await chrome.storage.local.get({ aiConfig: {} });
+  const endpoint = prompt("AI 端点（OpenAI 兼容基址，如 https://api.deepseek.com，留空=关闭 AI 分析）：",
+    aiConfig.endpoint || "") ;
+  if (endpoint === null) return;
+  const key = prompt("API key：", aiConfig.key || "");
+  if (key === null) return;
+  const model = prompt("模型名：", aiConfig.model || "deepseek-chat");
+  if (model === null) return;
+  const cfg = endpoint && key ? { endpoint: endpoint.trim(), key: key.trim(), model: model.trim() } : null;
+  if (cfg) await chrome.storage.local.set({ aiConfig: cfg });
+  else await chrome.storage.local.remove("aiConfig");
+  $("#hint").textContent = cfg ? "AI 分析已配置（" + cfg.model + "）" : "AI 分析已关闭";
+  setTimeout(() => ($("#hint").textContent = ""), 3000);
+});
+
 $("#clear").addEventListener("click", async () => {  if (tabId == null) return;
   await chrome.runtime.sendMessage({ type: "sniff:clear", tabId });
   allItems = [];
