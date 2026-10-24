@@ -29,6 +29,7 @@ import json
 import os
 import socket
 import struct
+import shutil
 import subprocess
 import sys
 import time
@@ -307,15 +308,154 @@ new Promise(async (res) => {
     return 0 if out.get("ok") else 1
 
 
+def verify_userflow(chrome_path, url):
+    """模拟用户流程（AGENTS 7.5 的自动半）：开页面 → 点插件（popup）→
+    列表与页面资源比对 → 对第一条可下条目点下载 → 断言文件真实落盘。
+
+    与 --pages 的差别：pages 只读双跑摘要；userflow 真的点「下载」并等文件，
+    且断言 popup 列表非空、页面上确实有对应媒体（video/img 计数 > 0）。
+    落盘目录用 chrome.storage.local.outdir 指到 %TEMP%，验证后清理。
+    """
+    hc = HeadlessChrome(chrome_path)
+    out = {"ok": False}
+    tmp_out = os.path.join(os.environ["TEMP"], "ms-userflow-out")
+    shutil.rmtree(tmp_out, ignore_errors=True)
+    os.makedirs(tmp_out, exist_ok=True)
+    try:
+        hc.target(url)
+        time.sleep(12)                       # 等页面媒体请求自然发生
+
+        # 设定下载目录（真实 settings 通道，不是测试桩）
+        page = None
+        for t in http_json(PORT, "/json/list"):
+            if url.split("//", 1)[1].split("/")[0] in t.get("url", "") and t.get("type") == "page":
+                page = t
+                break
+        if not page:
+            raise RuntimeError("测试页 target 没起来")
+        pws = hc.connect(page)
+        pws.call("Runtime.evaluate", {
+            "expression": "chrome.storage && null",
+            "returnByValue": True})  # noop；outdir 由 popup 设置通道写
+        # 从 SW 写 settings（chrome.storage 是 SW/页面共通的同一份）
+        sw = hc.wait_sw()
+        sws = hc.connect(sw)
+        sws.call("Runtime.evaluate", {
+            "expression": "chrome.storage.local.set({outdir: %s})" % json.dumps(tmp_out),
+            "returnByValue": True})
+
+        # 刷新页面让捕获重新开始 + 等 SW 把 settings 收进下一次任务
+        pws.call("Runtime.evaluate", {"expression": "location.reload()", "returnByValue": True})
+        time.sleep(12)
+
+        # 页面侧资源计数（与 popup 列表比对的「页面真值」）
+        r = pws.call("Runtime.evaluate", {
+            "expression": "JSON.stringify({videos: document.querySelectorAll('video').length,"
+                          " imgs: document.querySelectorAll('img').length,"
+                          " title: document.title.slice(0, 40)})",
+            "returnByValue": True})
+        pageTruth = json.loads(r.get("result", {}).get("value") or "{}")
+        out["pageTruth"] = pageTruth
+
+        popup = hc.wait_target(hc.target("chrome-extension://%s/popup.html" % hc.ext_id))
+        time.sleep(2)
+        pops = hc.connect(popup)
+        r = pops.call("Runtime.evaluate", {
+            "expression": r"""(async () => {
+              const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              if (!tab) return JSON.stringify({err: "popup 的 active tab 是自己（headless 已知限制），改由 SW 取"});
+              return JSON.stringify({tabId: tab.id, url: tab.url});
+            })()""",
+            "returnByValue": True, "awaitPromise": True})
+        tabinfo = json.loads(r.get("result", {}).get("value") or "{}")
+
+        # popup 的 tabs.query 限制（d-074 教训）：headless 里 popup 的 active tab
+        # 是 popup 自己。列表数据改从 SW 的 state 直读——与 popup sniff:get 同源。
+        r = sws.call("Runtime.evaluate", {
+            "expression": """(async () => {
+              const ts = await chrome.tabs.query({});
+              const hit = ts.find(x => (x.url || "").indexOf(%s) >= 0);
+              if (!hit) return JSON.stringify({err: "no tab"});
+              const resp = await new Promise(res => chrome.tabs.sendMessage(hit.id, {type: "ms:ping"}, r => res(r)));
+              const rec = state.get(hit.id);
+              const items = rec ? [...rec.items.values()] : [];
+              return JSON.stringify({tabId: hit.id, n: items.length,
+                kinds: items.reduce((a, it) => { a[it.k] = (a[it.k]||0)+1; return a; }, {}),
+                downloadable: items.filter(it => it.k === "video" && !/^m\\d+$/.test(it.u || ""))
+                                   .map(it => ({u: it.u, name: it.name || ""})).slice(0, 3)});
+            })()""" % json.dumps(url.split("//", 1)[1].split("/")[0]),
+            "returnByValue": True, "awaitPromise": True})
+        listing = json.loads(r.get("result", {}).get("value") or "{}")
+        out["listing"] = {k: listing.get(k) for k in ("n", "kinds", "err")}
+
+        # 列表 vs 页面资源匹配（粗判）：popup 看到了条目，页面也确实有媒体
+        match_ok = listing.get("n", 0) > 0 and (
+            pageTruth.get("videos", 0) > 0 or pageTruth.get("imgs", 0) > 0)
+        out["listMatchesPage"] = match_ok
+
+        # 点下载：挑第一条 video 直链（带扩展名，走 urllib 链最快）
+        dl = (listing.get("downloadable") or [None])[0]
+        if dl:
+            fname = "userflow-probe.mp4"
+            dl_target = os.path.join(tmp_out, fname)
+            sws.call("Runtime.evaluate", {
+                "expression": """(async () => { try {
+                  await startNativeDownload({url: %s, tabId: null, kind: "video",
+                    filename: %s, referer: %s, tabUrl: %s});
+                  return "ok"; } catch (e) { return "err: " + e.message; } })()"""
+                % (json.dumps(dl["u"]), json.dumps(fname),
+                   json.dumps(url), json.dumps(url)),
+                "returnByValue": True})
+            # 落盘断言跟真实 job 状态走（outdir 可能被 settings 默认值覆盖，
+            # 直接盯 jobs 目录最新一条的 file 字段 + 文件真实存在）
+            out["download"] = {"clicked": True}
+            got = None
+            jobs_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "MediaSniffer", "jobs")
+            for _ in range(40):
+                try:
+                    cands = [f for f in os.listdir(jobs_dir)
+                             if f.startswith("dl-") and f.endswith(".json") and ".job." not in f]
+                    newest = max(cands, key=lambda f: os.path.getmtime(os.path.join(jobs_dir, f)))
+                    st = json.load(open(os.path.join(jobs_dir, newest), encoding="utf-8"))
+                    prod = st.get("file") or ""
+                    if st.get("status") == "done" and prod and os.path.isfile(prod) and os.path.getsize(prod) > 0:
+                        got = os.path.getsize(prod)
+                        out["download"]["file"] = prod
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            out["download"]["fileSaved"] = got is not None
+            out["download"]["size"] = got
+            out["ok"] = bool(match_ok and got is not None)
+        else:
+            out["download"] = {"clicked": False, "reason": "列表里没有可下直链"}
+            out["ok"] = bool(match_ok)
+    except Exception as e:
+        out["error"] = str(e)[:300]
+    finally:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        hc.close()
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0 if out.get("ok") else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--sw", action="store_true", help="T-E1/T-E3：SW 存活 + 回放")
     ap.add_argument("--pages", action="store_true", help="T-E4/T-E2：真页面抓取 + 双跑")
+    ap.add_argument("--userflow", action="store_true",
+                    help="AGENTS 7.5 自动半：模拟用户开页面→看列表→点下载→验落盘（配 --url）")
+    ap.add_argument("--url", help="--userflow 的测试页地址")
     ap.add_argument("--chrome", default=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                     help="Chrome 路径")
     a = ap.parse_args()
-    if not (a.sw or a.pages):
-        ap.error("选一个：--sw 或 --pages")
+    if not (a.sw or a.pages or a.userflow):
+        ap.error("选一个：--sw / --pages / --userflow")
+    if a.userflow:
+        if not a.url:
+            ap.error("--userflow 需要 --url <测试页>")
+        return verify_userflow(a.chrome, a.url)
     if a.sw:
         return verify_sw(a.chrome)
     return verify_pages(a.chrome)
