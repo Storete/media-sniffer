@@ -194,7 +194,65 @@ function diagBump(tabId, key, url) {
   } catch (e) { /* 诊断永远不能影响主流程 */ }
 }
 
-async function flushAll() {  const payload = {};
+// ---------------------------------------------------------------- S0 双跑（影子会话）
+//
+// 目的不是「顺便也跑一下新模型看看」，而是**每次列表变化都留一份可比的差异**：
+// 真机三页（B 站 / 小红书 / Telegram）跑一天之后，diff 里只要出现 missing 或
+// changed，就说明新模型丢了旧模型有的东西 —— S1~S6 全建在它上面，
+// 不能带着这个隐患往前推。
+//
+// 三条铁律：
+//   1. **不影响主流程**：任何异常都吞掉并记进排障区，绝不 throw 到调用方。
+//   2. **不写用户可见的东西**：只存在内存里（SW 重启就没了，够取证用），
+//      不进 storage.session —— 那是给 popup 列表用的配额。
+//   3. **同口径比对**：拿的是同一份 `rec.items`、同一个时刻，不跨时刻比较。
+//
+// 口径的一个已知边界（写在这里免得后来的人以为它全能）：`sniff:get` 里会把
+// icon 类条目改判、把封面过滤掉，那属于**展示层**；影子比对的是条目袋本身，
+// 所以它证明的是「模型没丢输入」，不证明「展示规则一致」。
+const MS_SHADOW_KEEP = 3;                 // 每页留最近 3 次，能看出「是偶发还是每次都差」
+const msShadow = new Map();               // tabId -> [diff, ...]
+
+function runShadow(tabId, rec) {
+  try {
+    if (!rec || !rec.url) return;
+    if (typeof MSSession === "undefined" || !MSSession) return;
+    if (typeof MSSession.msBuildSession !== "function") return;
+    const session = MSSession.msBuildSession({ items: rec.items, tabUrl: rec.url });
+    const diff = MSSession.msDiffSession(session, rec.items);
+    const brief = {
+      at: Date.now(),
+      url: String(rec.url).slice(0, 200),
+      sid: session && session.sid,
+      kind: session && session.kind,
+      ok: !!diff.ok,
+      counts: diff.counts,
+      missing: diff.missing.slice(0, 10),
+      extra: diff.extra.slice(0, 10),
+      changed: diff.changed.slice(0, 10),
+      added: diff.added,
+    };
+    const arr = msShadow.get(tabId) || [];
+    arr.push(brief);
+    while (arr.length > MS_SHADOW_KEEP) arr.shift();
+    msShadow.set(tabId, arr);
+    // 不一致要留痕：只在**第一次**不一致时记，否则 400 条条目会刷满排障区
+    if (!diff.ok && !(arr.length > 1 && arr[arr.length - 2] && !arr[arr.length - 2].ok)) {
+      noteError("ms-shadow", tabId + " " + JSON.stringify({
+        sid: brief.sid,
+        missing: brief.missing.slice(0, 3),
+        changed: brief.changed.slice(0, 3),
+        extra: brief.extra.slice(0, 3),
+      }));
+    }
+  } catch (e) {
+    // 影子挂了绝不能影响用户下载/列表
+    noteError("ms-shadow-crash", (e && e.message) || e);
+  }
+}
+
+async function flushAll() {
+  const payload = {};
   for (const [tabId, rec] of state) {
     if (!rec.dirty) continue;
     rec.dirty = false;
@@ -203,6 +261,10 @@ async function flushAll() {  const payload = {};
       url: rec.url,
       items: [...rec.items.values()].map((it) => [it.u, it]),
     };
+    // S0 双跑：列表每变一次就留一份「新模型 vs 旧条目袋」的比对结果。
+    // 放在这里的原因是它覆盖最全 —— 只要用户还在看这个页面，条目一进来就比对，
+    // 不用等他打开 popup。开销是一次纯函数遍历（400 条约 1ms），且**绝不影响主流程**。
+    runShadow(tabId, rec);
   }
   if (!Object.keys(payload).length) return;
   try {
@@ -1662,6 +1724,7 @@ for (const ev of ["onCompleted", "onErrorOccurred"]) {
 chrome.tabs.onRemoved.addListener((tabId) => {
   state.delete(tabId);
   badgeTimer.delete(tabId);
+  msShadow.delete(tabId);      // 影子快照跟着标签页走，别留着占内存
   chrome.storage.session.remove("tab:" + tabId).catch(() => {});
 });
 
@@ -2183,6 +2246,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const rec = state.get(msg.tabId);
         if (rec) delete rec.focus;
         sendResponse({ ok: true });
+        break;
+      }
+      case "ms:shadow": {
+        // S0 双跑的取证入口：真机看一眼「新模型和旧条目袋差在哪」。
+        // 只给最近几次的摘要（missing/extra/changed 各截 10 条），
+        // 不带整个会话 —— 400 条条目的会话塞进消息会把 popup 拖慢。
+        const want = typeof msg.tabId === "number" ? [msg.tabId] : [...msShadow.keys()];
+        const out = {};
+        for (const id of want) {
+          const arr = msShadow.get(id);
+          if (arr && arr.length) out[id] = arr;
+        }
+        sendResponse({ ok: true, shadow: out });
         break;
       }
       case "sniff:clear": {

@@ -34,6 +34,10 @@ const sandbox = {
   clearInterval() {},
   JSON, Object, Array, Map, Set, Promise, Date, Math, Number, String, Boolean, Error, RegExp,
   Uint8Array, encodeURIComponent, decodeURIComponent,
+  // vm 的上下文没有 Web API。整份 background.js 都进这个沙箱，缺 URL 时
+  // 所有 `new URL()` 会静默走进 catch（hostOfUrl 返回空串），
+  // 于是「按域判断」这类逻辑在测试里永远是假绿。
+  URL,
   btoa: (s) => Buffer.from(s, "binary").toString("base64"),
   atob: (s) => Buffer.from(s, "base64").toString("binary"),
 };

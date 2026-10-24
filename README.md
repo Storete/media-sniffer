@@ -345,6 +345,7 @@ media-sniffer/
 │   ├── hls_meta.test.js     清单正文解析单测（55 项）
 │   ├── hls_same_movie.test.js 同片清单折叠单测（32 项）
 │   ├── naming.test.js       文件名规则单测（24 项）
+│   ├── session_shadow.test.js S0 双跑：会话 vs 条目袋（49 项）
 │   ├── native_done_history.test.js 下载完成写记录单测（16 项）
 │   ├── icon_filter.test.js  图标/噪声过滤单测（20 项）
 │   ├── blob_item.test.js    blob 条目取舍单测（18 项）
@@ -374,11 +375,12 @@ media-sniffer/
 ## 跑测试
 
 ```bash
-# JS（需要 Node 18+，不需要 npm install）—— 17 套 / 1021 项
-node test/background.test.js       # 275 项（含 focus_scope / group_key / review）
+# JS（需要 Node 18+，不需要 npm install）—— 18 套 / 1085 项
+node test/background.test.js       # 290 项（含 focus_scope / group_key / review）
 node test/main-hook.test.js        # 195 项
 node test/site_registry.test.js    # 103 项
 node test/session_model.test.js    # 69 项
+node test/session_shadow.test.js   # 49 项（S0 双跑：新会话 vs 旧条目袋，只允许新增）
 node test/popup_wiring.test.js     # 68 项
 node test/hls_meta.test.js         # 64 项（清单解析 + 变体地址补全）
 node test/ui_card.test.js          # 39 项

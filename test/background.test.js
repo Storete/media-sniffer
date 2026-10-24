@@ -56,6 +56,11 @@ const sandbox = {
   decodeURIComponent,
   btoa: (s) => Buffer.from(s, "binary").toString("base64"),
   atob: (s) => Buffer.from(s, "base64").toString("binary"),
+  // vm 的上下文只带 ECMAScript 内建，`URL` 是 Web API、默认没有。
+  // service worker 里它是有的 —— 不补这一行，session.js 里所有 new URL() 都进
+  // catch 分支，sid 静默变成空串（2026-10-25 就在这条上假绿过：sid 空了
+  // 而 ok 照样 true，因为两边用的是同一份空 sid）。
+  URL,
 };
 sandbox.window = sandbox;
 sandbox.self = sandbox;
@@ -63,10 +68,14 @@ sandbox.globalThis = sandbox;
 
 // chrome API 桩
 const listeners = { onMessage: [], onConnect: [], tabs: [], onUpdated: [] };
+// onRemoved 单独留一份引用：S0 双跑要验「关标签页后影子被清掉」，
+// 而 makeEvent 只把 addListener 塞进数组、数组本身不外传。
+const tabRemovedListeners = [];
 function makeEvent(list) {
   return { addListener: (fn) => list.push(fn), removeListener() {} };
 }
 const storageData = {};
+const sessionStore = {};
 sandbox.chrome = {
   runtime: {
     onMessage: makeEvent(listeners.onMessage),
@@ -86,7 +95,7 @@ sandbox.chrome = {
   },
   tabs: {
     onUpdated: makeEvent([]),
-    onRemoved: makeEvent([]),
+    onRemoved: makeEvent(tabRemovedListeners),
     onActivated: makeEvent([]),
     query: () => Promise.resolve([]),
     sendMessage: () => Promise.resolve(),
@@ -107,6 +116,27 @@ sandbox.chrome = {
       },
       set(obj, cb) {
         Object.assign(storageData, obj);
+        if (cb) cb();
+        return Promise.resolve();
+      },
+    },
+    session: {
+      // 真实扩展里有 storage.session；桩里缺它会让 flushAll / onRemoved 里的
+      // chrome.storage.session.remove 抛 TypeError，而那个抛错点正好在「清理」
+      // 分支上，于是「清理有没有生效」这条测试永远红得莫名其妙。
+      __data: {},
+      get(def, cb) {
+        const out = Object.assign({}, def, sessionStore);
+        if (cb) cb(out);
+        return Promise.resolve(out);
+      },
+      set(obj, cb) {
+        Object.assign(sessionStore, obj);
+        if (cb) cb();
+        return Promise.resolve();
+      },
+      remove(keys, cb) {
+        for (const k of [].concat(keys)) delete sessionStore[k];
         if (cb) cb();
         return Promise.resolve();
       },
@@ -1188,6 +1218,83 @@ console.log("\n[HLSP] applyHlsPageTitle：把页面标题借给真 m3u8 条目")
   check("[VAR] res 被截断到 20 字符（页面能塞任意长文本）",
     nv([[1, "9".repeat(200), "https://a.com/x"]]).length === 1
     && nv([[1, "9".repeat(200), "https://a.com/x"]])[0].res.length <= 20);
+}
+
+// ---------------------------------------------------------------- S0 双跑（影子会话）
+//
+// 比对逻辑本身的判据在 test/session_shadow.test.js（纯函数、直接喂夹具），
+// 这里验的是**接线**：runShadow 有没有被正确调用、异常会不会漏出去、
+// 取数入口 `ms:shadow` 能不能真的读到。不切源码切片 —— 切出来的东西
+// 和线上跑的不是同一份，2026-10-25 就因为切片切成空串而假绿过一次。
+console.log("\n[S0] 双跑影子：算法在 session_shadow，这里验接线");
+{
+  const runShadow = vm.runInContext("typeof runShadow === 'function' ? runShadow : null", ctx);
+  check("runShadow 是个函数", typeof runShadow === "function");
+
+  const TAB = 4321;
+  const mkRec = () => ({
+    url: "https://site.example/v/1",
+    dirty: true,
+    items: new Map([
+      ["https://cdn.example/v/1080.mp4",
+        { u: "https://cdn.example/v/1080.mp4", k: "video", m: "video/mp4", s: 5242880, w: 1920, h: 1080 }],
+      ["https://cdn.example/v/720.mp4",
+        { u: "https://cdn.example/v/720.mp4", k: "video", m: "video/mp4", s: 2097152, w: 1280, h: 720 }],
+      ["https://cdn.example/a.jpg", { u: "https://cdn.example/a.jpg", k: "image", m: "image/jpeg", s: 90000 }],
+    ]),
+  });
+
+  // 只走消息入口读结果：`msShadow` 是 const，runInContext 读不到（各脚本词法作用域），
+  // 而消息入口正好是产品里唯一的读者 —— 用它比读内部变量更有意义。
+  const readShadow = (tabId) => {
+    let got = null;
+    for (const fn of listeners.onMessage) {
+      try { fn({ type: "ms:shadow", tabId }, {}, (r) => { if (r && r.shadow) got = r; }); } catch (e) { /* 别的监听器 */ }
+    }
+    return got;
+  };
+
+  runShadow(TAB, mkRec());
+  let r1 = readShadow(TAB);
+  check("影子记了一次", !!(r1 && r1.shadow[TAB] && r1.shadow[TAB].length === 1), r1);
+  const b1 = r1 && r1.shadow[TAB] ? r1.shadow[TAB][0] : {};
+  check("正常条目：ok=true（不许报假差异）", b1.ok === true, b1);
+  check("影子带 sid / kind", !!b1.sid && b1.kind === "video", [b1.sid, b1.kind]);
+  check("影子只留摘要：有 counts.seen=3", !!b1.counts && b1.counts.seen === 3, b1.counts);
+  check("摘要里没有整份会话（免得消息把 popup 拖慢）", b1.tracks === undefined && b1.evidence === undefined);
+  check("added 说明新增字段", JSON.stringify(b1.added) === JSON.stringify(["id", "quality", "source"]), b1.added);
+
+  for (let i = 0; i < 6; i++) runShadow(TAB, mkRec());
+  const arr = readShadow(TAB).shadow[TAB];
+  check("每页只留最近 3 次（不是无限长）", arr.length === 3, arr.length);
+
+  let threw = null;
+  try { runShadow(TAB, null); } catch (e) { threw = e.message; }
+  check("rec 是 null 时不抛", threw === null, threw);
+  threw = null;
+  try { runShadow(TAB, { items: null }); } catch (e) { threw = e.message; }
+  check("rec 没有 url 时不抛（也不记）", threw === null, threw);
+  threw = null;
+  try { runShadow(TAB, { url: "https://a/b", items: undefined }); } catch (e) { threw = e.message; }
+  check("items 是 undefined 时不抛", threw === null, threw);
+  threw = null;
+  try { runShadow(TAB, { url: "https://a/b", items: "垃圾" }); } catch (e) { threw = e.message; }
+  check("items 是字符串时不抛", threw === null, threw);
+
+  let all = null;
+  for (const fn of listeners.onMessage) {
+    try { fn({ type: "ms:shadow" }, {}, (r) => { if (r && r.shadow) all = r; }); } catch (e) { /* 忽略 */ }
+  }
+  check("不传 tabId 时返回全部页", !!(all && all.shadow && all.shadow[TAB]), all && all.shadow && Object.keys(all.shadow));
+  check("取数入口带 ok:true", !!(all && all.ok === true));
+
+  // 标签页关掉后影子要跟着走，不能留内存
+  let cleaned = null;
+  try {
+    for (const fn of tabRemovedListeners) fn(TAB);
+    cleaned = readShadow(TAB);
+  } catch (e) { cleaned = null; }
+  check("关标签页后影子被清掉", cleaned !== null && !cleaned.shadow[TAB], cleaned);
 }
 
 console.log("\n==============================================");

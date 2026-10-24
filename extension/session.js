@@ -178,7 +178,7 @@ var MSSession = (function () {
       });
     }
     for (const img of images) {
-      out.push({ src: "dom", field: "image.url", value: img.u });
+      out.push({ src: "dom", field: "image.url", value: img.url });
     }
     if (rows.length) out.push({ src: "manifest", field: "manifest.type", value: manifest.type });
     if (!out.length) out.push({ src: "net", field: "items", value: "0" });
@@ -204,18 +204,8 @@ var MSSession = (function () {
     return "weak";
   }
 
-  /**
-   * 条目袋 → 会话。
-   *
-   * @param {Object} opt
-   * @param {Array|Map} opt.items 扁平条目（`rec.items` 的 values 或 Map 本身）
-   * @param {string} opt.tabUrl   当前页地址
-   */
-  function msBuildSession(opt) {
-    const o = opt || {};
-    let raw = o.items;
-    // 鸭子类型而不是 instanceof：这个函数会被塞进 vm 沙箱跑测试，
-    // 跨 realm 的 Map 用 instanceof 判不出来（实测会漏成「空数组」）。
+  /** 条目袋 → 数组。鸭子类型判 Map（跨 realm 的 Map 用 instanceof 判不出来）。 */
+  function listOf(raw) {
     if (raw && typeof raw !== "object") raw = null;
     let list = [];
     if (raw) {
@@ -225,7 +215,18 @@ var MSSession = (function () {
         list = raw;
       }
     }
-    if (!Array.isArray(list)) list = [];
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** 条目袋 → 会话。
+   *
+   * @param {Object} opt
+   * @param {Array|Map} opt.items 扁平条目（`rec.items` 的 values 或 Map 本身）
+   * @param {string} opt.tabUrl   当前页地址
+   */
+  function msBuildSession(opt) {
+    const o = opt || {};
+    const list = listOf(o.items);
 
     const rows = [];
     const images = [];
@@ -239,7 +240,16 @@ var MSSession = (function () {
         const hint = String(it.hint || "");
         // 封面是「这张图的来源说明」，不是内容本身：单独挑出来，不进图片集。
         if (hint.indexOf("cover") >= 0) { if (!cover) cover = u; continue; }
-        images.push(it);
+        // 图片也得进会话。原来这里只留了个 cover、其余图片被扔掉 —— 于是
+        // 「图集」这种页面在会话里等于空的，双跑比对也就无从比起（S0 Step2 现场发现）。
+        images.push({
+          url: u,
+          source: sourceOf(u),
+          mime: String(it.m || ""),
+          size: num(it.s),
+          width: num(it.w),
+          height: num(it.h),
+        });
         continue;
       }
       const r = normalize(it);
@@ -264,6 +274,7 @@ var MSSession = (function () {
       page: { url: String(o.tabUrl || ""), title: "" },
       kind,
       tracks,
+      images,
       manifest,
       subs: [],
       cover,
@@ -274,7 +285,119 @@ var MSSession = (function () {
     };
   }
 
-  return { msBuildSession, msSessionSid };
+  // ------------------------------------------------------------------ S0 双跑比对
+  //
+  // 为什么要有 msDiffSession
+  // ---------------------
+  // S0 的「双跑并行」不是「顺便也跑一下新模型」，而是**要能回答一个新模型是不是
+  // 丢了旧模型有的东西**。没有这个函数，双跑就只是两袋数据摆着，谁也不会去比。
+  //
+  // 比对的口径（这个口径决定了它有没有用）
+  // --------------------------------------
+  // **只允许「新增」**。三页真机跑下来，diff 里出现 missing / changed 就说明新模型
+  // 丢了东西或改了值 —— S1~S6 全建在它上面，不能带着这个隐患往前推。
+  // 所以 ok 的定义是严格的：missing、changed、extra 三者都为空。
+  //
+  // 字段映射（旧条目字段 → 会话字段）：u→url、k→role、m→mime、s→size、
+  // w→width、h→height、dur→dur。映射之外的都是新增（id/source/quality）。
+  //
+  // 两条刻意的不报错
+  // ----------------
+  // · 同一地址出现多次：旧模型是两条条目，新模型按地址合并成一条（buildTrack 取
+  //   max）。这是**故意的**，不是丢数据，所以计入 merged 而不进 changed。
+  // · 分片 / 图标 / 文档 / 字体 / 非 http 地址：两边都不该出现（约束 2），
+  //   计入 dropped。
+  function msDiffSession(session, items) {
+    const st = session || {};
+    const list = listOf(items);
+    const tracks = Array.isArray(st.tracks) ? st.tracks : [];
+    const imgs = Array.isArray(st.images) ? st.images : [];
+
+    const byRole = new Map();
+    for (const t of tracks) {
+      const m = new Map();
+      for (const v of (t && t.variants) || []) if (v && v.url) m.set(v.url, v);
+      byRole.set(t && t.role, m);
+    }
+    const imgMap = new Map();
+    for (const im of imgs) if (im && im.url) imgMap.set(im.url, im);
+
+    const counts = { seen: 0, media: 0, image: 0, dropped: 0, merged: 0 };
+    const urlCount = new Map();
+    const flat = [];      // [{kind, url, row}]  row 里的键已经是映射后的
+    for (const it of list) {
+      counts.seen++;
+      if (!it || typeof it !== "object") { counts.dropped++; continue; }
+      const k = String(it.k || "");
+      if (k === "image") {
+        const u = typeof it.u === "string" ? it.u : "";
+        if (!u || String(it.hint || "").indexOf("cover") >= 0) { counts.dropped++; continue; }
+        counts.image++;
+        urlCount.set(u, (urlCount.get(u) || 0) + 1);
+        flat.push({
+          kind: "image", url: u,
+          row: { mime: String(it.m || ""), size: num(it.s), width: num(it.w), height: num(it.h) },
+        });
+        continue;
+      }
+      const r = normalize(it);
+      if (!r) { counts.dropped++; continue; }
+      counts.media++;
+      urlCount.set(r.url, (urlCount.get(r.url) || 0) + 1);
+      flat.push({ kind: "media", url: r.url, row: r });
+    }
+
+    const missing = [];
+    const extra = [];
+    const changed = [];
+    const FIELDS = ["mime", "size", "width", "height"];
+    const seenMedia = new Set();
+    const seenImage = new Set();
+
+    for (const f of flat) {
+      const isImg = f.kind === "image";
+      (isImg ? seenImage : seenMedia).add(f.url);
+      const v = isImg ? imgMap.get(f.url) : (byRole.get(f.row.role) || new Map()).get(f.url);
+      if (!v) { missing.push(f.url); continue; }
+      // 同地址多条目 → 合并是故意的（buildTrack 取 max），不比字段值
+      if ((urlCount.get(f.url) || 1) > 1) { counts.merged++; continue; }
+      for (const k of FIELDS) {
+        const before = f.row[k];
+        const after = v[k];
+        // mime 是字符串，其余是数字。统一用 Number() 比会把两条相同的 mime 判成不同
+        // （Number("video/mp4") 是 NaN，而 NaN !== NaN）—— 那样每次双跑都是满屏假红，
+        // 第一次跑完就没人再看这个 diff 了。这是 test/session_shadow.test.js 第一轮抓到的。
+        const same = k === "mime"
+          ? String(before || "") === String(after || "")
+          : Number(before) === Number(after);
+        if (!same) {
+          changed.push({ url: f.url, field: k, old: before, new: after });
+        }
+      }
+    }
+
+    for (const m of byRole.values()) {
+      for (const u of m.keys()) if (!seenMedia.has(u)) extra.push(u);
+    }
+    for (const u of imgMap.keys()) if (!seenImage.has(u)) extra.push(u);
+
+    // 「新增字段」由数据算，不写死：拿第一条变体的键减去映射后的旧键。
+    let sample = null;
+    for (const t of tracks) { if (t && t.variants && t.variants.length) { sample = t.variants[0]; break; } }
+    const oldKeys = new Set(["url", "role", "mime", "size", "width", "height"]);
+    const added = sample ? Object.keys(sample).filter((k) => !oldKeys.has(k)).sort() : [];
+
+    return {
+      ok: missing.length === 0 && changed.length === 0 && extra.length === 0,
+      counts,
+      missing,
+      extra,
+      changed,
+      added,
+    };
+  }
+
+  return { msBuildSession, msSessionSid, msDiffSession };
 })();
 
 // 测试与 SW 共用：测试在 vm 里读这个全局，background 用 importScripts 加载。
