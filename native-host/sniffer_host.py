@@ -34,8 +34,17 @@ WORKER = os.path.join(HERE, "downloader.py")
 sys.path.insert(0, HERE)
 import library  # noqa: E402  统一的下载目录定位
 import errcode  # noqa: E402  错误码表（超时收尾要说同一张表上的话）
+import knowledge  # noqa: E402  解释库（同站+同码失败 ≥3 次 → 站点级建议）
 APP_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MediaSniffer")
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
+
+# 失败日志：解释库（L4 自动通道）的持久化。每行一条 `[签名, epoch]`，
+# 签名是 `站点|错误码`（knowledge.fail_signature）。宿主常驻，是唯一适合
+# 「跨任务累计」的主体 —— worker 每任务一进程、短命，记了也活不过下次。
+FAILURES_FILE = os.path.join(APP_DIR, "failures.jsonl")
+# 用 RLock 而不是 Lock：append_failure 持锁时会再调 load_failures（它自己也加锁），
+# 非可重入锁在这里直接死锁 —— 一个「记账失败不该崩流程」的功能反而先把自己卡死。
+_fail_lock = threading.RLock()
 
 # 单条消息上限：一个 512KB 分段转成 JSON 数组约 2MB，留足余量
 MAX_MSG = 64 * 1024 * 1024
@@ -515,6 +524,68 @@ def read_status(job_id):
         return None
 
 
+def read_job(job_id):
+    """读任务定义（`<id>.job.json`）。失败收尾要拿里面的 tabUrl 提取站点，
+    给解释库记账。文件不存在/坏了返回 None —— 记账是锦上添花，不能因为它
+    而让失败收尾本身出错。"""
+    p = os.path.join(JOBS_DIR, job_id + ".job.json")
+    try:
+        if not os.path.exists(p):
+            return None
+        return json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def load_failures():
+    """读失败日志成 `[(签名, epoch), ...]`。文件不存在/坏了都当空 ——
+    学习功能永远不能因为「日志坏了一行」而让下载流程崩掉。"""
+    with _fail_lock:
+        try:
+            if not os.path.exists(FAILURES_FILE):
+                return []
+            out = []
+            with open(FAILURES_FILE, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        sig, ts = json.loads(line)
+                        out.append((sig, ts))
+                    except Exception:
+                        continue
+            return out
+        except Exception:
+            return []
+
+
+def append_failure(site, code):
+    """追加一条失败（签名由 knowledge.fail_signature 规整）。追加失败不抛 ——
+    记录失败本身不该成为一次新的失败。"""
+    sig = knowledge.fail_signature(site, code)
+    if not sig.strip("|"):
+        return
+    with _fail_lock:
+        try:
+            entries = load_failures()
+            entries = knowledge.record_failure(entries, site, code, time.time())
+            os.makedirs(os.path.dirname(FAILURES_FILE), exist_ok=True)
+            with open(FAILURES_FILE, "w", encoding="utf-8") as f:
+                for s, t in entries:
+                    f.write(json.dumps([s, t], ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+
+def failure_advice(site, code):
+    """查「这个站 + 这个码」是不是已经失败 ≥3 次，是则返回建议 dict，否则 None。"""
+    try:
+        return knowledge.explain(load_failures(), site, code)
+    except Exception:
+        return None
+
+
 def mark_timeout(job_id, seconds):
     """把「宿主等超时了」写进状态文件，再通知扩展。
 
@@ -596,13 +667,25 @@ def poll_job(job_id):
                         sz = os.path.getsize(f)
                     except OSError:
                         sz = 0
+                # 解释库（L4 自动通道）：失败时记一笔，再看「同站 + 同码」是不是
+                # 已经 ≥3 次，是则把站点级建议附到 message 后面。记账/查建议失败
+                # 都不影响收尾本身 —— 学习是锦上添花，不能反过来崩掉下载流程。
+                final_msg = st.get("message") or ""
+                final_err = st.get("err") or ""
+                if st.get("status") == "error" and final_err:
+                    job = read_job(job_id)
+                    site = (job or {}).get("tabUrl") or ""
+                    append_failure(site, final_err)
+                    advice = failure_advice(site, final_err)
+                    if advice and advice.get("advice"):
+                        final_msg = (final_msg + " " if final_msg else "") + advice["advice"]
                 send({"id": job_id, "action": st.get("status"), "status": st.get("status"),
-                      "file": f, "size": sz, "message": st.get("message") or "",
+                      "file": f, "size": sz, "message": final_msg,
                       # **这条漏过一次**：download（downloader.py）早就把 err 写进状态
                       # 文件了，扩展侧也早就开始读 msg.err（background 里 code 字段），
                       # 中间的宿主却不转发 —— 于是 UI 上永远没有错误码，两边都以为
                       # 对方没实现。字段穿过的每一跳都要有测试钉住。
-                      "err": st.get("err") or "",
+                      "err": final_err,
                       "quality": st.get("quality") or "",
                       "trail": st.get("trail") or ""})
                 return

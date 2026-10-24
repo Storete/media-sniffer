@@ -38,7 +38,7 @@
 | T-C4 | S2 验证四层 + 12 错误码 | 删掉一个分片 → 界面说「分片缺失，已重试 3 次」 | ✅ 1.3.53（验证四层落地，第 4 层真机待验）<br>证据：d-059；`host_verify_test` 36 项<br>四层收成一个纯函数 `verify_product(path, expect, ffprobe)` → `(ok, code, detail, extra)`；四条下载链（直链/yt-dlp/HLS/合并）收尾统一走 `finish_verified`，**done 必经验证**<br>反向验证：废清单检查 6 红、废 ffprobe returncode 2 红、废缺轨道 2 红、废时长 2 红<br>**判据后半句「删分片→界面报错」要真机复验**（本机无 ffmpeg，第 4 层用假 subprocess 验逻辑）；「12 错误码」已在前几刀升到 15 码并全接线 |
 | T-C5 | S3 规划表外置 + 表驱动测试 | 「这条为什么走 yt-dlp」能答 | ✅ 1.3.54<br>证据：d-060；`host_plan_test` 32 项表驱动<br>分派抠成纯函数 `plan_download(job, tools) -> {chain, reason, args, expect}`；`reason` 是人话「为什么」，进 `main()` 失败时的 `trail` 第一项<br>反向验证：废 hls 判定 2 红、废 use_ytdlp 7 红、废 merge 优先级 4 红<br>**后续**：S4 时 popup 复用 `plan_download`，reject 地址不显示「下载到本地」按钮 |
 | T-C6 | S4 工作站（队列 / 续传 / 历史，关浏览器照跑） | 关浏览器后任务继续 | ⬜（依赖 B 组） |
-| T-C7 | S5 知识库双通道 + CI | 同站失败 3 次自动出建议 | ⬜ |
+| T-C7 | S5 知识库双通道 + CI | 同站失败 3 次自动出建议 | 🔄 1.3.55 解释库自动通道落地（popup 展示 + 规则库 + CI 待做）<br>证据：d-061；`host_knowledge_test` 52 项 + `host_knowledge_host_test` 13 项<br>纯函数 `knowledge.py`（site_key 归一化 / fail_signature / record_failure / explain），阈值 ≥3 才开口；宿主 `poll_job` 失败收尾记账+出建议<br>反向验证：阈值改 1 五红、site 不归一化 6 红、签名不看码 3 红、废建议 2 红、废记账 2 红<br>**抓到一个真死锁**：Lock 非可重入，记账持锁后再 load 死锁，改 RLock<br>**待做**：popup 把建议单独一行展示；规则库（人工通道）+ compatibility 模板 + CI |
 | T-C8 | S6 产品件七项（隐私政策 / 首次空态 / 诊断包 / opt-in 统计 / 发版通道 / 法律声明 / i18n） | 见 `PRODUCT-PLAN.md` §6 | ⬜ |
 | T-C9 | L1-b 读**播放器 API JSON**（独立开关） | 排 S6 之后，唯一改变隐私边界的动作 | 🅿️ 挂起 |
 
